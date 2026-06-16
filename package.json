@@ -1,0 +1,59 @@
+{
+  "name": "pi-prompt",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.28.0",
+  "type": "module",
+  "description": "Fullscreen markdown-aware prompt editor for Pi. Glow-style live coloring, char-precise selection, drafts, and file preloading.",
+  "author": "Leonardo Pereira",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leop-shopify/pi-prompt.git"
+  },
+  "homepage": "https://github.com/leop-shopify/pi-prompt#readme",
+  "bugs": {
+    "url": "https://github.com/leop-shopify/pi-prompt/issues"
+  },
+  "files": [
+    "src/ansi.ts",
+    "src/drafts.ts",
+    "src/index.ts",
+    "src/markdown-highlight.ts",
+    "src/textarea.ts",
+    "src/ui.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "prompt",
+    "markdown",
+    "editor",
+    "textarea",
+    "fullscreen",
+    "terminal"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@earendil-works/pi-tui": "0.78.1",
+    "typebox": "1.1.38"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "0.78.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "typescript": "5.9.3",
+    "vitest": "3.2.6"
+  }
+}
