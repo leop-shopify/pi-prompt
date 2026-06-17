@@ -81,6 +81,21 @@ describe("TextArea editing", () => {
     area.handleInput("\x1b");
     expect(onEscape).toHaveBeenLastCalledWith(true);
   });
+
+  it("fires toggle on ctrl+alt+p with full text", () => {
+    const onToggle = vi.fn();
+    const area = new TextArea(theme, { onToggle });
+    type(area, "half written");
+    area.handleInput("\x1b[112;7u"); // kitty ctrl+alt+p
+    expect(onToggle).toHaveBeenCalledWith("half written");
+  });
+
+  it("fires toggle with empty text when buffer is empty", () => {
+    const onToggle = vi.fn();
+    const area = new TextArea(theme, { onToggle });
+    area.handleInput("\x1b[112;7u");
+    expect(onToggle).toHaveBeenCalledWith("");
+  });
 });
 
 describe("TextArea word movement", () => {

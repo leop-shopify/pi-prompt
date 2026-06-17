@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { decodeKittyPrintable, matchesKey } from "@earendil-works/pi-tui";
 import { readFile } from "node:fs/promises";
@@ -20,6 +20,7 @@ interface PromptSession {
 
 const SHORTCUTS: Array<[string, string]> = [
   ["ctrl+enter", "send"],
+  ["ctrl+alt+p", "back to input"],
   ["esc", "exit"],
   ["shift+arrows", "select"],
   ["ctrl+c", "copy"],
@@ -82,16 +83,36 @@ export default function (pi: ExtensionAPI) {
       await openEditor(pi, ctx, initialText, session);
     },
   });
+
+  pi.registerShortcut("ctrl+alt+p", {
+    description: "Move the current input into the fullscreen prompt editor",
+    handler: async (ctx) => {
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("prompt editor requires interactive mode", "error");
+        return;
+      }
+      const moved = takeEditorText(ctx);
+      await openEditor(pi, ctx, moved, {});
+    },
+  });
+}
+
+/** Read the core input text and clear it, returning what was there. */
+export function takeEditorText(ctx: ExtensionContext): string {
+  const text = ctx.ui.getEditorText();
+  if (text.length > 0) ctx.ui.setEditorText("");
+  return text;
 }
 
 type EditorOutcome =
   | { kind: "submit"; text: string }
   | { kind: "exit" }
-  | { kind: "keepDraft"; text: string };
+  | { kind: "keepDraft"; text: string }
+  | { kind: "stash"; text: string };
 
 async function openEditor(
   pi: ExtensionAPI,
-  ctx: ExtensionCommandContext,
+  ctx: ExtensionContext,
   initialText: string,
   session: PromptSession,
 ): Promise<void> {
@@ -119,10 +140,15 @@ async function openEditor(
     ctx.ui.notify("Draft saved. Reopen with /prompt drafts", "info");
     return;
   }
+
+  if (outcome.kind === "stash") {
+    if (outcome.text.length > 0) ctx.ui.setEditorText(outcome.text);
+    return;
+  }
 }
 
 function runEditorOverlay(
-  ctx: ExtensionCommandContext,
+  ctx: ExtensionContext,
   initialText: string,
   session: PromptSession,
 ): Promise<EditorOutcome> {
@@ -137,6 +163,7 @@ function runEditorOverlay(
         tui.requestRender();
       },
       onSubmit: (text) => done({ kind: "submit", text }),
+      onToggle: (text) => done({ kind: "stash", text }),
       onEscape: (hasText) => {
         if (!hasText) {
           done({ kind: "exit" });

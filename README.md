@@ -21,12 +21,14 @@ After installing, run `/reload` in any open Pi session, then use `/prompt`.
 - `/prompt` — open the fullscreen editor empty.
 - `/prompt <path>` — open the editor preloaded with a file's contents (editable).
 - `/prompt drafts` — pick a saved draft to reopen.
+- `ctrl+alt+p` — toggle the current input into and out of the fullscreen editor. From the main input it moves your text into the editor (input cleared). Pressing it again inside the editor moves the text back to the main input and closes — no draft prompt, since nothing is lost. Toggling an empty editor just closes it.
 
 ### Keys
 
 | Key | Action |
 | --- | --- |
 | `ctrl+enter` | Send the prompt as a message |
+| `ctrl+alt+p` | Move the text back to the main input and close |
 | `enter` | Insert a newline |
 | `esc` | Leave (if there is text, choose keep-draft or discard) |
 | `shift+arrows` | Extend a character-precise selection |

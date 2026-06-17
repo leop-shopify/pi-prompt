@@ -61,6 +61,7 @@ export interface TextAreaCallbacks {
   onSubmit?: (text: string) => void;
   onEscape?: (hasText: boolean) => void;
   onCopy?: (chars: number) => void;
+  onToggle?: (text: string) => void;
 }
 
 /**
@@ -666,6 +667,12 @@ export class TextArea implements Component, Focusable {
     // ctrl+enter submits the whole prompt; plain enter inserts a newline.
     if (matchesKey(data, "ctrl+enter") || matchesKey(data, "ctrl+return")) {
       this.callbacks.onSubmit?.(this.getText());
+      return;
+    }
+    // The same chord that opened the editor moves the text back to the main
+    // input and closes, no draft prompt. Toggling an empty buffer just closes.
+    if (matchesKey(data, "ctrl+alt+p")) {
+      this.callbacks.onToggle?.(this.getText());
       return;
     }
     if (matchesKey(data, "escape")) {
