@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { takeEditorText } from "../index.js";
+import { promptFieldFocusForInput, takeEditorText } from "../index.js";
 
 function makeCtx(initial: string): { ctx: ExtensionContext; getText: () => string } {
   let text = initial;
@@ -13,6 +13,24 @@ function makeCtx(initial: string): { ctx: ExtensionContext; getText: () => strin
   const ctx = { ui } as unknown as ExtensionContext;
   return { ctx, getText: () => text };
 }
+
+describe("prompt field focus navigation", () => {
+  const KEY = {
+    tab: "\t",
+    shiftTab: "\x1b[Z",
+    up: "\x1b[A",
+    down: "\x1b[B",
+  } as const;
+
+  it("cycles fields with tab and shift+tab only", () => {
+    expect(promptFieldFocusForInput("editor", KEY.tab)).toBe("skills");
+    expect(promptFieldFocusForInput("skills", KEY.tab)).toBe("multiplier");
+    expect(promptFieldFocusForInput("editor", KEY.shiftTab)).toBe("multiplier");
+    expect(promptFieldFocusForInput("multiplier", KEY.shiftTab)).toBe("skills");
+    expect(promptFieldFocusForInput("editor", KEY.up)).toBeNull();
+    expect(promptFieldFocusForInput("editor", KEY.down)).toBeNull();
+  });
+});
 
 describe("takeEditorText", () => {
   it("returns the current input and clears it", () => {

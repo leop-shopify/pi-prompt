@@ -64,6 +64,19 @@ describe("TextArea editing", () => {
     expect(area.getText()).toBe("a\nb  c");
   });
 
+  it("reports first and last logical line cursor boundaries", () => {
+    const area = new TextArea(theme);
+    area.setText("one\ntwo\nthree");
+    expect(area.isCursorOnFirstLogicalLine()).toBe(false);
+    expect(area.isCursorOnLastLogicalLine()).toBe(true);
+    area.handleInput(KEY.up);
+    expect(area.isCursorOnFirstLogicalLine()).toBe(false);
+    expect(area.isCursorOnLastLogicalLine()).toBe(false);
+    area.handleInput(KEY.up);
+    expect(area.isCursorOnFirstLogicalLine()).toBe(true);
+    expect(area.isCursorOnLastLogicalLine()).toBe(false);
+  });
+
   it("fires submit on ctrl+enter (kitty) with full text", () => {
     const onSubmit = vi.fn();
     const area = new TextArea(theme, { onSubmit });

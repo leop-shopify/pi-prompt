@@ -107,6 +107,14 @@ export class TextArea implements Component, Focusable {
     return this.lines.join("\n");
   }
 
+  isCursorOnFirstLogicalLine(): boolean {
+    return this.cursor.line === 0;
+  }
+
+  isCursorOnLastLogicalLine(): boolean {
+    return this.cursor.line === this.lines.length - 1;
+  }
+
   setTheme(theme: Theme): void {
     this.theme = theme;
     this.relayout();
