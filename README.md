@@ -5,7 +5,7 @@ A fullscreen, markdown-aware prompt editor for [Pi](https://github.com/earendil-
 ## Install
 
 ```bash
-pi install https://github.com/leop-shopify/pi-prompt
+pi install git:github.com/leop-shopify/pi-prompt
 ```
 
 Local development install:
