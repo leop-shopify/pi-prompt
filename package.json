@@ -21,6 +21,7 @@
     "src/index.ts",
     "src/markdown-highlight.ts",
     "src/prompt-build.ts",
+    "src/prompt-templates.ts",
     "src/prompt-build/**/*.ts",
     "src/prompt-build/skills/**/*.md",
     "src/textarea.ts",

@@ -30,6 +30,13 @@ describe("prompt field focus navigation", () => {
     expect(promptFieldFocusForInput("editor", KEY.up)).toBeNull();
     expect(promptFieldFocusForInput("editor", KEY.down)).toBeNull();
   });
+
+  it("includes the memorized prompt field only for saved drafts", () => {
+    expect(promptFieldFocusForInput("skills", KEY.tab)).toBe("multiplier");
+    expect(promptFieldFocusForInput("skills", KEY.tab, true)).toBe("memorizePrompt");
+    expect(promptFieldFocusForInput("memorizePrompt", KEY.tab, true)).toBe("multiplier");
+    expect(promptFieldFocusForInput("multiplier", KEY.shiftTab, true)).toBe("memorizePrompt");
+  });
 });
 
 describe("takeEditorText", () => {

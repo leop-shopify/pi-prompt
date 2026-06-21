@@ -4,6 +4,7 @@ import { decodeKittyPrintable, matchesKey, truncateToWidth } from "@earendil-wor
 import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { type Draft, draftPreview, listDrafts, saveDraft } from "./drafts.js";
+import { memorizePromptTemplate } from "./prompt-templates.js";
 import {
   createPromptBuildFlow,
   MULTIPLIER_CHOICES,
@@ -29,6 +30,7 @@ interface PromptSession {
 interface PromptSubmitOptions {
   multiplier: number | null;
   skills: string[];
+  memorizePrompt: boolean;
 }
 
 interface SkillCommandInfo {
@@ -40,9 +42,9 @@ interface SkillCommandInfo {
   };
 }
 
-export type PromptFieldFocus = "multiplier" | "editor" | "skills";
+export type PromptFieldFocus = "multiplier" | "editor" | "skills" | "memorizePrompt";
 
-const PROMPT_FIELD_FOCUS_ORDER: PromptFieldFocus[] = ["multiplier", "editor", "skills"];
+const BASE_PROMPT_FIELD_FOCUS_ORDER: PromptFieldFocus[] = ["multiplier", "editor", "skills"];
 
 const SHORTCUTS: Array<[string, string]> = [
   ["ctrl+enter", "send"],
@@ -185,6 +187,10 @@ async function openEditor(
       return;
     }
 
+    if (session.draftId && outcome.options.memorizePrompt) {
+      await persistMemorizedPrompt(ctx, text);
+    }
+
     const skillContext = await buildSelectedSkillBlocks(pi, outcome.options.skills);
 
     if (outcome.options.multiplier !== null) {
@@ -216,6 +222,17 @@ async function openEditor(
   }
 }
 
+async function persistMemorizedPrompt(ctx: ExtensionContext, text: string): Promise<void> {
+  try {
+    const template = await memorizePromptTemplate(text);
+    const status = template.created ? "saved" : "already exists";
+    ctx.ui.notify(`Memorized prompt ${status} as /${template.name}`, "info");
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    ctx.ui.notify(`Could not memorize prompt: ${reason}`, "error");
+  }
+}
+
 function runEditorOverlay(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -230,8 +247,10 @@ function runEditorOverlay(
     let customMultiplier = "";
     let skillQuery = "";
     let skillSuggestionIndex = 0;
+    let memorizePrompt = false;
     const selectedSkills: string[] = [];
     const availableSkills = listSkillCommands(pi).map((skill) => skill.name);
+    const showMemorizePromptOption = Boolean(session.draftId);
 
     const submit = (text: string) => {
       const multiplier = multiplierValue(MULTIPLIER_CHOICES[multiplierIndex]!, customMultiplier);
@@ -241,7 +260,11 @@ function runEditorOverlay(
         tui.requestRender();
         return;
       }
-      done({ kind: "submit", text, options: { multiplier, skills: [...selectedSkills] } });
+      done({
+        kind: "submit",
+        text,
+        options: { multiplier, skills: [...selectedSkills], memorizePrompt: showMemorizePromptOption && memorizePrompt },
+      });
     };
 
     const requestExit = (hasText: boolean) => {
@@ -275,7 +298,8 @@ function runEditorOverlay(
         const height = Math.max(10, tui.terminal.rows - 2);
         const contentWidth = frameContentWidth(width);
         const controlFrameHeight = 3;
-        const promptHeight = Math.max(4, height - controlFrameHeight * 2);
+        const controlFrameCount = showMemorizePromptOption ? 3 : 2;
+        const promptHeight = Math.max(4, height - controlFrameHeight * controlFrameCount);
         const footer = mode === "confirmExit"
           ? buildExitFooter(theme)
           : buildEditFooter(theme, selectionInfo);
@@ -308,6 +332,14 @@ function runEditorOverlay(
             body: [renderSkillValue(theme, contentWidth, selectedSkills, skillQuery, availableSkills, skillSuggestionIndex, focus === "skills")],
             color: focus === "skills" ? "accent" : "borderMuted",
           }),
+          ...(showMemorizePromptOption ? renderFrame({
+            width,
+            height: controlFrameHeight,
+            theme,
+            title: "memorize draft",
+            body: [renderMemorizePromptValue(theme, contentWidth, memorizePrompt, focus === "memorizePrompt")],
+            color: focus === "memorizePrompt" ? "accent" : "borderMuted",
+          }) : []),
         ];
       },
       invalidate(): void {
@@ -333,7 +365,7 @@ function runEditorOverlay(
           return;
         }
 
-        const nextFocus = promptFieldFocusForInput(focus, data);
+        const nextFocus = promptFieldFocusForInput(focus, data, showMemorizePromptOption);
         if (nextFocus) {
           focus = nextFocus;
           tui.requestRender();
@@ -347,6 +379,11 @@ function runEditorOverlay(
         }
         if (focus === "skills") {
           handleSkillInput(data);
+          tui.requestRender();
+          return;
+        }
+        if (focus === "memorizePrompt") {
+          handleMemorizePromptInput(data);
           tui.requestRender();
           return;
         }
@@ -395,6 +432,23 @@ function runEditorOverlay(
         skillQuery += ch;
         skillSuggestionIndex = 0;
       }
+    }
+
+    function handleMemorizePromptInput(data: string): void {
+      if (matchesKey(data, "left")) {
+        memorizePrompt = false;
+        return;
+      }
+      if (matchesKey(data, "right")) {
+        memorizePrompt = true;
+        return;
+      }
+      if (matchesKey(data, "enter") || matchesKey(data, "return")) {
+        memorizePrompt = !memorizePrompt;
+        return;
+      }
+      const ch = decodeKittyPrintable(data) ?? data;
+      if (ch === " ") memorizePrompt = !memorizePrompt;
     }
 
     function currentSkillSuggestions(): string[] {
@@ -446,17 +500,24 @@ function runEditorOverlay(
   });
 }
 
-export function promptFieldFocusForInput(current: PromptFieldFocus, data: string): PromptFieldFocus | null {
-  if (matchesKey(data, "shift+tab")) return movePromptFieldFocus(current, -1);
-  if (matchesKey(data, "tab")) return movePromptFieldFocus(current, 1);
+export function promptFieldFocusForInput(
+  current: PromptFieldFocus,
+  data: string,
+  includeMemorizePrompt = false,
+): PromptFieldFocus | null {
+  if (matchesKey(data, "shift+tab")) return movePromptFieldFocus(current, -1, includeMemorizePrompt);
+  if (matchesKey(data, "tab")) return movePromptFieldFocus(current, 1, includeMemorizePrompt);
   return null;
 }
 
-function movePromptFieldFocus(current: PromptFieldFocus, direction: -1 | 1): PromptFieldFocus {
-  const index = PROMPT_FIELD_FOCUS_ORDER.indexOf(current);
+function movePromptFieldFocus(current: PromptFieldFocus, direction: -1 | 1, includeMemorizePrompt: boolean): PromptFieldFocus {
+  const focusOrder = includeMemorizePrompt
+    ? [...BASE_PROMPT_FIELD_FOCUS_ORDER, "memorizePrompt"] as PromptFieldFocus[]
+    : BASE_PROMPT_FIELD_FOCUS_ORDER;
+  const index = focusOrder.indexOf(current);
   const safeIndex = index >= 0 ? index : 0;
-  const nextIndex = (safeIndex + direction + PROMPT_FIELD_FOCUS_ORDER.length) % PROMPT_FIELD_FOCUS_ORDER.length;
-  return PROMPT_FIELD_FOCUS_ORDER[nextIndex]!;
+  const nextIndex = (safeIndex + direction + focusOrder.length) % focusOrder.length;
+  return focusOrder[nextIndex]!;
 }
 
 function listSkillCommands(pi: ExtensionAPI): SkillCommandInfo[] {
@@ -553,6 +614,17 @@ function renderSkillValue(
   const queryText = typed.length > 0 ? theme.fg(focused ? "warning" : "dim", typed) : theme.fg("dim", hint);
   const separator = chips && queryText ? " " : "";
   return truncateToWidth(`${chips}${separator}${queryText}`, width, "…", false);
+}
+
+function renderMemorizePromptValue(theme: Theme, width: number, enabled: boolean, focused: boolean): string {
+  const renderChoice = (value: boolean, label: string): string => {
+    const text = enabled === value ? `[${label}]` : ` ${label} `;
+    if (enabled !== value) return theme.fg("dim", text);
+    return focused ? theme.fg("accent", theme.bold(text)) : theme.fg("muted", theme.bold(text));
+  };
+  const choices = `${renderChoice(false, "no")} ${renderChoice(true, "yes")}`;
+  const hint = theme.fg("dim", "  persist as a global /prompt template on send");
+  return truncateToWidth(`${choices}${hint}`, width, "…", false);
 }
 
 function buildDirectPromptMessage(text: string, skillContext: string): string {
