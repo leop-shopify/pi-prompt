@@ -24,18 +24,17 @@ describe("prompt field focus navigation", () => {
 
   it("cycles fields with tab and shift+tab only", () => {
     expect(promptFieldFocusForInput("editor", KEY.tab)).toBe("skills");
-    expect(promptFieldFocusForInput("skills", KEY.tab)).toBe("multiplier");
+    expect(promptFieldFocusForInput("skills", KEY.tab)).toBe("saveAsTemplate");
+    expect(promptFieldFocusForInput("saveAsTemplate", KEY.tab)).toBe("multiplier");
     expect(promptFieldFocusForInput("editor", KEY.shiftTab)).toBe("multiplier");
-    expect(promptFieldFocusForInput("multiplier", KEY.shiftTab)).toBe("skills");
+    expect(promptFieldFocusForInput("multiplier", KEY.shiftTab)).toBe("saveAsTemplate");
     expect(promptFieldFocusForInput("editor", KEY.up)).toBeNull();
     expect(promptFieldFocusForInput("editor", KEY.down)).toBeNull();
   });
 
-  it("includes the memorized prompt field only for saved drafts", () => {
-    expect(promptFieldFocusForInput("skills", KEY.tab)).toBe("multiplier");
-    expect(promptFieldFocusForInput("skills", KEY.tab, true)).toBe("memorizePrompt");
-    expect(promptFieldFocusForInput("memorizePrompt", KEY.tab, true)).toBe("multiplier");
-    expect(promptFieldFocusForInput("multiplier", KEY.shiftTab, true)).toBe("memorizePrompt");
+  it("can omit the save-as-template field from focus navigation", () => {
+    expect(promptFieldFocusForInput("skills", KEY.tab, false)).toBe("multiplier");
+    expect(promptFieldFocusForInput("multiplier", KEY.shiftTab, false)).toBe("skills");
   });
 });
 

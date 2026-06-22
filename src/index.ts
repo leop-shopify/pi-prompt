@@ -4,7 +4,7 @@ import { decodeKittyPrintable, matchesKey, truncateToWidth } from "@earendil-wor
 import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { type Draft, draftPreview, listDrafts, saveDraft } from "./drafts.js";
-import { memorizePromptTemplate } from "./prompt-templates.js";
+import { listPromptTemplates, memorizePromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import {
   createPromptBuildFlow,
   MULTIPLIER_CHOICES,
@@ -25,12 +25,13 @@ import {
 interface PromptSession {
   draftId?: string;
   preloadedPath?: string;
+  templateName?: string;
 }
 
 interface PromptSubmitOptions {
   multiplier: number | null;
   skills: string[];
-  memorizePrompt: boolean;
+  saveAsTemplate: boolean;
 }
 
 interface SkillCommandInfo {
@@ -42,9 +43,9 @@ interface SkillCommandInfo {
   };
 }
 
-export type PromptFieldFocus = "multiplier" | "editor" | "skills" | "memorizePrompt";
+export type PromptFieldFocus = "multiplier" | "editor" | "skills" | "saveAsTemplate";
 
-const BASE_PROMPT_FIELD_FOCUS_ORDER: PromptFieldFocus[] = ["multiplier", "editor", "skills"];
+const PROMPT_FIELD_FOCUS_ORDER: PromptFieldFocus[] = ["multiplier", "editor", "skills", "saveAsTemplate"];
 
 const SHORTCUTS: Array<[string, string]> = [
   ["ctrl+enter", "send"],
@@ -116,10 +117,11 @@ export default function (pi: ExtensionAPI) {
 
 function registerPromptCommand(pi: ExtensionAPI, name: "prompt" | "pi-prompt", promptBuild: ReturnType<typeof createPromptBuildFlow>): void {
   pi.registerCommand(name, {
-    description: "Open a fullscreen markdown prompt editor (optionally preload a file, or `drafts`)",
+    description: "Open a fullscreen markdown prompt editor (optionally preload a file, `drafts`, or `templates`)",
     getArgumentCompletions: (prefix: string) => {
       const completions = [
         { value: "drafts", label: "drafts", description: "Open saved drafts" },
+        { value: "templates", label: "templates", description: "Open saved prompt templates" },
         { value: "resume", label: "resume", description: "Resume paused prompt-build review" },
       ].filter((item) => item.value.startsWith(prefix));
       return completions.length > 0 ? completions : null;
@@ -133,6 +135,10 @@ function registerPromptCommand(pi: ExtensionAPI, name: "prompt" | "pi-prompt", p
       const trimmed = args.trim();
       if (trimmed === "drafts") {
         await openDraftsBrowser(pi, ctx, promptBuild);
+        return;
+      }
+      if (trimmed === "templates") {
+        await openPromptTemplatesBrowser(pi, ctx, promptBuild);
         return;
       }
       if (trimmed === "resume") {
@@ -187,8 +193,8 @@ async function openEditor(
       return;
     }
 
-    if (session.draftId && outcome.options.memorizePrompt) {
-      await persistMemorizedPrompt(ctx, text);
+    if (outcome.options.saveAsTemplate) {
+      await persistPromptTemplate(ctx, text);
     }
 
     const skillContext = await buildSelectedSkillBlocks(pi, outcome.options.skills);
@@ -222,14 +228,14 @@ async function openEditor(
   }
 }
 
-async function persistMemorizedPrompt(ctx: ExtensionContext, text: string): Promise<void> {
+async function persistPromptTemplate(ctx: ExtensionContext, text: string): Promise<void> {
   try {
     const template = await memorizePromptTemplate(text);
     const status = template.created ? "saved" : "already exists";
-    ctx.ui.notify(`Memorized prompt ${status} as /${template.name}`, "info");
+    ctx.ui.notify(`Prompt template ${status} as ${template.name}.md`, "info");
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    ctx.ui.notify(`Could not memorize prompt: ${reason}`, "error");
+    ctx.ui.notify(`Could not save prompt template: ${reason}`, "error");
   }
 }
 
@@ -247,10 +253,9 @@ function runEditorOverlay(
     let customMultiplier = "";
     let skillQuery = "";
     let skillSuggestionIndex = 0;
-    let memorizePrompt = false;
+    let saveAsTemplate = false;
     const selectedSkills: string[] = [];
     const availableSkills = listSkillCommands(pi).map((skill) => skill.name);
-    const showMemorizePromptOption = Boolean(session.draftId);
 
     const submit = (text: string) => {
       const multiplier = multiplierValue(MULTIPLIER_CHOICES[multiplierIndex]!, customMultiplier);
@@ -263,7 +268,7 @@ function runEditorOverlay(
       done({
         kind: "submit",
         text,
-        options: { multiplier, skills: [...selectedSkills], memorizePrompt: showMemorizePromptOption && memorizePrompt },
+        options: { multiplier, skills: [...selectedSkills], saveAsTemplate },
       });
     };
 
@@ -288,7 +293,9 @@ function runEditorOverlay(
     });
     textarea.setText(initialText);
 
-    const title = session.preloadedPath ? `prompt — ${shortenPath(session.preloadedPath)}` : "prompt";
+    const title = session.templateName
+      ? `prompt template — ${session.templateName}.md`
+      : session.preloadedPath ? `prompt — ${shortenPath(session.preloadedPath)}` : "prompt";
 
     const component: Component = {
       render(width: number): string[] {
@@ -298,7 +305,7 @@ function runEditorOverlay(
         const height = Math.max(10, tui.terminal.rows - 2);
         const contentWidth = frameContentWidth(width);
         const controlFrameHeight = 3;
-        const controlFrameCount = showMemorizePromptOption ? 3 : 2;
+        const controlFrameCount = 3;
         const promptHeight = Math.max(4, height - controlFrameHeight * controlFrameCount);
         const footer = mode === "confirmExit"
           ? buildExitFooter(theme)
@@ -332,14 +339,14 @@ function runEditorOverlay(
             body: [renderSkillValue(theme, contentWidth, selectedSkills, skillQuery, availableSkills, skillSuggestionIndex, focus === "skills")],
             color: focus === "skills" ? "accent" : "borderMuted",
           }),
-          ...(showMemorizePromptOption ? renderFrame({
+          ...renderFrame({
             width,
             height: controlFrameHeight,
             theme,
-            title: "memorize draft",
-            body: [renderMemorizePromptValue(theme, contentWidth, memorizePrompt, focus === "memorizePrompt")],
-            color: focus === "memorizePrompt" ? "accent" : "borderMuted",
-          }) : []),
+            title: "template",
+            body: [renderSaveAsTemplateValue(theme, contentWidth, saveAsTemplate, focus === "saveAsTemplate")],
+            color: focus === "saveAsTemplate" ? "accent" : "borderMuted",
+          }),
         ];
       },
       invalidate(): void {
@@ -365,7 +372,7 @@ function runEditorOverlay(
           return;
         }
 
-        const nextFocus = promptFieldFocusForInput(focus, data, showMemorizePromptOption);
+        const nextFocus = promptFieldFocusForInput(focus, data);
         if (nextFocus) {
           focus = nextFocus;
           tui.requestRender();
@@ -382,8 +389,8 @@ function runEditorOverlay(
           tui.requestRender();
           return;
         }
-        if (focus === "memorizePrompt") {
-          handleMemorizePromptInput(data);
+        if (focus === "saveAsTemplate") {
+          handleSaveAsTemplateInput(data);
           tui.requestRender();
           return;
         }
@@ -434,21 +441,21 @@ function runEditorOverlay(
       }
     }
 
-    function handleMemorizePromptInput(data: string): void {
+    function handleSaveAsTemplateInput(data: string): void {
       if (matchesKey(data, "left")) {
-        memorizePrompt = false;
+        saveAsTemplate = false;
         return;
       }
       if (matchesKey(data, "right")) {
-        memorizePrompt = true;
+        saveAsTemplate = true;
         return;
       }
       if (matchesKey(data, "enter") || matchesKey(data, "return")) {
-        memorizePrompt = !memorizePrompt;
+        saveAsTemplate = !saveAsTemplate;
         return;
       }
       const ch = decodeKittyPrintable(data) ?? data;
-      if (ch === " ") memorizePrompt = !memorizePrompt;
+      if (ch === " ") saveAsTemplate = !saveAsTemplate;
     }
 
     function currentSkillSuggestions(): string[] {
@@ -503,17 +510,17 @@ function runEditorOverlay(
 export function promptFieldFocusForInput(
   current: PromptFieldFocus,
   data: string,
-  includeMemorizePrompt = false,
+  includeSaveAsTemplate = true,
 ): PromptFieldFocus | null {
-  if (matchesKey(data, "shift+tab")) return movePromptFieldFocus(current, -1, includeMemorizePrompt);
-  if (matchesKey(data, "tab")) return movePromptFieldFocus(current, 1, includeMemorizePrompt);
+  if (matchesKey(data, "shift+tab")) return movePromptFieldFocus(current, -1, includeSaveAsTemplate);
+  if (matchesKey(data, "tab")) return movePromptFieldFocus(current, 1, includeSaveAsTemplate);
   return null;
 }
 
-function movePromptFieldFocus(current: PromptFieldFocus, direction: -1 | 1, includeMemorizePrompt: boolean): PromptFieldFocus {
-  const focusOrder = includeMemorizePrompt
-    ? [...BASE_PROMPT_FIELD_FOCUS_ORDER, "memorizePrompt"] as PromptFieldFocus[]
-    : BASE_PROMPT_FIELD_FOCUS_ORDER;
+function movePromptFieldFocus(current: PromptFieldFocus, direction: -1 | 1, includeSaveAsTemplate: boolean): PromptFieldFocus {
+  const focusOrder = includeSaveAsTemplate
+    ? PROMPT_FIELD_FOCUS_ORDER
+    : PROMPT_FIELD_FOCUS_ORDER.filter((field) => field !== "saveAsTemplate");
   const index = focusOrder.indexOf(current);
   const safeIndex = index >= 0 ? index : 0;
   const nextIndex = (safeIndex + direction + focusOrder.length) % focusOrder.length;
@@ -616,15 +623,12 @@ function renderSkillValue(
   return truncateToWidth(`${chips}${separator}${queryText}`, width, "…", false);
 }
 
-function renderMemorizePromptValue(theme: Theme, width: number, enabled: boolean, focused: boolean): string {
-  const renderChoice = (value: boolean, label: string): string => {
-    const text = enabled === value ? `[${label}]` : ` ${label} `;
-    if (enabled !== value) return theme.fg("dim", text);
-    return focused ? theme.fg("accent", theme.bold(text)) : theme.fg("muted", theme.bold(text));
-  };
-  const choices = `${renderChoice(false, "no")} ${renderChoice(true, "yes")}`;
-  const hint = theme.fg("dim", "  persist as a global /prompt template on send");
-  return truncateToWidth(`${choices}${hint}`, width, "…", false);
+function renderSaveAsTemplateValue(theme: Theme, width: number, enabled: boolean, focused: boolean): string {
+  const checkbox = enabled ? "[x]" : "[ ]";
+  const label = `${checkbox} save as template?`;
+  const control = focused ? theme.fg("accent", theme.bold(label)) : theme.fg("muted", theme.bold(label));
+  const hint = theme.fg("dim", "  saves to ~/.pi/agent/prompt-templates/ on send");
+  return truncateToWidth(`${control}${hint}`, width, "…", false);
 }
 
 function buildDirectPromptMessage(text: string, skillContext: string): string {
@@ -671,4 +675,27 @@ async function openDraftsBrowser(pi: ExtensionAPI, ctx: ExtensionCommandContext,
   if (!draft) return;
 
   await openEditor(pi, ctx, draft.text, { draftId: draft.id }, promptBuild);
+}
+
+async function openPromptTemplatesBrowser(pi: ExtensionAPI, ctx: ExtensionCommandContext, promptBuild: ReturnType<typeof createPromptBuildFlow>): Promise<void> {
+  const templates = await listPromptTemplates();
+  if (templates.length === 0) {
+    ctx.ui.notify("No saved prompt templates", "info");
+    return;
+  }
+
+  const labels = templates.map(promptTemplateLabel);
+  const chosenLabel = await ctx.ui.select("Open a prompt template", labels);
+  if (!chosenLabel) return;
+
+  const index = labels.indexOf(chosenLabel);
+  const template = index >= 0 ? templates[index] : undefined;
+  if (!template) return;
+
+  await openEditor(pi, ctx, template.text, { preloadedPath: template.path, templateName: template.name }, promptBuild);
+}
+
+function promptTemplateLabel(template: PromptTemplate): string {
+  const source = template.source === "extension" ? "extension" : "saved";
+  return `${template.title}  (${source}: ${template.name}.md)`;
 }

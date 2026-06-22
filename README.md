@@ -21,6 +21,7 @@ After installing, run `/reload` in any open Pi session, then use `/prompt`.
 - `/prompt` — open the fullscreen editor empty.
 - `/prompt <path>` — open the editor preloaded with a file's contents (editable).
 - `/prompt drafts` — pick a saved draft to reopen.
+- `/prompt templates` — pick a bundled extension template or a saved template from `~/.pi/agent/prompt-templates/*.md` to reopen.
 - `ctrl+alt+p` — toggle the current input into and out of the fullscreen editor. From the main input it moves your text into the editor (input cleared). Pressing it again inside the editor moves the text back to the main input and closes — no draft prompt, since nothing is lost. Toggling an empty editor just closes it.
 
 ### Keys
@@ -48,6 +49,8 @@ Movement, word navigation, and deletion are routed through Pi's own keybinding r
 - The editor colorizes markdown source inline (headings, bold, italic, inline code, fenced code, lists, quotes, links, rules). Syntax markers stay visible and editable; only styling is added, so the cursor and selection map 1:1 onto the raw text.
 - `ctrl+enter` requires a terminal that supports the Kitty keyboard protocol (most modern terminals; passes through tmux when the outer terminal supports it). In a terminal without it, `ctrl+enter` is indistinguishable from `enter`.
 - Drafts are stored at `~/.pi/agent/extensions/pi-prompt-drafts.json`.
+- The editor's bottom `save as template?` checkbox defaults to off. When checked on send, the prompt is saved as a user template under `~/.pi/agent/prompt-templates/`.
+- Bundled extension templates live in `prompt-templates/*.md`; each template is just a Markdown file with a `# Title`.
 
 ## Development
 
