@@ -22,8 +22,8 @@ After installing, run `/reload` in any open Pi session, then use `/prompt`.
 - `/prompt <path>` — open the editor preloaded with a file's contents (editable).
 - `/prompt drafts` — pick a saved draft to reopen.
 - `/prompt goal-templates` — pick one of the bundled goal-style workflow templates or a saved template from `~/.pi/agent/prompt-templates/*.md` to reopen.
-- `/prompt loop-templates` — pick a small loop template from bundled `loop-templates/*.md` files or `~/.pi/agent/loop-templates/*.md` to reopen without forcing `/goal`.
-  Goal templates preselect `/goal` in the editor's `use skill` field, so selected skills are sent after the command instead of hiding the command behind skill context.
+- `/prompt loop-templates` — pick a small loop template from bundled `loop-templates/*.md` files or `~/.pi/agent/loop-templates/*.md`.
+  Goal templates preselect `/goal` and loop templates preselect `/loop` in the editor's `use skill` field, so selected skills are sent after the command instead of hiding the command behind skill context.
 - `ctrl+alt+p` — toggle the current input into and out of the fullscreen editor. From the main input it moves your text into the editor (input cleared). Pressing it again inside the editor moves the text back to the main input and closes — no draft prompt, since nothing is lost. Toggling an empty editor just closes it.
 
 ### Keys

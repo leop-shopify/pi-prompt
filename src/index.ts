@@ -74,7 +74,7 @@ const EXIT_CHOICES = [
   { key: "esc", label: "Keep editing" },
 ] as const;
 
-const PROMPT_COMMAND_ITEMS = ["/goal"] as const;
+const PROMPT_COMMAND_ITEMS = ["/goal", "/loop"] as const;
 
 async function tryReadFile(cwd: string, rawPath: string): Promise<{ path: string; text: string } | { error: string }> {
   const cleaned = rawPath.trim().replace(/^@/, "");
@@ -188,7 +188,7 @@ export function takeEditorText(ctx: ExtensionContext): string {
 }
 
 type EditorOutcome =
-  | { kind: "submit"; text: string; options: PromptSubmitOptions }
+  | { kind: "submit"; text: string; options: PromptSubmitOptions; submitViaPiInput?: (message: string) => boolean }
   | { kind: "exit" }
   | { kind: "keepDraft"; text: string }
   | { kind: "stash"; text: string };
@@ -221,6 +221,13 @@ async function openEditor(
     }
 
     const message = buildDirectPromptMessage(text, skillContext, outcome.options.commands);
+    if (shouldSubmitThroughPiInput(message)) {
+      if (outcome.submitViaPiInput?.(message)) return;
+      ctx.ui.setEditorText(message);
+      ctx.ui.notify("Slash command staged in the input. Press Enter to run it.", "warning");
+      return;
+    }
+
     // When the agent is mid-turn, queue the prompt as a follow-up so the send
     // does not throw and does not interrupt the running turn.
     if (ctx.isIdle()) {
@@ -290,6 +297,7 @@ function runEditorOverlay(
           skills: selectedUseSkillItems.filter((item) => !isPromptCommandItem(item)),
           saveAsTemplate,
         },
+        submitViaPiInput: (message) => submitViaPiInput(ctx, tui, message),
       });
     };
 
@@ -657,16 +665,48 @@ function renderSaveAsTemplateValue(theme: Theme, width: number, enabled: boolean
 }
 
 export function buildDirectPromptMessage(text: string, skillContext: string, commands: string[] = []): string {
-  const uniqueCommands = uniquePromptCommands(commands);
+  const promptCommands = uniquePromptCommands(commands);
   let promptText = text.trim();
-  for (const command of uniqueCommands) promptText = stripLeadingPromptCommand(promptText, command).trimStart();
+  for (const command of promptCommands) promptText = stripLeadingPromptCommand(promptText, command).trimStart();
+
+  const leadingCommand = splitLeadingSlashCommand(promptText);
+  if (leadingCommand && !promptCommands.includes(leadingCommand.command)) {
+    promptCommands.push(leadingCommand.command);
+    promptText = leadingCommand.rest.trimStart();
+  }
 
   const body = skillContext.trim().length === 0
     ? promptText
     : [skillContext.trim(), "", "User prompt:", promptText].join("\n");
 
-  if (uniqueCommands.length === 0) return body;
-  return `${uniqueCommands.join("\n")} ${body}`.trimEnd();
+  if (promptCommands.length === 0) return body;
+  return `${promptCommands.join("\n")} ${body}`.trimEnd();
+}
+
+export function shouldSubmitThroughPiInput(message: string): boolean {
+  return message.trimStart().startsWith("/");
+}
+
+function submitViaPiInput(ctx: ExtensionContext, tui: unknown, message: string): boolean {
+  const handleInput = (tui as { handleInput?: (data: string) => void }).handleInput;
+  if (typeof handleInput !== "function") return false;
+
+  const previousText = ctx.ui.getEditorText();
+  ctx.ui.setEditorText(message);
+  try {
+    handleInput.call(tui, "\r");
+    return true;
+  } catch {
+    ctx.ui.setEditorText(previousText);
+    return false;
+  }
+}
+
+function splitLeadingSlashCommand(text: string): { command: string; rest: string } | null {
+  const trimmedStart = text.trimStart();
+  const match = trimmedStart.match(/^(\/\S+)(?:\s+|$)/);
+  if (!match) return null;
+  return { command: match[1]!, rest: trimmedStart.slice(match[0].length) };
 }
 
 function uniquePromptCommands(commands: string[]): string[] {
@@ -761,13 +801,18 @@ async function openPromptTemplatesBrowser(
   const filledText = await fillPromptTemplateVariables(ctx, template.text);
   if (filledText === undefined) return;
 
-  const initialText = kind === "goal" ? stripLeadingPromptCommand(filledText, "/goal").trimStart() : filledText;
+  const command = promptCommandForTemplateKind(kind);
+  const initialText = stripLeadingPromptCommand(filledText, command).trimStart();
   await openEditor(pi, ctx, initialText, {
     preloadedPath: template.path,
     templateName: template.name,
     templateKind: kind,
-    selectedUseSkillItems: kind === "goal" ? ["/goal"] : [],
+    selectedUseSkillItems: [command],
   }, promptBuild);
+}
+
+export function promptCommandForTemplateKind(kind: PromptTemplateKind): "/goal" | "/loop" {
+  return kind === "loop" ? "/loop" : "/goal";
 }
 
 async function fillPromptTemplateVariables(ctx: ExtensionCommandContext, text: string): Promise<string | undefined> {

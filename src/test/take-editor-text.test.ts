@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { buildDirectPromptMessage, promptFieldFocusForInput, stripLeadingPromptCommand, takeEditorText } from "../index.js";
+import { buildDirectPromptMessage, promptCommandForTemplateKind, promptFieldFocusForInput, shouldSubmitThroughPiInput, stripLeadingPromptCommand, takeEditorText } from "../index.js";
 
 function makeCtx(initial: string): { ctx: ExtensionContext; getText: () => string } {
   let text = initial;
@@ -50,8 +50,34 @@ describe("prompt command message building", () => {
     ].join("\n"));
   });
 
+  it("prefixes selected loop commands", () => {
+    expect(buildDirectPromptMessage("Run this loop", "", ["/loop"])).toBe("/loop Run this loop");
+  });
+
+  it("maps template kinds to prompt commands", () => {
+    expect(promptCommandForTemplateKind("goal")).toBe("/goal");
+    expect(promptCommandForTemplateKind("loop")).toBe("/loop");
+  });
+
   it("does not duplicate a command already present in template text", () => {
     expect(buildDirectPromptMessage("/goal Implement the change", "", ["/goal"])).toBe("/goal Implement the change");
+  });
+
+  it("keeps a typed slash command in front of selected skill context", () => {
+    const message = buildDirectPromptMessage("/goal\nImplement the change", "<skill>skill content</skill>");
+
+    expect(message).toBe([
+      "/goal <skill>skill content</skill>",
+      "",
+      "User prompt:",
+      "Implement the change",
+    ].join("\n"));
+  });
+
+  it("identifies prompts that need Pi input dispatch", () => {
+    expect(shouldSubmitThroughPiInput("/goal Implement the change")).toBe(true);
+    expect(shouldSubmitThroughPiInput("  /skill:rails-engineer Fix this")).toBe(true);
+    expect(shouldSubmitThroughPiInput("Implement the change")).toBe(false);
   });
 
   it("strips a leading slash command from loaded template body text", () => {
