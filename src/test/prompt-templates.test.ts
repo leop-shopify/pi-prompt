@@ -1,11 +1,32 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { listPromptTemplates, memorizePromptTemplate, promptTemplateName } from "../prompt-templates.js";
+import { extensionPromptTemplatesPath, listPromptTemplates, memorizePromptTemplate, promptTemplateName } from "../prompt-templates.js";
 
 const ORIGINAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR;
 let tempAgentDir: string | undefined;
+
+const BUNDLED_TEMPLATE_NAMES = [
+  "behavior-preserving-refactor",
+  "cross-repo-project-plan",
+  "documentation-sync",
+  "implementation-contract",
+  "pr-readiness",
+  "project-backlog-burn-down",
+  "quality-gate",
+  "release-readiness",
+  "review-user-stories",
+  "root-cause-debug",
+  "test-coverage-map",
+] as const;
+
+const BUNDLED_TEMPLATE_QUALITY_MARKERS = [
+  "## Verification surface",
+  "## Completion audit",
+  "## Blocked stop condition",
+  "## Final artifact",
+] as const;
 
 async function useTempAgentDir(): Promise<string> {
   tempAgentDir = await mkdtemp(join(tmpdir(), "pi-prompt-"));
@@ -71,6 +92,28 @@ describe("listPromptTemplates", () => {
         source: "extension",
       },
     ]);
+  });
+
+  it("ships eleven high-signal bundled goal templates", async () => {
+    await useTempAgentDir();
+
+    const extensionTemplatesDir = extensionPromptTemplatesPath();
+    const markdownFiles = (await readdir(extensionTemplatesDir)).filter((entry) => entry.endsWith(".md"));
+    const templates = await listPromptTemplates({ extensionTemplatesDir });
+    const bundled = templates.filter((template) => template.source === "extension");
+
+    expect(markdownFiles.sort()).toEqual(BUNDLED_TEMPLATE_NAMES.map((name) => `${name}.md`).sort());
+    expect(bundled.map((template) => template.name).sort()).toEqual([...BUNDLED_TEMPLATE_NAMES].sort());
+
+    for (const template of bundled) {
+      const raw = await readFile(template.path, "utf8");
+
+      expect(raw).toMatch(/^---\n/);
+      expect(raw).toMatch(/\ndescription:\s*["'][^"'\n]+["']\n/);
+      expect(template.text.trim()).toMatch(/^\/goal\b/);
+      expect(template.text).toMatch(/evidence|verification|verified/i);
+      for (const marker of BUNDLED_TEMPLATE_QUALITY_MARKERS) expect(template.text).toContain(marker);
+    }
   });
 
   it("lets user-saved templates override bundled templates with the same name", async () => {
