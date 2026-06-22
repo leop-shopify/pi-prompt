@@ -21,7 +21,9 @@ After installing, run `/reload` in any open Pi session, then use `/prompt`.
 - `/prompt` — open the fullscreen editor empty.
 - `/prompt <path>` — open the editor preloaded with a file's contents (editable).
 - `/prompt drafts` — pick a saved draft to reopen.
-- `/prompt templates` — pick one of the bundled goal-style workflow templates or a saved template from `~/.pi/agent/prompt-templates/*.md` to reopen.
+- `/prompt goal-templates` — pick one of the bundled goal-style workflow templates or a saved template from `~/.pi/agent/prompt-templates/*.md` to reopen.
+- `/prompt loop-templates` — pick a small loop template from bundled `loop-templates/*.md` files or `~/.pi/agent/loop-templates/*.md` to reopen without forcing `/goal`.
+  Goal templates preselect `/goal` in the editor's `use skill` field, so selected skills are sent after the command instead of hiding the command behind skill context.
 - `ctrl+alt+p` — toggle the current input into and out of the fullscreen editor. From the main input it moves your text into the editor (input cleared). Pressing it again inside the editor moves the text back to the main input and closes — no draft prompt, since nothing is lost. Toggling an empty editor just closes it.
 
 ### Keys
@@ -49,8 +51,9 @@ Movement, word navigation, and deletion are routed through Pi's own keybinding r
 - The editor colorizes markdown source inline (headings, bold, italic, inline code, fenced code, lists, quotes, links, rules). Syntax markers stay visible and editable; only styling is added, so the cursor and selection map 1:1 onto the raw text.
 - `ctrl+enter` requires a terminal that supports the Kitty keyboard protocol (most modern terminals; passes through tmux when the outer terminal supports it). In a terminal without it, `ctrl+enter` is indistinguishable from `enter`.
 - Drafts are stored at `~/.pi/agent/extensions/pi-prompt-drafts.json`.
-- The editor's bottom `save as template?` checkbox defaults to off. When checked on send, the prompt is saved as a user template under `~/.pi/agent/prompt-templates/`.
-- Bundled extension templates live in `prompt-templates/*.md` with frontmatter `description:` for display. The package ships 11 goal-style templates for cross-repo project planning, implementation contracts, debugging, testing, quality gates, refactors, backlog burn-down, PR readiness, release readiness, documentation sync, and user-story review.
+- The editor's bottom `save as template?` checkbox defaults to off. When checked on send, the prompt is saved as a user goal template under `~/.pi/agent/prompt-templates/`.
+- Bundled goal templates live in `prompt-templates/*.md` with frontmatter `description:` for display. The package ships 11 goal-style templates for cross-repo project planning, implementation contracts, debugging, testing, quality gates, refactors, backlog burn-down, PR readiness, release readiness, documentation sync, and user-story review.
+- Loop templates are loaded separately from `loop-templates/*.md` and `~/.pi/agent/loop-templates/*.md`; they are inserted as-is except for `{{variable}}` prompting.
 
 ## Development
 

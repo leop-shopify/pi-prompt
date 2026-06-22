@@ -24,6 +24,7 @@ interface ActivePromptBuildRun {
   originalPrompt: string;
   requestedMaxBranches: number;
   skillContext: string;
+  selectedUseSkillItems: string[];
   ctx: ExtensionContext;
   expectedReports: number;
   reports: PromptBranchResult[];
@@ -47,7 +48,7 @@ interface PromptBuildProgressEvent {
 }
 
 export interface PromptBuildFlowController {
-  start(ctx: ExtensionContext, text: string, multiplier: number, skillContext: string): Promise<void>;
+  start(ctx: ExtensionContext, text: string, multiplier: number, skillContext: string, selectedUseSkillItems?: string[]): Promise<void>;
   resume(ctx: ExtensionContext): Promise<void>;
   handleProgress(event: unknown): void;
   handleError(event: unknown): void;
@@ -56,14 +57,14 @@ export interface PromptBuildFlowController {
 }
 
 export interface PromptBuildFlowOptions {
-  openPromptEditor?: (ctx: ExtensionContext, finalPrompt: string) => Promise<void>;
+  openPromptEditor?: (ctx: ExtensionContext, finalPrompt: string, options?: { selectedUseSkillItems?: string[] }) => Promise<void>;
 }
 
 export function createPromptBuildFlow(pi: ExtensionAPI, options: PromptBuildFlowOptions = {}): PromptBuildFlowController {
   const progress = createPromptBuildProgress();
   let activeRun: ActivePromptBuildRun | undefined;
 
-  async function start(ctx: ExtensionContext, text: string, multiplier: number, skillContext: string): Promise<void> {
+  async function start(ctx: ExtensionContext, text: string, multiplier: number, skillContext: string, selectedUseSkillItems: string[] = []): Promise<void> {
     const teamName = `prompt-build-${Date.now()}`;
     try {
       const session = await createPromptBuildSession({
@@ -80,6 +81,7 @@ export function createPromptBuildFlow(pi: ExtensionAPI, options: PromptBuildFlow
         originalPrompt: text,
         requestedMaxBranches: multiplier,
         skillContext,
+        selectedUseSkillItems,
         ctx,
         expectedReports: 1,
         reports: [],
@@ -238,7 +240,7 @@ export function createPromptBuildFlow(pi: ExtensionAPI, options: PromptBuildFlow
     await writeFinalPromptBuildSelection(run.session, finalPrompt, result.selectedOptions);
     progress.clear(run.ctx);
     if (options.openPromptEditor) {
-      await options.openPromptEditor(run.ctx, finalPrompt);
+      await options.openPromptEditor(run.ctx, finalPrompt, { selectedUseSkillItems: run.selectedUseSkillItems });
     } else {
       run.ctx.ui.setEditorText(finalPrompt);
       run.ctx.ui.notify("Prompt-build rebuilt the prompt input. Review and send it when ready.", "info");

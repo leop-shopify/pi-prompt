@@ -4,7 +4,14 @@ import { decodeKittyPrintable, matchesKey, truncateToWidth } from "@earendil-wor
 import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { type Draft, draftPreview, listDrafts, saveDraft } from "./drafts.js";
-import { listPromptTemplates, memorizePromptTemplate, type PromptTemplate } from "./prompt-templates.js";
+import {
+  applyPromptTemplateVariables,
+  extractPromptTemplateVariables,
+  listPromptTemplates,
+  memorizePromptTemplate,
+  type PromptTemplate,
+  type PromptTemplateKind,
+} from "./prompt-templates.js";
 import {
   createPromptBuildFlow,
   MULTIPLIER_CHOICES,
@@ -26,10 +33,13 @@ interface PromptSession {
   draftId?: string;
   preloadedPath?: string;
   templateName?: string;
+  templateKind?: PromptTemplateKind;
+  selectedUseSkillItems?: string[];
 }
 
 interface PromptSubmitOptions {
   multiplier: number | null;
+  commands: string[];
   skills: string[];
   saveAsTemplate: boolean;
 }
@@ -64,6 +74,7 @@ const EXIT_CHOICES = [
   { key: "esc", label: "Keep editing" },
 ] as const;
 
+const PROMPT_COMMAND_ITEMS = ["/goal"] as const;
 
 async function tryReadFile(cwd: string, rawPath: string): Promise<{ path: string; text: string } | { error: string }> {
   const cleaned = rawPath.trim().replace(/^@/, "");
@@ -80,8 +91,8 @@ async function tryReadFile(cwd: string, rawPath: string): Promise<{ path: string
 export default function (pi: ExtensionAPI) {
   let promptBuild!: ReturnType<typeof createPromptBuildFlow>;
   promptBuild = createPromptBuildFlow(pi, {
-    openPromptEditor: async (ctx, finalPrompt) => {
-      await openEditor(pi, ctx, finalPrompt, {}, promptBuild);
+    openPromptEditor: async (ctx, finalPrompt, options) => {
+      await openEditor(pi, ctx, finalPrompt, { selectedUseSkillItems: options?.selectedUseSkillItems }, promptBuild);
     },
   });
 
@@ -117,11 +128,12 @@ export default function (pi: ExtensionAPI) {
 
 function registerPromptCommand(pi: ExtensionAPI, name: "prompt" | "pi-prompt", promptBuild: ReturnType<typeof createPromptBuildFlow>): void {
   pi.registerCommand(name, {
-    description: "Open a fullscreen markdown prompt editor (optionally preload a file, `drafts`, or `templates`)",
+    description: "Open a fullscreen markdown prompt editor (optionally preload a file, `drafts`, `goal-templates`, or `loop-templates`)",
     getArgumentCompletions: (prefix: string) => {
       const completions = [
         { value: "drafts", label: "drafts", description: "Open saved drafts" },
-        { value: "templates", label: "templates", description: "Open saved prompt templates" },
+        { value: "goal-templates", label: "goal-templates", description: "Open goal prompt templates" },
+        { value: "loop-templates", label: "loop-templates", description: "Open loop prompt templates" },
         { value: "resume", label: "resume", description: "Resume paused prompt-build review" },
       ].filter((item) => item.value.startsWith(prefix));
       return completions.length > 0 ? completions : null;
@@ -137,8 +149,12 @@ function registerPromptCommand(pi: ExtensionAPI, name: "prompt" | "pi-prompt", p
         await openDraftsBrowser(pi, ctx, promptBuild);
         return;
       }
-      if (trimmed === "templates") {
-        await openPromptTemplatesBrowser(pi, ctx, promptBuild);
+      if (trimmed === "goal-templates") {
+        await openPromptTemplatesBrowser(pi, ctx, promptBuild, "goal");
+        return;
+      }
+      if (trimmed === "loop-templates") {
+        await openPromptTemplatesBrowser(pi, ctx, promptBuild, "loop");
         return;
       }
       if (trimmed === "resume") {
@@ -200,11 +216,11 @@ async function openEditor(
     const skillContext = await buildSelectedSkillBlocks(pi, outcome.options.skills);
 
     if (outcome.options.multiplier !== null) {
-      await promptBuild.start(ctx, text, outcome.options.multiplier, skillContext);
+      await promptBuild.start(ctx, text, outcome.options.multiplier, skillContext, outcome.options.commands);
       return;
     }
 
-    const message = buildDirectPromptMessage(text, skillContext);
+    const message = buildDirectPromptMessage(text, skillContext, outcome.options.commands);
     // When the agent is mid-turn, queue the prompt as a follow-up so the send
     // does not throw and does not interrupt the running turn.
     if (ctx.isIdle()) {
@@ -254,8 +270,8 @@ function runEditorOverlay(
     let skillQuery = "";
     let skillSuggestionIndex = 0;
     let saveAsTemplate = false;
-    const selectedSkills: string[] = [];
-    const availableSkills = listSkillCommands(pi).map((skill) => skill.name);
+    const selectedUseSkillItems = [...(session.selectedUseSkillItems ?? [])];
+    const availableUseSkillItems = [...PROMPT_COMMAND_ITEMS, ...listSkillCommands(pi).map((skill) => skill.name)];
 
     const submit = (text: string) => {
       const multiplier = multiplierValue(MULTIPLIER_CHOICES[multiplierIndex]!, customMultiplier);
@@ -268,7 +284,12 @@ function runEditorOverlay(
       done({
         kind: "submit",
         text,
-        options: { multiplier, skills: [...selectedSkills], saveAsTemplate },
+        options: {
+          multiplier,
+          commands: selectedUseSkillItems.filter(isPromptCommandItem),
+          skills: selectedUseSkillItems.filter((item) => !isPromptCommandItem(item)),
+          saveAsTemplate,
+        },
       });
     };
 
@@ -294,7 +315,7 @@ function runEditorOverlay(
     textarea.setText(initialText);
 
     const title = session.templateName
-      ? `prompt template — ${session.templateName}.md`
+      ? `${session.templateKind ?? "prompt"} template — ${session.templateName}.md`
       : session.preloadedPath ? `prompt — ${shortenPath(session.preloadedPath)}` : "prompt";
 
     const component: Component = {
@@ -336,7 +357,7 @@ function runEditorOverlay(
             height: controlFrameHeight,
             theme,
             title: "use skill",
-            body: [renderSkillValue(theme, contentWidth, selectedSkills, skillQuery, availableSkills, skillSuggestionIndex, focus === "skills")],
+            body: [renderSkillValue(theme, contentWidth, selectedUseSkillItems, skillQuery, availableUseSkillItems, skillSuggestionIndex, focus === "skills")],
             color: focus === "skills" ? "accent" : "borderMuted",
           }),
           ...renderFrame({
@@ -426,7 +447,7 @@ function runEditorOverlay(
       }
       if (matchesKey(data, "backspace") || data === "\x7f") {
         if (skillQuery.length > 0) skillQuery = skillQuery.slice(0, -1);
-        else selectedSkills.pop();
+        else selectedUseSkillItems.pop();
         skillSuggestionIndex = 0;
         return;
       }
@@ -459,13 +480,13 @@ function runEditorOverlay(
     }
 
     function currentSkillSuggestions(): string[] {
-      return skillSuggestions(availableSkills, skillQuery, selectedSkills);
+      return skillSuggestions(availableUseSkillItems, skillQuery, selectedUseSkillItems);
     }
 
     function acceptCurrentSkillSuggestion(): void {
       const query = skillQuery.trim();
       if (query.toLowerCase() === "none") {
-        selectedSkills.splice(0, selectedSkills.length);
+        selectedUseSkillItems.splice(0, selectedUseSkillItems.length);
         skillQuery = "";
         skillSuggestionIndex = 0;
         return;
@@ -473,7 +494,7 @@ function runEditorOverlay(
       const suggestions = currentSkillSuggestions();
       const exact = suggestions.find((skill) => skill.toLowerCase() === query.toLowerCase());
       const chosen = exact ?? suggestions[0] ?? query;
-      if (chosen && availableSkills.includes(chosen) && !selectedSkills.includes(chosen)) selectedSkills.push(chosen);
+      if (chosen && availableUseSkillItems.includes(chosen) && !selectedUseSkillItems.includes(chosen)) selectedUseSkillItems.push(chosen);
       skillQuery = "";
       skillSuggestionIndex = 0;
     }
@@ -525,6 +546,10 @@ function movePromptFieldFocus(current: PromptFieldFocus, direction: -1 | 1, incl
   const safeIndex = index >= 0 ? index : 0;
   const nextIndex = (safeIndex + direction + focusOrder.length) % focusOrder.length;
   return focusOrder[nextIndex]!;
+}
+
+function isPromptCommandItem(item: string): boolean {
+  return (PROMPT_COMMAND_ITEMS as readonly string[]).includes(item);
 }
 
 function listSkillCommands(pi: ExtensionAPI): SkillCommandInfo[] {
@@ -614,9 +639,9 @@ function renderSkillValue(
   focused: boolean,
 ): string {
   const chips = selected.length > 0
-    ? selected.map((skill) => theme.fg("accent", `@${skill}`)).join(" ")
+    ? selected.map((item) => theme.fg(isPromptCommandItem(item) ? "warning" : "accent", isPromptCommandItem(item) ? item : `@${item}`)).join(" ")
     : focused ? "" : theme.fg("dim", "none");
-  const hint = available.length === 0 ? "no skills available" : "type skill name, enter/comma to add, type none to clear";
+  const hint = available.length === 0 ? "no skills or commands available" : "type skill name or /command, enter/comma to add, type none to clear";
   const typed = focused ? `${query}█` : query;
   const queryText = typed.length > 0 ? theme.fg(focused ? "warning" : "dim", typed) : theme.fg("dim", hint);
   const separator = chips && queryText ? " " : "";
@@ -627,13 +652,48 @@ function renderSaveAsTemplateValue(theme: Theme, width: number, enabled: boolean
   const checkbox = enabled ? "[x]" : "[ ]";
   const label = `${checkbox} save as template?`;
   const control = focused ? theme.fg("accent", theme.bold(label)) : theme.fg("muted", theme.bold(label));
-  const hint = theme.fg("dim", "  saves to ~/.pi/agent/prompt-templates/ on send");
+  const hint = theme.fg("dim", "  saves goal template to ~/.pi/agent/prompt-templates/ on send");
   return truncateToWidth(`${control}${hint}`, width, "…", false);
 }
 
-function buildDirectPromptMessage(text: string, skillContext: string): string {
-  if (skillContext.trim().length === 0) return text;
-  return [skillContext.trim(), "", "User prompt:", text].join("\n");
+export function buildDirectPromptMessage(text: string, skillContext: string, commands: string[] = []): string {
+  const uniqueCommands = uniquePromptCommands(commands);
+  let promptText = text.trim();
+  for (const command of uniqueCommands) promptText = stripLeadingPromptCommand(promptText, command).trimStart();
+
+  const body = skillContext.trim().length === 0
+    ? promptText
+    : [skillContext.trim(), "", "User prompt:", promptText].join("\n");
+
+  if (uniqueCommands.length === 0) return body;
+  return `${uniqueCommands.join("\n")} ${body}`.trimEnd();
+}
+
+function uniquePromptCommands(commands: string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+
+  for (const command of commands) {
+    if (!isPromptCommandItem(command) || seen.has(command)) continue;
+    seen.add(command);
+    unique.push(command);
+  }
+
+  return unique;
+}
+
+export function stripLeadingPromptCommand(text: string, command: string): string {
+  const trimmedStart = text.trimStart();
+  const leadingWhitespace = text.slice(0, text.length - trimmedStart.length);
+  const escapedCommand = escapeRegExp(command);
+  const match = trimmedStart.match(new RegExp(`^${escapedCommand}(?:\\s+|$)`));
+  if (!match) return text;
+
+  return `${leadingWhitespace}${trimmedStart.slice(match[0].length)}`;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function buildEditFooter(theme: Theme, selectionInfo: string): string {
@@ -677,22 +737,51 @@ async function openDraftsBrowser(pi: ExtensionAPI, ctx: ExtensionCommandContext,
   await openEditor(pi, ctx, draft.text, { draftId: draft.id }, promptBuild);
 }
 
-async function openPromptTemplatesBrowser(pi: ExtensionAPI, ctx: ExtensionCommandContext, promptBuild: ReturnType<typeof createPromptBuildFlow>): Promise<void> {
-  const templates = await listPromptTemplates();
+async function openPromptTemplatesBrowser(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  promptBuild: ReturnType<typeof createPromptBuildFlow>,
+  kind: PromptTemplateKind,
+): Promise<void> {
+  const templates = await listPromptTemplates({ kind });
+  const label = kind === "goal" ? "goal template" : "loop template";
   if (templates.length === 0) {
-    ctx.ui.notify("No saved prompt templates", "info");
+    ctx.ui.notify(`No saved ${label}s`, "info");
     return;
   }
 
   const labels = templates.map(promptTemplateLabel);
-  const chosenLabel = await ctx.ui.select("Open a prompt template", labels);
+  const chosenLabel = await ctx.ui.select(`Open a ${label}`, labels);
   if (!chosenLabel) return;
 
   const index = labels.indexOf(chosenLabel);
   const template = index >= 0 ? templates[index] : undefined;
   if (!template) return;
 
-  await openEditor(pi, ctx, template.text, { preloadedPath: template.path, templateName: template.name }, promptBuild);
+  const filledText = await fillPromptTemplateVariables(ctx, template.text);
+  if (filledText === undefined) return;
+
+  const initialText = kind === "goal" ? stripLeadingPromptCommand(filledText, "/goal").trimStart() : filledText;
+  await openEditor(pi, ctx, initialText, {
+    preloadedPath: template.path,
+    templateName: template.name,
+    templateKind: kind,
+    selectedUseSkillItems: kind === "goal" ? ["/goal"] : [],
+  }, promptBuild);
+}
+
+async function fillPromptTemplateVariables(ctx: ExtensionCommandContext, text: string): Promise<string | undefined> {
+  const variables = extractPromptTemplateVariables(text);
+  if (variables.length === 0) return text;
+
+  const values: Record<string, string> = {};
+  for (const variable of variables) {
+    const value = await ctx.ui.input(`Fill template variable: {{${variable}}}`, variable);
+    if (value === undefined) return undefined;
+    values[variable] = value;
+  }
+
+  return applyPromptTemplateVariables(text, values);
 }
 
 function promptTemplateLabel(template: PromptTemplate): string {

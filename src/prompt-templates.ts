@@ -11,6 +11,7 @@ export interface MemorizedPromptTemplate {
 }
 
 export type PromptTemplateSource = "extension" | "user";
+export type PromptTemplateKind = "goal" | "loop";
 
 export interface PromptTemplate {
   name: string;
@@ -24,24 +25,31 @@ export interface ListPromptTemplatesOptions {
   userTemplatesDir?: string;
   extensionTemplatesDir?: string;
   includeExtensionTemplates?: boolean;
+  kind?: PromptTemplateKind;
 }
 
 const MAX_TEMPLATE_NAME_LENGTH = 48;
+const PROMPT_TEMPLATE_VARIABLE_PATTERN = /{{\s*([^{}\n]+?)\s*}}/g;
 
-export function userPromptTemplatesPath(): string {
-  return join(getAgentDir(), "prompt-templates");
+function promptTemplatesDirName(kind: PromptTemplateKind): string {
+  return kind === "loop" ? "loop-templates" : "prompt-templates";
 }
 
-export function extensionPromptTemplatesPath(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "..", "prompt-templates");
+export function userPromptTemplatesPath(kind: PromptTemplateKind = "goal"): string {
+  return join(getAgentDir(), promptTemplatesDirName(kind));
+}
+
+export function extensionPromptTemplatesPath(kind: PromptTemplateKind = "goal"): string {
+  return join(dirname(fileURLToPath(import.meta.url)), "..", promptTemplatesDirName(kind));
 }
 
 export async function listPromptTemplates(options: ListPromptTemplatesOptions = {}): Promise<PromptTemplate[]> {
+  const kind = options.kind ?? "goal";
   const includeExtensionTemplates = options.includeExtensionTemplates ?? true;
   const extensionTemplates = includeExtensionTemplates
-    ? await readPromptTemplates(options.extensionTemplatesDir ?? extensionPromptTemplatesPath(), "extension")
+    ? await readPromptTemplates(options.extensionTemplatesDir ?? extensionPromptTemplatesPath(kind), "extension")
     : [];
-  const userTemplates = await readPromptTemplates(options.userTemplatesDir ?? userPromptTemplatesPath(), "user");
+  const userTemplates = await readPromptTemplates(options.userTemplatesDir ?? userPromptTemplatesPath(kind), "user");
 
   return mergePromptTemplates([...extensionTemplates, ...userTemplates]);
 }
@@ -70,6 +78,27 @@ export async function memorizePromptTemplate(text: string): Promise<MemorizedPro
   }
 
   throw new Error(`Could not find an available prompt template name for ${baseName}`);
+}
+
+export function extractPromptTemplateVariables(text: string): string[] {
+  const variables: string[] = [];
+  const seen = new Set<string>();
+
+  for (const match of text.matchAll(PROMPT_TEMPLATE_VARIABLE_PATTERN)) {
+    const variable = match[1]?.trim();
+    if (!variable || seen.has(variable)) continue;
+    seen.add(variable);
+    variables.push(variable);
+  }
+
+  return variables;
+}
+
+export function applyPromptTemplateVariables(text: string, values: Record<string, string>): string {
+  return text.replace(PROMPT_TEMPLATE_VARIABLE_PATTERN, (placeholder, rawVariable: string) => {
+    const variable = rawVariable.trim();
+    return Object.prototype.hasOwnProperty.call(values, variable) ? values[variable] ?? "" : placeholder;
+  });
 }
 
 export function promptTemplateName(text: string): string {

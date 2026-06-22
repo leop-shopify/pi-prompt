@@ -1,6 +1,6 @@
 {
   "name": "pi-prompt",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "packageManager": "pnpm@10.28.0",
   "type": "module",
@@ -25,6 +25,7 @@
     "src/prompt-build/**/*.ts",
     "src/prompt-build/skills/**/*.md",
     "prompt-templates/**/*.md",
+    "loop-templates/**/*.md",
     "src/textarea.ts",
     "src/ui.ts",
     "README.md",

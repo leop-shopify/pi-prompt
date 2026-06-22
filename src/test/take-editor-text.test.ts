@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { promptFieldFocusForInput, takeEditorText } from "../index.js";
+import { buildDirectPromptMessage, promptFieldFocusForInput, stripLeadingPromptCommand, takeEditorText } from "../index.js";
 
 function makeCtx(initial: string): { ctx: ExtensionContext; getText: () => string } {
   let text = initial;
@@ -35,6 +35,27 @@ describe("prompt field focus navigation", () => {
   it("can omit the save-as-template field from focus navigation", () => {
     expect(promptFieldFocusForInput("skills", KEY.tab, false)).toBe("multiplier");
     expect(promptFieldFocusForInput("multiplier", KEY.shiftTab, false)).toBe("skills");
+  });
+});
+
+describe("prompt command message building", () => {
+  it("prefixes selected slash commands before skill context", () => {
+    const message = buildDirectPromptMessage("Implement the change", "<skill>skill content</skill>", ["/goal"]);
+
+    expect(message).toBe([
+      "/goal <skill>skill content</skill>",
+      "",
+      "User prompt:",
+      "Implement the change",
+    ].join("\n"));
+  });
+
+  it("does not duplicate a command already present in template text", () => {
+    expect(buildDirectPromptMessage("/goal Implement the change", "", ["/goal"])).toBe("/goal Implement the change");
+  });
+
+  it("strips a leading slash command from loaded template body text", () => {
+    expect(stripLeadingPromptCommand("  /goal\nImplement the change", "/goal")).toBe("  Implement the change");
   });
 });
 

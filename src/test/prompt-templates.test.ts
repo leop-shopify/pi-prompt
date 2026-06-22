@@ -2,7 +2,14 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { extensionPromptTemplatesPath, listPromptTemplates, memorizePromptTemplate, promptTemplateName } from "../prompt-templates.js";
+import {
+  applyPromptTemplateVariables,
+  extensionPromptTemplatesPath,
+  extractPromptTemplateVariables,
+  listPromptTemplates,
+  memorizePromptTemplate,
+  promptTemplateName,
+} from "../prompt-templates.js";
 
 const ORIGINAL_AGENT_DIR = process.env.PI_CODING_AGENT_DIR;
 let tempAgentDir: string | undefined;
@@ -49,6 +56,24 @@ describe("promptTemplateName", () => {
   });
 });
 
+describe("template variables", () => {
+  it("extracts unique {{variable}} placeholders in order", () => {
+    expect(extractPromptTemplateVariables("Ship {{project}} in {{repo_name}} then {{ project }} and {{test file}} again.")).toEqual([
+      "project",
+      "repo_name",
+      "test file",
+    ]);
+  });
+
+  it("applies provided {{variable}} values and leaves unknown placeholders intact", () => {
+    expect(applyPromptTemplateVariables("Ship {{project}} from {{ repo }}. Test {{test file}}. Keep {{unknown}}.", {
+      project: "checkout",
+      repo: "payments",
+      "test file": "checkout.test.ts",
+    })).toBe("Ship checkout from payments. Test checkout.test.ts. Keep {{unknown}}.");
+  });
+});
+
 describe("listPromptTemplates", () => {
   it("lists user-saved prompt templates from the Pi agent prompt-templates directory", async () => {
     const agentDir = await useTempAgentDir();
@@ -90,6 +115,39 @@ describe("listPromptTemplates", () => {
         title: "Review user stories",
         text: "# Review user stories\n\nCreate user stories from the app code.\n",
         source: "extension",
+      },
+    ]);
+  });
+
+  it("lists loop templates from loop-template directories without requiring /goal", async () => {
+    const agentDir = await useTempAgentDir();
+    const extensionTemplatesDir = join(agentDir, "extension-loop-templates");
+    const userTemplatesDir = join(agentDir, "loop-templates");
+    await mkdir(extensionTemplatesDir, { recursive: true });
+    await mkdir(userTemplatesDir, { recursive: true });
+    await writeFile(join(extensionTemplatesDir, "small-review.md"), [
+      "---",
+      "description: Small review loop",
+      "---",
+      "Review the current file and list one improvement.",
+      "",
+    ].join("\n"), "utf8");
+    await writeFile(join(userTemplatesDir, "scratch.md"), "Summarize {{file}} in three bullets.\n", "utf8");
+
+    await expect(listPromptTemplates({ kind: "loop", extensionTemplatesDir, userTemplatesDir })).resolves.toEqual([
+      {
+        name: "small-review",
+        path: join(extensionTemplatesDir, "small-review.md"),
+        title: "Small review loop",
+        text: "Review the current file and list one improvement.\n",
+        source: "extension",
+      },
+      {
+        name: "scratch",
+        path: join(userTemplatesDir, "scratch.md"),
+        title: "Summarize {{file}} in three bullets.",
+        text: "Summarize {{file}} in three bullets.\n",
+        source: "user",
       },
     ]);
   });
