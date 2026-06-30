@@ -216,7 +216,8 @@ async function openEditor(
     const skillContext = await buildSelectedSkillBlocks(pi, outcome.options.skills);
 
     if (outcome.options.multiplier !== null) {
-      await promptBuild.start(ctx, text, outcome.options.multiplier, skillContext, outcome.options.commands);
+      const normalized = normalizePromptCommandInput(text, outcome.options.commands);
+      await promptBuild.start(ctx, normalized.promptText, outcome.options.multiplier, skillContext, normalized.commands);
       return;
     }
 
@@ -664,16 +665,22 @@ function renderSaveAsTemplateValue(theme: Theme, width: number, enabled: boolean
   return truncateToWidth(`${control}${hint}`, width, "…", false);
 }
 
-export function buildDirectPromptMessage(text: string, skillContext: string, commands: string[] = []): string {
+export function normalizePromptCommandInput(text: string, commands: string[] = []): { promptText: string; commands: string[] } {
   const promptCommands = uniquePromptCommands(commands);
   let promptText = text.trim();
   for (const command of promptCommands) promptText = stripLeadingPromptCommand(promptText, command).trimStart();
 
   const leadingCommand = splitLeadingSlashCommand(promptText);
-  if (leadingCommand && !promptCommands.includes(leadingCommand.command)) {
+  if (leadingCommand && isPromptCommandItem(leadingCommand.command) && !promptCommands.includes(leadingCommand.command)) {
     promptCommands.push(leadingCommand.command);
     promptText = leadingCommand.rest.trimStart();
   }
+
+  return { promptText, commands: promptCommands };
+}
+
+export function buildDirectPromptMessage(text: string, skillContext: string, commands: string[] = []): string {
+  const { promptText, commands: promptCommands } = normalizePromptCommandInput(text, commands);
 
   const body = skillContext.trim().length === 0
     ? promptText

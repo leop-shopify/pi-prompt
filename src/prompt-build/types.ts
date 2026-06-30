@@ -1,6 +1,9 @@
-export type MultiplierChoice = "none" | "5" | "10" | "15" | "20" | "25" | "custom";
+export const PROMPT_BRANCH_OPTION_MIN = 3;
+export const PROMPT_BRANCH_OPTION_MAX = 5;
 
-export const MULTIPLIER_CHOICES: MultiplierChoice[] = ["none", "5", "10", "15", "20", "25", "custom"];
+export type MultiplierChoice = "none" | "1" | "2" | "3" | "5" | "10" | "custom";
+
+export const MULTIPLIER_CHOICES: MultiplierChoice[] = ["none", "1", "2", "3", "5", "10", "custom"];
 
 export interface PromptBranchPlan {
   index: number;

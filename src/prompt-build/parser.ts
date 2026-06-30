@@ -1,4 +1,4 @@
-import type { ParsedPromptOption, PromptBranchPlan, PromptBranchResult } from "./types.js";
+import { PROMPT_BRANCH_OPTION_MAX, PROMPT_BRANCH_OPTION_MIN, type ParsedPromptOption, type PromptBranchPlan, type PromptBranchResult } from "./types.js";
 
 const FALLBACK_BRANCHES: Array<Omit<PromptBranchPlan, "index">> = [
   {
@@ -128,7 +128,7 @@ export function parsePromptOptions(branch: PromptBranchResult): ParsedPromptOpti
   if (!parsed) return [];
 
   const options = promptOptionsFromJson(branch, parsed);
-  return options.length >= 3 ? options : [];
+  return options.length >= PROMPT_BRANCH_OPTION_MIN ? options.slice(0, PROMPT_BRANCH_OPTION_MAX) : [];
 }
 
 export function parseAllPromptOptions(branches: PromptBranchResult[]): ParsedPromptOption[] {
@@ -138,7 +138,7 @@ export function parseAllPromptOptions(branches: PromptBranchResult[]): ParsedPro
 }
 
 function promptOptionsFromJson(branch: PromptBranchResult, parsed: JsonBranchOutput): ParsedPromptOption[] {
-  const modules: JsonPromptModule[] = Array.isArray(parsed.modules)
+  const modules: JsonPromptModule[] = Array.isArray(parsed.modules) && parsed.modules.length > 0
     ? parsed.modules as JsonPromptModule[]
     : [{ id: "module", title: branch.title, candidates: parsed.candidates ?? parsed.options }];
 
@@ -203,8 +203,7 @@ function sectionText(output: string, headingPattern: RegExp): string {
 
 function parseBranchJson(output: string): JsonBranchOutput | null {
   const trimmed = output.trim();
-  const fencedJson = trimmed.match(/^```json\s*([\s\S]*?)```\s*$/i)?.[1]?.trim();
-  const jsonText = fencedJson ?? (trimmed.startsWith("{") && trimmed.endsWith("}") ? trimmed : null);
+  const jsonText = extractJsonText(trimmed) ?? (trimmed.startsWith("{") && trimmed.endsWith("}") ? trimmed : null);
   if (!jsonText) return null;
   try {
     const parsed = JSON.parse(jsonText) as JsonBranchOutput;
@@ -215,13 +214,63 @@ function parseBranchJson(output: string): JsonBranchOutput | null {
 }
 
 function extractJsonText(raw: string): string | null {
-  const fenced = raw.match(/```json\s*([\s\S]*?)```/i)?.[1];
-  if (fenced?.trim()) return fenced.trim();
+  const fencedMatches = raw.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi);
+  for (const match of fencedMatches) {
+    const candidate = match[1]?.trim();
+    if (candidate && parsesAsObject(candidate)) return candidate;
+  }
 
-  const firstBrace = raw.indexOf("{");
-  const lastBrace = raw.lastIndexOf("}");
-  if (firstBrace >= 0 && lastBrace > firstBrace) return raw.slice(firstBrace, lastBrace + 1).trim();
+  return firstBalancedJsonObject(raw);
+}
+
+function firstBalancedJsonObject(raw: string): string | null {
+  for (let start = 0; start < raw.length; start += 1) {
+    if (raw[start] !== "{") continue;
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let index = start; index < raw.length; index += 1) {
+      const char = raw[index];
+
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === '"') {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+      if (char === "{") depth += 1;
+      if (char !== "}") continue;
+
+      depth -= 1;
+      if (depth !== 0) continue;
+
+      const candidate = raw.slice(start, index + 1).trim();
+      if (parsesAsObject(candidate)) return candidate;
+      break;
+    }
+  }
+
   return null;
+}
+
+function parsesAsObject(text: string): boolean {
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return Boolean(parsed && typeof parsed === "object" && !Array.isArray(parsed));
+  } catch {
+    return false;
+  }
 }
 
 function stringValue(value: unknown): string | undefined {

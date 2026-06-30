@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { buildDirectPromptMessage, promptCommandForTemplateKind, promptFieldFocusForInput, shouldSubmitThroughPiInput, stripLeadingPromptCommand, takeEditorText } from "../index.js";
+import { buildDirectPromptMessage, normalizePromptCommandInput, promptCommandForTemplateKind, promptFieldFocusForInput, shouldSubmitThroughPiInput, stripLeadingPromptCommand, takeEditorText } from "../index.js";
 
 function makeCtx(initial: string): { ctx: ExtensionContext; getText: () => string } {
   let text = initial;
@@ -61,6 +61,17 @@ describe("prompt command message building", () => {
 
   it("does not duplicate a command already present in template text", () => {
     expect(buildDirectPromptMessage("/goal Implement the change", "", ["/goal"])).toBe("/goal Implement the change");
+  });
+
+  it("extracts typed prompt commands before multiplier agents see the prompt body", () => {
+    expect(normalizePromptCommandInput("/loop I want to build a house")).toEqual({
+      promptText: "I want to build a house",
+      commands: ["/loop"],
+    });
+    expect(normalizePromptCommandInput("/goal\nImplement the change", ["/goal"])).toEqual({
+      promptText: "Implement the change",
+      commands: ["/goal"],
+    });
   });
 
   it("keeps a typed slash command in front of selected skill context", () => {

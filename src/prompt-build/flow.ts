@@ -30,6 +30,7 @@ interface ActivePromptBuildRun {
   reports: PromptBranchResult[];
   session: PromptBuildSessionFiles;
   reviewState?: PromptBuildReviewState;
+  completedReportKeys: Set<string>;
 }
 
 interface PromptBuildAgentReportEvent {
@@ -86,6 +87,7 @@ export function createPromptBuildFlow(pi: ExtensionAPI, options: PromptBuildFlow
         expectedReports: 1,
         reports: [],
         session,
+        completedReportKeys: new Set(),
       };
 
       progress.set(ctx, `using ${multiplier}x prompt multiplier`);
@@ -95,7 +97,7 @@ export function createPromptBuildFlow(pi: ExtensionAPI, options: PromptBuildFlow
         description: "pi-prompt pre-build prompt planner",
         prompts: [planPrompt(text, multiplier, skillContext)],
         agentNamePrefix: "pre-build",
-        thinking: "medium",
+        model_slot: "reading-default",
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -127,7 +129,7 @@ export function createPromptBuildFlow(pi: ExtensionAPI, options: PromptBuildFlow
     if (run.phase === "planning" && (payload.status === "started" || payload.status === "spawned")) {
       const started = payload.started ?? 0;
       const suffix = payload.status === "spawned" ? ` · ${started}/1 pre-build agent started` : " · starting pre-build agent";
-      progress.set(run.ctx, `using ${run.requestedMaxBranches}x prompt multiplier · pi-extended-teams${suffix} · medium effort`);
+      progress.set(run.ctx, `using ${run.requestedMaxBranches}x prompt multiplier · pi-extended-teams${suffix} · reading-default`);
       return;
     }
     const text = payload.text ?? (payload.total ? `using pi-extended-teams · ${payload.started ?? 0}/${payload.total} prompt-build agents started` : "using pi-extended-teams · working");
@@ -150,12 +152,21 @@ export function createPromptBuildFlow(pi: ExtensionAPI, options: PromptBuildFlow
 
     try {
       if (run.phase === "planning") {
+        if (!isPlanningAgentName(payload.name)) return;
+        const reportKey = `planning:${payload.name}`;
+        if (run.completedReportKeys.has(reportKey)) return;
+        run.completedReportKeys.add(reportKey);
         await handlePlanningReport(run, payload.report);
         return;
       }
 
       if (run.phase !== "branches") return;
-      await handleBranchReport(run, payload);
+      const branchIndex = branchIndexFromAgentName(payload.name);
+      if (branchIndex === null || branchIndex < 1 || branchIndex > run.expectedReports) return;
+      const reportKey = `branch:${branchIndex}`;
+      if (run.completedReportKeys.has(reportKey)) return;
+      run.completedReportKeys.add(reportKey);
+      await handleBranchReport(run, payload, branchIndex);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       progress.set(run.ctx, `building prompt — failed: ${message}`);
@@ -177,12 +188,11 @@ export function createPromptBuildFlow(pi: ExtensionAPI, options: PromptBuildFlow
       description: "pi-prompt prompt-build branches",
       prompts: plans.map((plan: PromptBranchPlan) => branchTaskPrompt(run.originalPrompt, plan.index, plans.length, run.skillContext, plan)),
       agentNamePrefix: "prompt-branch",
-      thinking: "high",
+      model_slot: "reading-default",
     });
   }
 
-  async function handleBranchReport(run: ActivePromptBuildRun, payload: PromptBuildAgentReportEvent): Promise<void> {
-    const index = branchIndexFromAgentName(payload.name) ?? run.reports.length + 1;
+  async function handleBranchReport(run: ActivePromptBuildRun, payload: PromptBuildAgentReportEvent, index: number): Promise<void> {
     let branch = {
       index,
       title: titleFromBranchOutput(payload.report ?? "", index),
@@ -255,9 +265,13 @@ export function createPromptBuildFlow(pi: ExtensionAPI, options: PromptBuildFlow
   return { start, resume, handleProgress, handleError, handleAgentReport, shutdown };
 }
 
-function branchIndexFromAgentName(name: unknown): number | null {
+export function isPlanningAgentName(name: unknown): boolean {
+  return typeof name === "string" && /^pre-build-\d+$/.test(name);
+}
+
+export function branchIndexFromAgentName(name: unknown): number | null {
   if (typeof name !== "string") return null;
-  const match = name.match(/prompt-branch-(\d+)/);
+  const match = name.match(/^prompt-branch-(\d+)$/);
   if (!match) return null;
   const parsed = Number.parseInt(match[1]!, 10);
   return Number.isFinite(parsed) ? parsed : null;

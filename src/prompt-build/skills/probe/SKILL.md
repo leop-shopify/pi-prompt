@@ -48,7 +48,7 @@ Uncertainty / limits:
 
 ## Output for prompt-build probes
 
-When the probe feeds prompt-build, you receive one assigned prompt-building topic. Stay on that topic and return structured JSON so the UI can let the user choose exact text literally. Return at least three valid candidates for the assigned topic; fewer than three candidates is invalid output.
+When the probe feeds prompt-build, you receive one assigned prompt-building topic. Stay on that topic and return one structured JSON object so the UI can let the user choose exact text literally. Return 3-5 valid actionable candidates total for the assigned topic; fewer than three candidates is invalid output, and more than five candidates will be ignored.
 
 ```json
 {
@@ -57,18 +57,12 @@ When the probe feeds prompt-build, you receive one assigned prompt-building topi
     "title": "Short path title",
     "summary": "What this probe angle contributes to the future prompt"
   },
-  "modules": [
+  "candidates": [
     {
-      "id": "scope",
-      "title": "Scope guard",
-      "candidates": [
-        {
-          "label": "Smallest safe scope",
-          "exactText": "Exact prompt text the user can choose to include.",
-          "rationale": "Why this candidate helps; not written into the final prompt.",
-          "evidence": "File paths, docs, logs, commands, or 'No external evidence needed'."
-        }
-      ]
+      "label": "Smallest safe scope",
+      "exactText": "Exact prompt text the user can choose to include.",
+      "rationale": "Why this candidate helps; not written into the final prompt.",
+      "evidence": "File paths, docs, logs, commands, or 'No external evidence needed'."
     }
   ]
 }
@@ -79,6 +73,6 @@ Rules for prompt-build JSON:
 - `exactText` must be complete, copy-ready instruction text.
 - Keep rationale and evidence out of `exactText`; the final prompt only includes chosen exactText.
 - Do not fabricate evidence. If no evidence was needed, say so.
-- Produce at least three high-signal candidates for the assigned topic.
+- Produce 3-5 high-signal actionable candidates for the assigned topic.
 - Do not solve the user's goal inside exactText; encode how the future agent should solve it.
 - Do not drift into another topic. If another topic matters, mention it in rationale/evidence rather than returning off-topic exactText.

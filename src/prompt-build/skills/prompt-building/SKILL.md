@@ -1,6 +1,6 @@
 ---
 name: prompt-building
-description: Expert prompt construction for Pi workflows. Use whenever the user wants to build, improve, multiply, review, assemble, or send a better prompt/instruction set instead of doing the underlying work now. Strongly trigger on prompt-build, prompt multiplier, pre-build prompt, exact prompt modules, branch/probe candidates, agent instructions, or “make this prompt better.” Enforces literal user choice: generated candidates must separate exactText from rationale/evidence, and final prompts may include only the original prompt plus user-selected exactText.
+description: Expert prompt construction for Pi workflows. Use whenever the user wants to build, improve, multiply, review, assemble, or send a better prompt/instruction set instead of doing the underlying work now. Strongly trigger on prompt-build, prompt multiplier, pre-build prompt, exact prompt candidates, branch/probe candidates, agent instructions, or “make this prompt better.” Enforces literal user choice: generated candidates must separate exactText from rationale/evidence, and final prompts may include only the original prompt plus user-selected exactText.
 ---
 
 # Prompt Building
@@ -14,7 +14,7 @@ Prompt-building is a product flow: it helps the user decide what instructions a 
 1. **Do not solve the underlying task.** Build the prompt that would solve it later.
 2. **Do not silently write generated prose.** Anything that can enter the final prompt must be shown as `exactText` and selected by the user.
 3. **Separate exact text from explanation.** Reasons, evidence, tradeoffs, and warnings belong outside `exactText`.
-4. **Preserve the original prompt.** The deterministic final prompt should be the user's original prompt plus selected exact modules.
+4. **Preserve the original prompt.** The deterministic final prompt should be the user's original prompt plus selected exactText items.
 5. **Prefer fewer, sharper choices.** A multiplier is a maximum, not a quota.
 6. **Make choices meaningful.** Do not create cosmetic variants that differ only in phrasing.
 7. **Keep boundaries explicit.** Scope, non-goals, stop conditions, verification, and reporting expectations often matter more than style.
@@ -33,7 +33,7 @@ Good topics include:
 - Risk boundaries: security, production, data, install/deploy/commit restrictions.
 - Product or UX tradeoffs the future prompt must not decide silently.
 
-Do not create topics just to use the multiplier. If five topics are useful for a 25x request, use five. Every topic probe must return at least three valid structured options for that same topic; fewer than three options is a failed topic, not a partial success.
+Do not create topics just to use the multiplier. If five topics are useful for a 25x request, use five. Every topic probe must return 3-5 valid actionable candidates for that same topic; fewer than three candidates is a failed topic, and more than five candidates will be ignored.
 
 ## Candidate JSON contract
 
@@ -46,18 +46,12 @@ Prompt-build agents should return only JSON in this shape:
     "title": "Short branch title",
     "summary": "What this branch contributes to the future prompt"
   },
-  "modules": [
+  "candidates": [
     {
-      "id": "scope",
-      "title": "Module title shown in the UI",
-      "candidates": [
-        {
-          "label": "Chooser label",
-          "exactText": "Exact prompt text the user may choose to include. It must stand alone.",
-          "rationale": "Why this candidate helps. This is not written into the final prompt.",
-          "evidence": "Concrete files/docs/observations used, or 'No external evidence needed'."
-        }
-      ]
+      "label": "Chooser label",
+      "exactText": "Exact prompt text the user may choose to include. It must stand alone.",
+      "rationale": "Why this candidate helps. This is not written into the final prompt.",
+      "evidence": "Concrete files/docs/observations used, or 'No external evidence needed'."
     }
   ]
 }
@@ -65,7 +59,7 @@ Prompt-build agents should return only JSON in this shape:
 
 Candidate quality bar:
 
-- Each assigned topic returns at least three valid candidates.
+- Each assigned topic returns 3-5 valid actionable candidates total.
 - Every candidate stays on the assigned topic.
 - `exactText` is imperative and operational.
 - `exactText` contains no unsupported claims.
@@ -97,7 +91,7 @@ Do not ask another model to synthesize the final prompt from branch reports. Tha
 
 A good prompt-build review flow lets the user:
 
-- Navigate by branch/module and by next undecided option.
+- Navigate by branch and by next undecided candidate.
 - Multi-select any number of candidates.
 - Ignore individual candidates, not whole branches only.
 - See exactText, rationale, evidence, and source separately.

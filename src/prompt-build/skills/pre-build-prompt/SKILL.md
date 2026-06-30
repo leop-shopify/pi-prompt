@@ -9,7 +9,7 @@ Use this skill to construct the prompt that should be sent for the real work. Do
 
 The output is a better work prompt: clear enough that a future agent can execute without guessing, overreaching, or silently choosing risky defaults.
 
-For prompt-build multiplier mode, pre-build first identifies concrete prompt-building topics. Each topic will be sent to a probe agent, and that agent must return at least three options for extending or refining that same topic.
+For prompt-build multiplier mode, pre-build first identifies concrete prompt-building topics. Each topic will be sent to a probe agent, and that agent must return 3-5 actionable options for extending or refining that same topic.
 
 ## Core stance
 
