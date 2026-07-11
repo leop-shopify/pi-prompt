@@ -1,0 +1,281 @@
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { connect } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import { startPlanHttpHost, SECURITY_HEADERS } from "../plan/http-server.js";
+import type { PlanController, PlanControllerEvent } from "../plan/controller.js";
+import type { PlanSession } from "../plan/types.js";
+
+function readyState(overrides: Partial<PlanSession> = {}): PlanSession {
+  return {
+    schemaVersion: 1, id: "session", stateVersion: 3, documentRevision: 1, status: "ready",
+    source: { prompt: "PRIVATE SOURCE", cwd: "/private/cwd", skills: [{ name: "private", path: "/private/SKILL.md", baseDir: "/private", sha256: "a".repeat(64) }] },
+    execution: { kind: "normal" }, generation: { mode: "normal" },
+    document: { id: "document", title: { id: "title", kind: "title", body: "Hostile </script><img onerror=1>", children: [] }, elements: [{ id: "execution", kind: "execution", body: "Normal, staged only", children: [] }, { id: "step", kind: "step", title: "Build", body: "Do it", children: [] }] }, annotations: [], ...overrides,
+  } as PlanSession;
+}
+function fakeController(initial = readyState(), behavior: { stageFailures?: number } = {}) {
+  let state = initial;
+  let stageFailures = behavior.stageFailures ?? 0;
+  let staged = false;
+  const listeners = new Set<(event: PlanControllerEvent) => void>();
+  let note = 0; let job = 0;
+  const publish = (kind = "state-changed") => { for (const listener of listeners) listener({ kind: kind as any, sessionId: state.id, status: state.status, stateVersion: state.stateVersion, documentRevision: state.documentRevision }); };
+  const commit = (patch: Partial<PlanSession>, kind?: string) => { state = { ...state, stateVersion: state.stateVersion + 1, ...patch } as PlanSession; publish(kind); return { ok: true as const, value: undefined }; };
+  const controller = {
+    snapshot: vi.fn(() => state),
+    subscribe: vi.fn((listener: (event: PlanControllerEvent) => void) => { listeners.add(listener); return () => listeners.delete(listener); }),
+    addAnnotation: vi.fn(async ({ target, body }: any) => commit({ annotations: [...state.annotations, { id: `note-${++note}`, target, targetSnapshot: { documentRevision: state.documentRevision, target, elementKind: target.kind === "root" ? "root" : "step", text: target.kind === "root" ? "" : "Do it" }, body, status: "open", history: [], createdAgainstRevision: state.documentRevision, createdAt: "2026-07-10T00:00:00.000Z", updatedAt: "2026-07-10T00:00:00.000Z" }] })),
+    updateAnnotationBody: vi.fn(async ({ annotationId, body }: any) => commit({ annotations: state.annotations.map((entry) => entry.id === annotationId ? { ...entry, body } : entry) })),
+    transitionAnnotation: vi.fn(async ({ annotationId, status }: any) => commit({ annotations: state.annotations.map((entry) => entry.id === annotationId ? { ...entry, status } : entry) })),
+    revise: vi.fn(async ({ selectedAnnotationIds }: any) => { const id = `job-${++job}`; commit({ status: "revising", generationJob: { jobId: id, operation: "revision", baseDocumentRevision: state.documentRevision, selectedAnnotationIds, startedAt: "2026-07-10T00:00:00.000Z" } }); return { ok: true as const, value: { jobId: id, completion: new Promise(() => undefined) } }; }),
+    generate: vi.fn(async () => { const id = `job-${++job}`; commit({ status: "generating" }); return { ok: true as const, value: { jobId: id, completion: new Promise(() => undefined) } }; }),
+    dispatchGeneration: vi.fn(() => ({ ok: true as const, value: undefined })),
+    acceptedStagingPending: vi.fn(() => state.status === "accepted" && !staged),
+    accept: vi.fn(async () => {
+      if (state.status === "ready") commit({ status: "accepted" }, "accepted");
+      if (stageFailures > 0) { stageFailures -= 1; return { ok: false as const, error: { code: "stage-failed", message: "The accepted plan was saved but could not be staged." } }; }
+      staged = true; return { ok: true as const, value: undefined };
+    }),
+    pause: vi.fn(async () => commit({ status: "paused", generationJob: undefined }, "paused")),
+    cancel: vi.fn(async () => commit({ status: "cancelled", generationJob: undefined }, "cancelled")),
+  };
+  return { controller: controller as unknown as PlanController, raw: controller, getState: () => state, listeners };
+}
+function auth(host: Awaited<ReturnType<typeof startPlanHttpHost>>, mutation = false, etag?: string) {
+  const token = new URL(host.launchUrl).hash.slice("#capability=".length);
+  return { Authorization: `Bearer ${token}`, "X-Pi-Prompt-Origin": host.origin, ...(mutation ? { Origin: host.origin, "Content-Type": "application/json", ...(etag ? { "If-Match": etag } : {}) } : {}) };
+}
+async function json(response: Response) { return response.json() as Promise<any>; }
+
+describe("secure plan HTTP host", () => {
+  it("serves only the constant shell/allowlisted assets with security headers and no private plan data", async () => {
+    const fake = fakeController(); const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn() });
+    try {
+      const shell = await fetch(host.origin); const text = await shell.text();
+      expect(shell.status).toBe(200); expect(text).toContain("Plan review");
+      expect(text).not.toContain("Hostile"); expect(text).not.toContain("PRIVATE SOURCE"); expect(text).not.toContain("capability=");
+      for (const [name, value] of Object.entries(SECURITY_HEADERS)) expect(shell.headers.get(name)).toBe(value);
+      expect((await fetch(`${host.origin}/browser/app.js`)).status).toBe(200);
+      expect((await fetch(`${host.origin}/browser/unknown.js`)).status).toBe(404);
+      expect((await fetch(`${host.origin}/`, { method: "OPTIONS" })).status).toBe(405);
+      expect(shell.headers.get("access-control-allow-origin")).toBeNull();
+    } finally { await host.close(); }
+  });
+
+  it("serves the canonical session plan.md through the authenticated plan endpoint", async () => {
+    const planRoot = await mkdtemp(join(tmpdir(), "pi-prompt-http-plan-"));
+    await mkdir(join(planRoot, "session"), { recursive: true });
+    await writeFile(join(planRoot, "session", "plan.md"), "# Saved plan\n\n## Execution\nNormal\n", { mode: 0o600 });
+    const fake = fakeController(readyState({ status: "generating", documentRevision: 0, document: null, annotations: [] } as Partial<PlanSession>));
+    const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn(), planRoot });
+    try {
+      expect((await fetch(`${host.origin}/api/v1/plan`)).status).toBe(401);
+      const response = await fetch(`${host.origin}/api/v1/plan`, { headers: auth(host) });
+      expect(response.status).toBe(200); expect(response.headers.get("content-type")).toContain("text/markdown");
+      expect(await response.text()).toBe("# Saved plan\n\n## Execution\nNormal\n");
+    } finally { await host.close(); }
+  });
+
+  it("requires exact host/auth/custom origin and mutation Origin, and returns generic secured errors", async () => {
+    const fake = fakeController(); const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn() });
+    try {
+      for (const response of [
+        await fetch(`${host.origin}/api/v1/snapshot`),
+        await fetch(`${host.origin}/api/v1/snapshot`, { headers: { ...auth(host), Authorization: "Bearer wrong" } }),
+        await fetch(`${host.origin}/api/v1/snapshot`, { headers: { ...auth(host), "X-Pi-Prompt-Origin": "http://evil.invalid" } }),
+        await fetch(`${host.origin}/api/v1/snapshot`, { headers: { ...auth(host), Origin: "http://evil.invalid" } }),
+      ]) { expect([401, 403]).toContain(response.status); expect(response.headers.get("content-security-policy")).toBe(SECURITY_HEADERS["Content-Security-Policy"]); expect(JSON.stringify(await json(response))).not.toContain("PRIVATE"); }
+      const noOrigin = await fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers: { ...auth(host, false), "Content-Type": "application/json", "If-Match": '"pi-plan-state-3"' }, body: JSON.stringify({ requestId: "request-id-00000001", target: { kind: "element", elementId: "step" }, body: "x" }) });
+      expect(noOrigin.status).toBe(403);
+    } finally { await host.close(); }
+  });
+
+  it("adds the normal security headers to raw parser errors", async () => {
+    const fake = fakeController(); const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn() });
+    try {
+      const raw = await new Promise<string>((resolve, reject) => {
+        const socket = connect(host.port, "127.0.0.1"); let response = "";
+        socket.setEncoding("utf8"); socket.once("error", reject); socket.on("data", (chunk) => { response += chunk; }); socket.once("end", () => resolve(response));
+        socket.once("connect", () => socket.write("INVALID REQUEST\r\n\r\n"));
+      });
+      expect(raw).toContain("HTTP/1.1 400 Bad Request");
+      for (const [name, value] of Object.entries(SECURITY_HEADERS)) expect(raw).toContain(`${name}: ${value}`);
+    } finally { await host.close(); }
+  });
+
+  it("enforces method, precondition, content type/size, fatal UTF-8, duplicate keys, and exact schemas", async () => {
+    const fake = fakeController(); const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn() });
+    try {
+      expect((await fetch(`${host.origin}/api/v1/snapshot`, { method: "POST", headers: auth(host, true), body: "{}" })).status).toBe(405);
+      const missing = await fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers: auth(host, true), body: "{}" }); expect(missing.status).toBe(428);
+      const wrongType = await fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers: { ...auth(host, true, '"pi-plan-state-3"'), "Content-Type": "text/plain" }, body: "{}" }); expect(wrongType.status).toBe(415);
+      const duplicate = '{"requestId":"request-id-00000001","body":"a","body":"b","target":{"kind":"element","elementId":"step"}}';
+      const duplicateResponse = await fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body: duplicate }); expect(duplicateResponse.status).toBe(400); expect(await json(duplicateResponse)).toMatchObject({ error: { code: "duplicate-key" } });
+      const invalidUtf8 = await fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body: new Uint8Array([0xff]) }); expect(invalidUtf8.status).toBe(400); expect(await json(invalidUtf8)).toMatchObject({ error: { code: "invalid-utf8" } });
+      const extra = await fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body: JSON.stringify({ requestId: "request-id-00000001", target: { kind: "element", elementId: "step" }, body: "x", path: "/private" }) }); expect(extra.status).toBe(422);
+      const huge = await fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body: JSON.stringify({ requestId: "request-id-00000001", target: { kind: "element", elementId: "step" }, body: "x".repeat(256 * 1024) }) }); expect(huge.status).toBe(413);
+    } finally { await host.close(); }
+  });
+
+  it("runs annotation/update/revision endpoints with ETags, stale conflicts, replay, and durable events", async () => {
+    const fake = fakeController(); const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn(), longPollMs: 20 });
+    try {
+      const snapshotResponse = await fetch(`${host.origin}/api/v1/snapshot`, { headers: auth(host) });
+      expect(snapshotResponse.headers.get("etag")).toBe('"pi-plan-state-3"'); const snapshot = await json(snapshotResponse); expect(snapshot.snapshot.promptPreview).toBe("PRIVATE SOURCE"); expect(JSON.stringify(snapshot)).not.toContain("/private/SKILL.md");
+      const createBody = { requestId: "request-id-00000001", target: { kind: "element", elementId: "step" }, body: "literal <script>x</script>" };
+      const [first, duplicate] = await Promise.all([1, 2].map(() => fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body: JSON.stringify(createBody) })));
+      expect(first.status).toBe(200); expect(duplicate.status).toBe(200); expect(fake.raw.addAnnotation).toHaveBeenCalledTimes(1);
+      const created = await json(first); expect(created.snapshot.annotations[0].body).toBe("literal <script>x</script>");
+      const mismatch = await fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body: JSON.stringify({ ...createBody, body: "different" }) }); expect(mismatch.status).toBe(409);
+      const stale = await fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body: JSON.stringify({ ...createBody, requestId: "request-id-00000002" }) }); expect(stale.status).toBe(409); expect(await json(stale)).toMatchObject({ current: { stateVersion: 4 } });
+      const patch = await fetch(`${host.origin}/api/v1/annotations/note-1`, { method: "PATCH", headers: auth(host, true, '"pi-plan-state-4"'), body: JSON.stringify({ requestId: "request-id-00000003", update: { body: "updated" } }) }); expect(patch.status).toBe(200);
+      const revision = await fetch(`${host.origin}/api/v1/revision-requests`, { method: "POST", headers: auth(host, true, '"pi-plan-state-5"'), body: JSON.stringify({ requestId: "request-id-00000004", selectedAnnotationIds: ["note-1"], instruction: "Revise" }) }); expect(revision.status).toBe(202); expect(await json(revision)).toMatchObject({ job: { status: "revising" }, snapshot: { stateVersion: 6 } }); expect(fake.raw.dispatchGeneration).toHaveBeenCalledWith("job-1");
+      const events = await fetch(`${host.origin}/api/v1/events?after=0`, { headers: auth(host) }); const eventBody = await json(events); expect(eventBody.events.map((event: any) => event.stateVersion)).toEqual([4, 5, 6]);
+      expect(JSON.stringify(eventBody)).not.toContain("instruction");
+      const future = await fetch(`${host.origin}/api/v1/events?after=999`, { headers: auth(host) }); expect(future.status).toBe(400);
+    } finally { await host.close(); }
+  });
+
+  it("accepts/stages once before response close and handles pause, cancel, and reopen on isolated hosts", async () => {
+    const accepted = fakeController(); const acceptHost = await startPlanHttpHost({ controller: accepted.controller, reopenInPi: vi.fn() });
+    const accept = await fetch(`${acceptHost.origin}/api/v1/accept`, { method: "POST", headers: auth(acceptHost, true, '"pi-plan-state-3"'), body: JSON.stringify({ requestId: "request-id-accept-01", stateVersion: 3, documentRevision: 1, confirmed: true }) });
+    expect(accept.status).toBe(200); expect(accepted.raw.accept).toHaveBeenCalledTimes(1); await acceptHost.close(); expect(acceptHost.closed).toBe(true);
+
+    for (const disposition of ["pause", "cancel"] as const) {
+      const fake = fakeController(); const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn() });
+      const response = await fetch(`${host.origin}/api/v1/cancel`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body: JSON.stringify({ requestId: `request-id-${disposition}-0001`, disposition }) });
+      expect(response.status).toBe(200); expect(disposition === "pause" ? fake.raw.pause : fake.raw.cancel).toHaveBeenCalledTimes(1); await host.close();
+    }
+
+    const reopen = vi.fn(); const reopening = fakeController(); const reopenHost = await startPlanHttpHost({ controller: reopening.controller, reopenInPi: reopen });
+    const response = await fetch(`${reopenHost.origin}/api/v1/reopen-in-pi`, { method: "POST", headers: auth(reopenHost, true, '"pi-plan-state-3"'), body: JSON.stringify({ requestId: "request-id-reopen-001" }) });
+    expect(response.status).toBe(200); await reopenHost.close(); await Promise.resolve(); expect(reopen).toHaveBeenCalledTimes(1); expect(reopening.raw.accept).not.toHaveBeenCalled();
+  });
+
+  it("closes and reopens exactly once when a raw client aborts its accepted terminal response", async () => {
+    const fake = fakeController();
+    let reopened!: () => void;
+    const reopenedOnce = new Promise<void>((resolve) => { reopened = resolve; });
+    const reopen = vi.fn(() => { reopened(); });
+    const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: reopen });
+    const token = new URL(host.launchUrl).hash.slice("#capability=".length);
+    const body = JSON.stringify({ requestId: "request-id-aborted-reopen" });
+    await new Promise<void>((resolve, reject) => {
+      const socket = connect(host.port, "127.0.0.1");
+      socket.once("error", reject);
+      socket.once("connect", () => {
+        socket.write([
+          "POST /api/v1/reopen-in-pi HTTP/1.1", `Host: 127.0.0.1:${host.port}`,
+          `Authorization: Bearer ${token}`, `X-Pi-Prompt-Origin: ${host.origin}`, `Origin: ${host.origin}`,
+          "Content-Type: application/json", 'If-Match: "pi-plan-state-3"', `Content-Length: ${Buffer.byteLength(body)}`,
+          "Connection: keep-alive", "", body,
+        ].join("\r\n"), () => { socket.destroy(); resolve(); });
+      });
+    });
+    await Promise.race([reopenedOnce, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("reopen-timeout")), 1_000))]);
+    await host.close();
+    expect(host.closed).toBe(true);
+    expect(reopen).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a stage-failed accepted snapshot open and retries exact accepted versions", async () => {
+    const fake = fakeController(readyState(), { stageFailures: 1 });
+    const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn() });
+    try {
+      const failed = await fetch(`${host.origin}/api/v1/accept`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body: JSON.stringify({ requestId: "request-id-stagefail-1", stateVersion: 3, documentRevision: 1, confirmed: true }) });
+      expect(failed.status).toBe(503);
+      expect(failed.headers.get("etag")).toBe('"pi-plan-state-4"');
+      expect(await json(failed)).toMatchObject({ error: { code: "stage-failed" }, accepted: true, snapshot: { status: "accepted", stateVersion: 4, documentRevision: 1, actions: { canRetryStaging: true } } });
+      expect(host.closed).toBe(false);
+      const retried = await fetch(`${host.origin}/api/v1/accept`, { method: "POST", headers: auth(host, true, '"pi-plan-state-4"'), body: JSON.stringify({ requestId: "request-id-stageretry-1", stateVersion: 4, documentRevision: 1, confirmed: true }) });
+      expect(retried.status).toBe(200); expect(fake.raw.accept).toHaveBeenCalledTimes(2);
+    } finally { await host.close(); }
+  });
+
+  it.each(["pause", "accept"] as const)("sets close intent inside the serialized %s mutation and rejects queued work while sharing duplicates", async (terminal) => {
+    const fake = fakeController();
+    let entered!: () => void; let release!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    if (terminal === "pause") fake.raw.pause.mockImplementationOnce(async () => { entered(); await blocked; return { ok: true, value: undefined }; });
+    else fake.raw.accept.mockImplementationOnce(async () => { entered(); await blocked; return { ok: true, value: undefined }; });
+    const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn() });
+    const requestId = `request-id-race-${terminal}`;
+    const path = terminal === "pause" ? "/api/v1/cancel" : "/api/v1/accept";
+    const body = terminal === "pause" ? { requestId, disposition: "pause" } : { requestId, stateVersion: 3, documentRevision: 1, confirmed: true };
+    const mutationHeaders = { ...auth(host, true, '"pi-plan-state-3"'), Connection: "close" };
+    const first = fetch(`${host.origin}${path}`, { method: "POST", headers: mutationHeaders, body: JSON.stringify(body) });
+    await started;
+    const duplicate = fetch(`${host.origin}${path}`, { method: "POST", headers: mutationHeaders, body: JSON.stringify(body) });
+    const queued = fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers: mutationHeaders, body: JSON.stringify({ requestId: `request-id-queued-${terminal}`, target: { kind: "element", elementId: "step" }, body: "queued" }) });
+    const probe = await fetch(`${host.origin}/api/v1/snapshot`, { headers: { ...auth(host), Connection: "close" } });
+    expect(probe.status).toBe(200);
+    release();
+    const [firstResponse, duplicateResponse, queuedResponse] = await Promise.all([first, duplicate, queued]);
+    expect(firstResponse.status).toBe(200); expect(duplicateResponse.status).toBe(200);
+    expect(await json(duplicateResponse)).toEqual(await json(firstResponse));
+    expect(queuedResponse.status).toBe(503); expect(await json(queuedResponse)).toMatchObject({ error: { code: "closing" } });
+    expect(fake.raw.addAnnotation).not.toHaveBeenCalled();
+    await host.close(); expect(host.closed).toBe(true);
+  });
+
+  it("serializes reopen close intent ahead of a queued accept while sharing the duplicate reopen response", async () => {
+    const fake = fakeController();
+    let entered!: () => void; let release!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    fake.raw.addAnnotation.mockImplementationOnce(async () => { entered(); await blocked; return { ok: true, value: undefined }; });
+    const reopen = vi.fn(); const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: reopen });
+    const headers = { ...auth(host, true, '"pi-plan-state-3"'), Connection: "close" };
+    const blocker = fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers, body: JSON.stringify({ requestId: "request-id-block-reopen", target: { kind: "element", elementId: "step" }, body: "block" }) });
+    await started;
+    const token = new URL(host.launchUrl).hash.slice("#capability=".length);
+    const rawRequest = (path: string, body: object): string => {
+      const encoded = JSON.stringify(body);
+      return [`POST ${path} HTTP/1.1`, `Host: 127.0.0.1:${host.port}`, `Authorization: Bearer ${token}`, `X-Pi-Prompt-Origin: ${host.origin}`, `Origin: ${host.origin}`, "Content-Type: application/json", 'If-Match: "pi-plan-state-3"', `Content-Length: ${Buffer.byteLength(encoded)}`, "Connection: keep-alive", "", encoded].join("\r\n");
+    };
+    const reopenBody = { requestId: "request-id-reopen-race" };
+    const pipeline = new Promise<string>((resolve, reject) => {
+      const socket = connect(host.port, "127.0.0.1"); let response = "";
+      socket.setEncoding("utf8"); socket.once("error", reject); socket.on("data", (chunk) => { response += chunk; }); socket.once("end", () => resolve(response));
+      socket.once("connect", () => socket.write([
+        rawRequest("/api/v1/reopen-in-pi", reopenBody),
+        rawRequest("/api/v1/reopen-in-pi", reopenBody),
+        rawRequest("/api/v1/accept", { requestId: "request-id-accept-queued", stateVersion: 3, documentRevision: 1, confirmed: true }),
+      ].join("")));
+    });
+    expect((await fetch(`${host.origin}/api/v1/snapshot`, { headers: { ...auth(host), Connection: "close" } })).status).toBe(200);
+    release();
+    expect((await blocker).status).toBe(200);
+    const raw = await pipeline;
+    expect(raw.match(/HTTP\/1\.1 200 OK/g)).toHaveLength(2); expect(raw.match(/"reopening":true/g)).toHaveLength(2);
+    expect(raw).toContain("HTTP/1.1 503 Service Unavailable"); expect(raw).toContain('"code":"closing"'); expect(fake.raw.accept).not.toHaveBeenCalled();
+    await host.close(); await Promise.resolve(); expect(reopen).toHaveBeenCalledTimes(1);
+  });
+
+  it("charges only authenticated API requests against the request budget", async () => {
+    const fake = fakeController(); const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn(), maximumRequestsPerMinute: 1 });
+    try {
+      expect((await fetch(`${host.origin}/browser/app.js`)).status).toBe(200);
+      expect((await fetch(`${host.origin}/browser/app.js`)).status).toBe(200);
+      expect((await fetch(`${host.origin}/api/v1/snapshot`)).status).toBe(401);
+      expect((await fetch(`${host.origin}/api/v1/snapshot`, { headers: auth(host) })).status).toBe(200);
+      expect((await fetch(`${host.origin}/api/v1/snapshot`, { headers: auth(host) })).status).toBe(429);
+    } finally { await host.close(); }
+  });
+
+  it("bounds long polls/rates/idle lifecycle and rotates capabilities", async () => {
+    const first = fakeController(); const host1 = await startPlanHttpHost({ controller: first.controller, reopenInPi: vi.fn(), longPollMs: 10, maximumRequestsPerMinute: 2 });
+    const second = fakeController(); const host2 = await startPlanHttpHost({ controller: second.controller, reopenInPi: vi.fn(), idleMs: 100 });
+    try {
+      expect(new URL(host1.launchUrl).hash).not.toBe(new URL(host2.launchUrl).hash);
+      const started = Date.now(); const poll = await fetch(`${host1.origin}/api/v1/events?after=0`, { headers: auth(host1) }); expect(poll.status).toBe(200); expect(Date.now() - started).toBeLessThan(500);
+      await fetch(`${host1.origin}/api/v1/snapshot`, { headers: auth(host1) });
+      const limited = await fetch(`${host1.origin}/api/v1/snapshot`, { headers: auth(host1) }); expect(limited.status).toBe(429);
+      await new Promise((resolve) => setTimeout(resolve, 140));
+      expect(host2.closed).toBe(true); expect(second.listeners.size).toBe(0);
+    } finally { await host1.close(); await host2.close(); }
+  });
+});

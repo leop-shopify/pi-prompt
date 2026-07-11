@@ -1,4 +1,6 @@
+import { copyToClipboard } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
+vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => ({ ...(await importOriginal<object>()), copyToClipboard: vi.fn(async () => undefined) }));
 import { stripAnsi } from "../ansi.js";
 import { TextArea } from "../textarea.js";
 import { makeTestTheme } from "./helpers.js";
@@ -84,6 +86,7 @@ describe("TextArea editing", () => {
     area.handleInput("\x1b[13;5u"); // kitty ctrl+enter
     expect(onSubmit).toHaveBeenCalledWith("send me");
   });
+
 
   it("fires escape with hasText flag", () => {
     const onEscape = vi.fn();
@@ -202,6 +205,14 @@ describe("TextArea selection", () => {
     area.handleInput(KEY.shiftDown); // select line1 + into line2 col0
     type(area, "X");
     expect(area.getText()).toBe("Xline2");
+  });
+
+  it("copies and cuts only the active selection", async () => {
+    const onCopy = vi.fn(); const area = new TextArea(theme, { onCopy });
+    area.setText("copy me"); area.handleInput(KEY.shiftLeft); area.handleInput(KEY.shiftLeft);
+    area.handleInput("\x03"); await vi.waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith("me"));
+    expect(onCopy).toHaveBeenCalledWith(2); expect(area.getText()).toBe("copy me");
+    area.handleInput("\x18"); expect(area.getText()).toBe("copy ");
   });
 });
 

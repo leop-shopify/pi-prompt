@@ -672,7 +672,7 @@ export class TextArea implements Component, Focusable {
     this.selectionBeforeMove = this.hasSelection();
 
     // App-level actions that are not part of the native editor keymap.
-    // ctrl+enter submits the whole prompt; plain enter inserts a newline.
+    // Ctrl+Enter submits the whole prompt; plain Enter always inserts a newline.
     if (matchesKey(data, "ctrl+enter") || matchesKey(data, "ctrl+return")) {
       this.callbacks.onSubmit?.(this.getText());
       return;

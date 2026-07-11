@@ -1,0 +1,421 @@
+import { formatStagedPlan, renderPlanMarkdown } from "./classification.js";
+import type { DispatchablePlanGenerator, PlanGeneratorInput, PlanGeneratorResult, PrivateSkillContent } from "./generator.js";
+import type { AppendPlanBranchLocator } from "./locator.js";
+import {
+  allocateInitialPlanDocument, collectPlanElementIds, createAnnotation, reconcileRevision, transitionAnnotationStatus,
+  type PlanIdFactory,
+} from "./reconcile.js";
+import type { CommitAcceptedPlanInput, CommitPlanInput, CommittedPlanState, PlanAuditKind } from "./repository.js";
+import { PLAN_LIMITS, normalizePlanText, validatePlanSession } from "./schema.js";
+import type {
+  AnnotationStatus, AnnotationTarget, ExecutionKind, GenerationMode, PlanSession, SafeError,
+  SkillReference, ValidationIssue, ValidationResult,
+} from "./types.js";
+
+export interface PlanControllerRepository {
+  commit(input: CommitPlanInput): Promise<CommittedPlanState>;
+  commitAccepted(input: CommitAcceptedPlanInput): Promise<CommittedPlanState>;
+  close(): Promise<void>;
+}
+export interface PlanControllerGenerator extends DispatchablePlanGenerator {}
+export interface LoadedPrivateSkills {
+  readonly references: readonly SkillReference[];
+  readonly contexts: readonly PrivateSkillContent[];
+}
+export interface PlanControllerSkillPort {
+  reload(references: readonly SkillReference[]): Promise<ValidationResult<LoadedPrivateSkills>>;
+  refresh(selectedNames: readonly string[], discovered: readonly unknown[]): Promise<ValidationResult<LoadedPrivateSkills>>;
+}
+export interface PlanControllerStager { stage(value: string): void | Promise<void> }
+export interface PlanControllerEvent {
+  readonly kind: Exclude<PlanAuditKind, "recovered">;
+  readonly sessionId: string;
+  readonly status: PlanSession["status"];
+  readonly stateVersion: number;
+  readonly documentRevision: number;
+  readonly errorCode?: string;
+}
+export interface PlanControllerOptions {
+  readonly repository: PlanControllerRepository;
+  readonly generator: PlanControllerGenerator;
+  readonly appendLocator: AppendPlanBranchLocator;
+  readonly skills: PlanControllerSkillPort;
+  readonly idFactory: PlanIdFactory;
+  readonly clock: () => Date | string;
+  readonly stager: PlanControllerStager;
+  readonly readPlan?: (sessionId: string) => Promise<string>;
+}
+export interface CreatePlanInput {
+  readonly prompt: string;
+  readonly cwd: string;
+  readonly skills: readonly SkillReference[];
+  readonly execution: ExecutionKind;
+  readonly mode: GenerationMode;
+}
+export interface RevisionInput { readonly expectedStateVersion: number; readonly selectedAnnotationIds: readonly string[]; readonly instruction?: string }
+export interface VersionedInput { readonly expectedStateVersion: number }
+export interface PlanJobHandle { readonly jobId: string; readonly completion: Promise<PlanControllerResult> }
+export type PlanControllerResult<T = void> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: SafeError };
+
+type EventKind = Exclude<PlanAuditKind, "recovered">;
+interface JobRuntime { readonly id: string; readonly abort: AbortController }
+
+/** Canonical snapshots contain private prompt and skill paths. HTTP/browser adapters must sanitize them. */
+export class PlanController {
+  readonly #options: PlanControllerOptions;
+  readonly #reserved: Set<string>;
+  readonly #listeners = new Set<(event: PlanControllerEvent) => void>();
+  #state: PlanSession | null;
+  #tail: Promise<void> = Promise.resolve();
+  #active: JobRuntime | null = null;
+  #closing = false;
+  #closed = false;
+  #closePromise: Promise<void> | null = null;
+  #acceptInFlight: Promise<PlanControllerResult> | null = null;
+  #acceptedStaged = false;
+
+  private constructor(options: PlanControllerOptions, state: PlanSession | null, reservedIds: Iterable<string>) {
+    this.#options = options; this.#state = state; this.#reserved = new Set(reservedIds);
+    if (state) this.#reserved.add(state.id);
+    if (state?.generationJob) this.#reserved.add(state.generationJob.jobId);
+    if (state?.document) for (const id of collectPlanElementIds(state.document)) this.#reserved.add(id);
+    for (const annotation of state?.annotations ?? []) this.#reserved.add(annotation.id);
+  }
+
+  static async create(options: PlanControllerOptions, input: CreatePlanInput): Promise<PlanControllerResult<PlanController>> {
+    const controller = new PlanController(options, null, []);
+    const id = controller.#allocateId();
+    if (!id.ok) return id;
+    const candidate: PlanSession = {
+      schemaVersion: 1, id: id.value, stateVersion: 1, documentRevision: 0, status: "paused",
+      source: { prompt: input.prompt, cwd: input.cwd, skills: [...input.skills] }, execution: { kind: input.execution.kind },
+      generation: { mode: input.mode }, document: null, annotations: [],
+    };
+    const committed = await controller.#commit(candidate, null, "created");
+    if (committed.ok) controller.#reserved.add(id.value);
+    return committed.ok ? success(controller) : committed;
+  }
+
+  static fromRecovered(options: PlanControllerOptions, state: PlanSession, reservedIds: Iterable<string>): PlanControllerResult<PlanController> {
+    if (reservedIds === undefined || reservedIds === null) return failure("reserved-ids-required", "Recovered sessions require committed historical IDs.");
+    const validated = validatePlanSession(state);
+    return validated.ok ? success(new PlanController(options, validated.value, reservedIds)) : failure("invalid-recovered-state", "The recovered plan state is invalid.");
+  }
+
+  snapshot(): PlanSession | null { return this.#state; }
+  /** Privacy-safe host signal: accepted content still needs an explicit idempotent staging attempt. */
+  acceptedStagingPending(): boolean { return this.#state?.status === "accepted" && !this.#acceptedStaged; }
+  subscribe(listener: (event: PlanControllerEvent) => void): () => void {
+    if (this.#closed || this.#closing) return () => undefined;
+    this.#listeners.add(listener); return () => { this.#listeners.delete(listener); };
+  }
+
+  async generate(input: { readonly expectedStateVersion: number; readonly instruction?: string }): Promise<PlanControllerResult<PlanJobHandle>> {
+    return this.#startJob("initial", input.expectedStateVersion, [], input.instruction);
+  }
+  async revise(input: RevisionInput): Promise<PlanControllerResult<PlanJobHandle>> {
+    return this.#startJob("revision", input.expectedStateVersion, input.selectedAnnotationIds, input.instruction);
+  }
+  dispatchGeneration(jobId: string): PlanControllerResult {
+    const state = this.#state;
+    if (this.#closed || this.#closing) return failure("controller-closed", "The plan controller is closed.");
+    if (!state?.generationJob || state.generationJob.jobId !== jobId || this.#active?.id !== jobId) return failure("job-stale", "The generation job is no longer active.");
+    return this.#options.generator.dispatch(jobId);
+  }
+
+  async addAnnotation(input: VersionedInput & { readonly target: AnnotationTarget; readonly body: string }): Promise<PlanControllerResult> {
+    return this.#enqueue(async () => {
+      const state = this.#mutableState(input.expectedStateVersion); if (!state.ok) return state;
+      if (!state.value.document) return failure("plan-not-ready", "A materialized plan is required.");
+      const made = createAnnotation(state.value.document, state.value.documentRevision, input.target, input.body, { idFactory: this.#options.idFactory, reservedIds: this.#reserved, now: this.#now() });
+      if (!made.ok) return validationFailure(made.issues);
+      const next = { ...state.value, stateVersion: state.value.stateVersion + 1, annotations: [...state.value.annotations, made.value] } as PlanSession;
+      const committed = await this.#commit(next, state.value, "state-changed"); if (committed.ok) this.#reserved.add(made.value.id); return committed;
+    });
+  }
+
+  async updateAnnotationBody(input: VersionedInput & { readonly annotationId: string; readonly body: string }): Promise<PlanControllerResult> {
+    return this.#updateAnnotation(input, (annotation) => success({ ...annotation, body: normalizePlanText(input.body), updatedAt: this.#now() }));
+  }
+  async transitionAnnotation(input: VersionedInput & { readonly annotationId: string; readonly status: AnnotationStatus }): Promise<PlanControllerResult> {
+    return this.#updateAnnotation(input, (annotation) => {
+      const changed = transitionAnnotationStatus(annotation, input.status, { actor: "user", now: this.#now() });
+      return changed.ok ? success(changed.value) : validationFailure(changed.issues);
+    });
+  }
+
+  async verifySkills(input: VersionedInput): Promise<PlanControllerResult> {
+    const observed = this.#mutableState(input.expectedStateVersion); if (!observed.ok) return observed;
+    if (this.#active) return failure("job-active", "A generation job is already active.");
+    const references = [...observed.value.source.skills];
+    let loaded: ValidationResult<LoadedPrivateSkills>;
+    try { loaded = await this.#options.skills.reload(references); }
+    catch { loaded = { ok: false, issues: [{ path: "$", code: "skill-context-changed", message: "Skill context could not be reloaded." }] }; }
+    return this.#enqueue(async () => {
+      const current = this.#mutableState(input.expectedStateVersion); if (!current.ok) return current;
+      if (this.#active) return failure("job-active", "A generation job is already active.");
+      if (!loaded.ok || !exactLoadedSkills(references, loaded.value)) return this.#commitSkillFailure(current.value);
+      return success(undefined);
+    });
+  }
+
+  async refreshSkills(input: VersionedInput & { readonly selectedNames: readonly string[]; readonly discovered: readonly unknown[] }): Promise<PlanControllerResult> {
+    const state = this.#state;
+    if (!state || state.stateVersion !== input.expectedStateVersion) return failure("state-conflict", "The expected state version is stale.");
+    let refreshed: ValidationResult<LoadedPrivateSkills>;
+    try { refreshed = await this.#options.skills.refresh(input.selectedNames, input.discovered); }
+    catch { refreshed = { ok: false, issues: [{ path: "$", code: "skill-context-changed", message: "Skill context could not be refreshed." }] }; }
+    return this.#enqueue(async () => {
+      const current = this.#mutableState(input.expectedStateVersion); if (!current.ok) return current;
+      if (this.#active) return failure("job-active", "A generation job is already active.");
+      if (!refreshed.ok) return this.#commitSkillFailure(current.value);
+      const status = current.value.document ? "ready" : "paused";
+      const next = { ...current.value, stateVersion: current.value.stateVersion + 1, status, source: { ...current.value.source, skills: [...refreshed.value.references] }, lastError: undefined, generationJob: undefined } as PlanSession;
+      return this.#commit(next, current.value, "state-changed");
+    });
+  }
+
+  async pause(input: VersionedInput): Promise<PlanControllerResult> { return this.#stop(input.expectedStateVersion, "paused", "paused"); }
+  async resumeReview(input: VersionedInput): Promise<PlanControllerResult> {
+    return this.#enqueue(async () => {
+      const current = this.#mutableState(input.expectedStateVersion); if (!current.ok) return current;
+      if (current.value.status !== "paused" || !current.value.document || current.value.generationJob || this.#active) {
+        return failure("invalid-status", "Only a paused materialized plan without an active job can resume review.");
+      }
+      const next = { ...current.value, stateVersion: current.value.stateVersion + 1, status: "ready", lastError: undefined } as PlanSession;
+      return this.#commit(next, current.value, "state-changed");
+    });
+  }
+  async cancel(input: VersionedInput): Promise<PlanControllerResult> { return this.#stop(input.expectedStateVersion, "cancelled", "cancelled"); }
+
+  accept(input: VersionedInput & { readonly documentRevision: number; readonly confirmed: boolean }): Promise<PlanControllerResult> {
+    if (!input.confirmed) return Promise.resolve(failure("confirmation-required", "Plan acceptance requires explicit confirmation."));
+    if (this.#acceptInFlight) return this.#acceptInFlight;
+    const observed = this.#state;
+    const acceptedRetry = observed?.status === "accepted" && !observed.generationJob && observed.document !== null
+      && observed.documentRevision === input.documentRevision && observed.stateVersion === input.expectedStateVersion;
+    const ready = observed?.status === "ready" && !observed.generationJob && observed.document !== null
+      && observed.stateVersion === input.expectedStateVersion && observed.documentRevision === input.documentRevision;
+    if ((!ready && !acceptedRetry) || !observed?.document) return Promise.resolve(failure("state-conflict", "The plan is not ready at the expected version."));
+    if (acceptedRetry && this.#acceptedStaged) return Promise.resolve(success(undefined));
+    const operation = this.#performAccept(input, observed, acceptedRetry);
+    this.#acceptInFlight = operation;
+    void operation.finally(() => { if (this.#acceptInFlight === operation) this.#acceptInFlight = null; }).catch(() => undefined);
+    return operation;
+  }
+
+  async #performAccept(
+    input: VersionedInput & { readonly documentRevision: number }, observed: PlanSession, acceptedRetry: boolean,
+  ): Promise<PlanControllerResult> {
+    if (!observed.document) return failure("state-conflict", "The plan is not ready at the expected version.");
+    let loaded: ValidationResult<LoadedPrivateSkills>;
+    try { loaded = await this.#options.skills.reload(observed.source.skills); }
+    catch { loaded = { ok: false, issues: [{ path: "$", code: "skill-context-changed", message: "Skill context could not be reloaded." }] }; }
+    if (!loaded.ok || !exactLoadedSkills(observed.source.skills, loaded.value)) {
+      if (acceptedRetry) return failure("skill-context-changed", "Selected skill context changed and must be refreshed.");
+      return this.#enqueue(async () => {
+        const current = this.#mutableState(input.expectedStateVersion); return current.ok ? this.#commitSkillFailure(current.value) : current;
+      });
+    }
+    const blocks = loaded.value.contexts.map((context, index) => skillBlock(context, observed.source.skills[index]?.baseDir ?? ""));
+    let markdown: string;
+    try { markdown = this.#options.readPlan ? await this.#options.readPlan(observed.id) : renderPlanMarkdown(observed.document); }
+    catch { return failure("plan-file-unavailable", "The saved plan.md file could not be read."); }
+    const staged = formatStagedPlan(markdown, observed.execution, blocks);
+    if (!acceptedRetry) {
+      const committed = await this.#enqueue(async () => {
+        const current = this.#mutableState(input.expectedStateVersion); if (!current.ok) return current;
+        if (current.value.status !== "ready" || current.value.documentRevision !== input.documentRevision || !current.value.document || current.value.generationJob) return failure("state-conflict", "The plan is not ready at the expected version.");
+        const next = { ...current.value, stateVersion: current.value.stateVersion + 1, status: "accepted", lastError: undefined } as PlanSession;
+        return this.#commitAccepted(next, current.value, markdown);
+      });
+      if (!committed.ok) return committed;
+    }
+    try { await this.#options.stager.stage(staged); this.#acceptedStaged = true; return success(undefined); }
+    catch { return failure("stage-failed", "The accepted plan was saved but could not be staged."); }
+  }
+
+  close(): Promise<void> {
+    if (this.#closePromise) return this.#closePromise;
+    const operation = this.#performClose(); this.#closePromise = operation;
+    void operation.catch(() => { if (!this.#closed && this.#closePromise === operation) { this.#closePromise = null; this.#closing = false; } });
+    return operation;
+  }
+
+  async #performClose(): Promise<void> {
+    this.#closing = true;
+    const runtime = this.#active;
+    const stopped = await this.#enqueue(async () => {
+      const state = this.#state;
+      if (state && (state.status === "generating" || state.status === "revising")) {
+        const next = { ...state, stateVersion: state.stateVersion + 1, status: "paused", generationJob: undefined } as PlanSession;
+        return this.#commit(next, state, "paused");
+      }
+      return success(undefined);
+    }, true);
+    if (!stopped.ok) throw new Error(stopped.error.code);
+    runtime?.abort.abort(); if (this.#active === runtime) this.#active = null;
+    await this.#tail;
+    try { await this.#options.generator.close(); }
+    finally { try { await this.#options.repository.close(); } finally { this.#listeners.clear(); this.#closed = true; } }
+  }
+
+  async #startJob(operation: "initial" | "revision", expected: number, selectedIds: readonly string[], instruction?: string): Promise<PlanControllerResult<PlanJobHandle>> {
+    const canonicalInstruction = instruction === undefined ? undefined : normalizePlanText(instruction);
+    if (canonicalInstruction !== undefined && Buffer.byteLength(canonicalInstruction, "utf8") > PLAN_LIMITS.generationInstructionBytes) return failure("invalid-instruction", "Generation instruction is too long.");
+    const started = await this.#enqueue(async (): Promise<PlanControllerResult<{ readonly state: PlanSession; readonly runtime: JobRuntime }>> => {
+      const current = this.#mutableState(expected); if (!current.ok) return current;
+      if (this.#active || current.value.generationJob) return failure("job-active", "A generation job is already active.");
+      if (operation === "initial" && (current.value.document || !["paused", "error"].includes(current.value.status))) return failure("invalid-status", "Initial generation requires an empty paused or error session.");
+      if (operation === "revision" && (!current.value.document || !["ready", "error"].includes(current.value.status))) return failure("invalid-status", "Revision requires a materialized ready or error session.");
+      if (new Set(selectedIds).size !== selectedIds.length || selectedIds.some((id) => !current.value.annotations.some((annotation) => annotation.id === id))) return failure("invalid-annotations", "Selected annotation IDs must be unique and current.");
+      const allocated = this.#allocateId(); if (!allocated.ok) return allocated;
+      const runtime = { id: allocated.value, abort: new AbortController() };
+      const status = operation === "initial" ? "generating" : "revising";
+      const next = { ...current.value, stateVersion: current.value.stateVersion + 1, status, generationJob: { jobId: runtime.id, operation, baseDocumentRevision: current.value.documentRevision, selectedAnnotationIds: [...selectedIds], ...(canonicalInstruction === undefined ? {} : { instruction: canonicalInstruction }), startedAt: this.#now() }, lastError: undefined } as PlanSession;
+      const committed = await this.#commit(next, current.value, "state-changed");
+      if (!committed.ok) return committed;
+      this.#active = runtime; this.#reserved.add(runtime.id); return success({ state: next, runtime });
+    });
+    if (!started.ok) return started;
+    const completion = this.#runJob(started.value.state, started.value.runtime);
+    return success({ jobId: started.value.runtime.id, completion });
+  }
+
+  async #runJob(started: PlanSession, runtime: JobRuntime): Promise<PlanControllerResult> {
+    const job = started.generationJob;
+    if (!job) return failure("job-lost", "The generation job could not be started.");
+    let result: PlanGeneratorResult;
+    try {
+      result = await this.#options.generator.generate({ session: started, jobId: job.jobId, operation: job.operation, selectedAnnotationIds: job.selectedAnnotationIds, ...(job.instruction === undefined ? {} : { instruction: job.instruction }), signal: runtime.abort.signal, loadSkills: async () => {
+        try {
+          const loaded = await this.#options.skills.reload(started.source.skills);
+          return loaded.ok && exactLoadedSkills(started.source.skills, loaded.value) ? { ok: true, value: loaded.value.contexts } : { ok: false, issues: [{ path: "$", code: "skill-context-changed", message: "Private skill context changed." }] };
+        } catch { return { ok: false, issues: [{ path: "$", code: "skill-context-changed", message: "Private skill context changed." }] }; }
+      } });
+    } catch { result = { ok: false, error: { code: "generation-failed", message: "Plan generation failed." } }; }
+    return this.#enqueue(async () => {
+      const completed = await this.#completeJob(job.jobId, result);
+      if (completed.ok && this.#state?.generationJob === undefined && this.#active?.id === job.jobId) this.#active = null;
+      return completed;
+    });
+  }
+
+  async #completeJob(jobId: string, result: PlanGeneratorResult): Promise<PlanControllerResult> {
+    const state = this.#state; const job = state?.generationJob;
+    if (!state || !job || job.jobId !== jobId || this.#active?.id !== jobId || job.baseDocumentRevision !== state.documentRevision) return failure("job-stale", "A late generation result was ignored.");
+    if (!result.ok) {
+      if (result.error.code === "skill-context-changed") return this.#commitSkillFailure(state);
+      if (result.error.code === "delegated-planning-paused") {
+        const paused = { ...state, stateVersion: state.stateVersion + 1, status: "paused", generationJob: undefined, lastError: safeError(result.error) } as PlanSession;
+        return this.#commit(paused, state, "paused");
+      }
+      const next = { ...state, stateVersion: state.stateVersion + 1, status: "error", generationJob: undefined, lastError: safeError(result.error) } as PlanSession;
+      return this.#commit(next, state, "state-changed");
+    }
+    const outcome = result.outcome;
+    if (job.operation === "initial") {
+      if (outcome.kind !== "plan") return this.#commitGenerationError(state);
+      const allocated = allocateInitialPlanDocument(outcome.document, { idFactory: this.#options.idFactory, reservedIds: this.#reserved });
+      if (!allocated.ok) return this.#commitGenerationError(state);
+      const next = { ...state, stateVersion: state.stateVersion + 1, documentRevision: 1, document: allocated.value, annotations: [], status: "ready", generationJob: undefined, lastError: undefined } as PlanSession;
+      const committed = await this.#commit(next, state, "revision-committed"); if (committed.ok) for (const id of collectPlanElementIds(allocated.value)) this.#reserved.add(id); return committed;
+    }
+    if (outcome.kind !== "revision" || !state.document) return this.#commitGenerationError(state);
+    const reconciled = reconcileRevision({ previousDocument: state.document, previousRevision: state.documentRevision, annotations: state.annotations, result: outcome, selectedAnnotationIds: job.selectedAnnotationIds, idFactory: this.#options.idFactory, reservedIds: this.#reserved, now: this.#now() });
+    if (!reconciled.ok) return this.#commitGenerationError(state);
+    if (sameDocumentContent(reconciled.value.document, state.document)) {
+      return this.#commitGenerationError(state, "no-op-revision", "The generated revision did not change the plan.");
+    }
+    const next = { ...state, stateVersion: state.stateVersion + 1, documentRevision: reconciled.value.documentRevision, document: reconciled.value.document, annotations: reconciled.value.annotations, status: "ready", generationJob: undefined, lastError: undefined } as PlanSession;
+    const committed = await this.#commit(next, state, "revision-committed"); if (committed.ok) for (const id of collectPlanElementIds(reconciled.value.document)) this.#reserved.add(id); return committed;
+  }
+
+  async #commitGenerationError(state: PlanSession, code = "invalid-generation-result", message = "The generated plan was invalid."): Promise<PlanControllerResult> {
+    const next = { ...state, stateVersion: state.stateVersion + 1, status: "error", generationJob: undefined, lastError: { code, message } } as PlanSession;
+    return this.#commit(next, state, "state-changed");
+  }
+  async #commitSkillFailure(state: PlanSession): Promise<PlanControllerResult> {
+    const next = { ...state, stateVersion: state.stateVersion + 1, status: "needs-input", generationJob: undefined, lastError: { code: "skill-context-changed", message: "Selected skill context changed and must be refreshed." } } as PlanSession;
+    const committed = await this.#commit(next, state, "skill-check-failed");
+    if (committed.ok) this.#active?.abort.abort();
+    return committed;
+  }
+
+  async #updateAnnotation(input: VersionedInput & { readonly annotationId: string }, change: (annotation: PlanSession["annotations"][number]) => PlanControllerResult<PlanSession["annotations"][number]>): Promise<PlanControllerResult> {
+    return this.#enqueue(async () => {
+      const current = this.#mutableState(input.expectedStateVersion); if (!current.ok) return current;
+      const index = current.value.annotations.findIndex((annotation) => annotation.id === input.annotationId); const annotation = current.value.annotations[index];
+      if (annotation === undefined) return failure("annotation-not-found", "The annotation does not exist.");
+      if (current.value.generationJob?.selectedAnnotationIds.includes(annotation.id)) return failure("annotation-locked", "Selected feedback is locked while its generation job is active.");
+      const changed = change(annotation); if (!changed.ok) return changed;
+      const annotations = [...current.value.annotations]; annotations[index] = changed.value;
+      const next = { ...current.value, stateVersion: current.value.stateVersion + 1, annotations } as PlanSession;
+      return this.#commit(next, current.value, "state-changed");
+    });
+  }
+
+  async #stop(expected: number, status: "paused" | "cancelled", event: "paused" | "cancelled"): Promise<PlanControllerResult> {
+    return this.#enqueue(async () => {
+      const current = this.#mutableState(expected); if (!current.ok) return current;
+      const runtime = this.#active;
+      const next = { ...current.value, stateVersion: current.value.stateVersion + 1, status, generationJob: undefined } as PlanSession;
+      const committed = await this.#commit(next, current.value, event);
+      if (committed.ok) { runtime?.abort.abort(); if (this.#active === runtime) this.#active = null; }
+      return committed;
+    });
+  }
+
+  #mutableState(expected: number): PlanControllerResult<PlanSession> {
+    if (this.#closed || this.#closing) return failure("controller-closed", "The plan controller is closed.");
+    const state = this.#state; if (!state) return failure("not-created", "The plan session has not been created.");
+    if (state.status === "accepted" || state.status === "cancelled") return failure("terminal-state", "The plan session is terminal.");
+    return state.stateVersion === expected ? success(state) : failure("state-conflict", "The expected state version is stale.");
+  }
+  async #commit(candidate: PlanSession, previous: PlanSession | null, eventKind: EventKind): Promise<PlanControllerResult> {
+    const validated = validatePlanSession(candidate); if (!validated.ok) return failure("invalid-state", "The plan state mutation was invalid.");
+    try { const committed = await this.#options.repository.commit({ session: validated.value, previous, eventKind, appendLocator: this.#options.appendLocator }); this.#state = committed.state; this.#publish(eventKind, committed.state); return success(undefined); }
+    catch { return failure("persistence-failed", "The plan state could not be saved."); }
+  }
+  async #commitAccepted(candidate: PlanSession, previous: PlanSession, finalPlan: string): Promise<PlanControllerResult> {
+    const validated = validatePlanSession(candidate); if (!validated.ok) return failure("invalid-state", "The accepted plan state was invalid.");
+    try { const committed = await this.#options.repository.commitAccepted({ session: validated.value, previous, eventKind: "accepted", finalPlan, appendLocator: this.#options.appendLocator }); this.#state = committed.state; this.#publish("accepted", committed.state); return success(undefined); }
+    catch { return failure("persistence-failed", "The accepted plan could not be saved."); }
+  }
+  #publish(kind: EventKind, state: PlanSession): void {
+    const event: PlanControllerEvent = Object.freeze({ kind, sessionId: state.id, status: state.status, stateVersion: state.stateVersion, documentRevision: state.documentRevision, ...(state.lastError ? { errorCode: state.lastError.code } : {}) });
+    for (const listener of this.#listeners) { try { listener(event); } catch { /* observers cannot affect durable commits */ } }
+  }
+  #enqueue<T>(work: () => Promise<T>, duringClose = false): Promise<T> {
+    if ((this.#closing && !duringClose) || this.#closed) return Promise.resolve(failure("controller-closed", "The plan controller is closed.") as T);
+    const run = this.#tail.then(work, work); this.#tail = run.then(() => undefined, () => undefined); return run;
+  }
+  #allocateId(): PlanControllerResult<string> {
+    for (let attempt = 0; attempt < 8; attempt += 1) { let id: string; try { id = this.#options.idFactory(); } catch { break; } if (/^[!-~]{1,64}$/.test(id) && !this.#reserved.has(id)) return success(id); }
+    return failure("id-allocation-failed", "A unique plan ID could not be allocated.");
+  }
+  #now(): string { const raw = this.#options.clock(); return raw instanceof Date ? raw.toISOString() : raw; }
+}
+
+function sameDocumentContent(left: NonNullable<PlanSession["document"]>, right: NonNullable<PlanSession["document"]>): boolean {
+  const content = (document: NonNullable<PlanSession["document"]>): unknown => {
+    const element = (value: NonNullable<PlanSession["document"]>["title"]): unknown => ({
+      kind: value.kind, ...(value.title === undefined ? {} : { title: value.title }), body: value.body, children: value.children.map(element),
+    });
+    return { title: element(document.title), elements: document.elements.map(element) };
+  };
+  return JSON.stringify(content(left)) === JSON.stringify(content(right));
+}
+function skillBlock(context: PrivateSkillContent, baseDir: string): string {
+  return `<skill name="${escapeXml(context.name)}" baseDir="${escapeXml(baseDir)}">\n${context.body}\n</skill>`;
+}
+function escapeXml(value: string): string { return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"); }
+function sameReferences(expected: readonly SkillReference[], actual: readonly SkillReference[]): boolean { return expected.length === actual.length && expected.every((value, index) => { const other = actual[index]; return other !== undefined && value.name === other.name && value.path === other.path && value.baseDir === other.baseDir && value.sha256 === other.sha256; }); }
+function exactLoadedSkills(expected: readonly SkillReference[], loaded: LoadedPrivateSkills): boolean {
+  return sameReferences(expected, loaded.references) && loaded.contexts.length === expected.length
+    && loaded.contexts.every((context, index) => context.name === expected[index]?.name);
+}
+function safeError(error: SafeError): SafeError { return { code: error.code, message: error.message }; }
+function success<T>(value: T): PlanControllerResult<T> { return { ok: true, value }; }
+function failure<T = never>(code: string, message: string): PlanControllerResult<T> { return { ok: false, error: { code, message } }; }
+function validationFailure<T = never>(issues: readonly ValidationIssue[]): PlanControllerResult<T> { const first = issues[0]; return failure(first?.code ?? "invalid-input", first?.message ?? "The input was invalid."); }
