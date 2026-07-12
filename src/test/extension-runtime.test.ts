@@ -54,11 +54,12 @@ describe("extension runtime", () => {
     expect(controller.snapshot()?.status).toBe("paused"); expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("paused before writer dispatch"), "error");
   });
 
-  it("publishes the ready plan asynchronously when completion settles", async () => {
-    const controller = controllerHarness(); const review = { start: vi.fn(), ready: vi.fn() }; const { runtime } = runtimeFor(controller, review);
-    await runtime.generate(context(), submission); expect(review.ready).not.toHaveBeenCalled();
+  it("publishes the ready plan asynchronously and clears terminal progress when completion settles", async () => {
+    const controller = controllerHarness(); const review = { start: vi.fn(), ready: vi.fn() }; const { runtime } = runtimeFor(controller, review); const ctx = context();
+    await runtime.generate(ctx, submission); expect(review.ready).not.toHaveBeenCalled();
     controller.setReady(); controller.finish({ ok: true, value: undefined });
     await vi.waitFor(() => expect(review.ready).toHaveBeenCalledWith(expect.objectContaining({ controller, state: expect.objectContaining({ status: "ready" }) })));
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-prompt-plan", undefined);
   });
 
   it("resumes an interrupted answered clarification continuation from its persisted origin", async () => {

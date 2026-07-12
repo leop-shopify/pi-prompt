@@ -54,6 +54,7 @@ export function createBrowserPlanReviewPort(options: BrowserReviewPortOptions): 
       if (activeContext === input.ctx) { clearPlanProgress(input.ctx); activeContext = null; }
       await host.close(); throw error;
     }
+    if (epoch !== ownedEpoch) { await host.close(); return; }
     showPlanProgress(input.ctx, {
       headline: privateState.document ? "Plan review is open" : "Agent is working",
       prompt: privateState.source.prompt,

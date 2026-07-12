@@ -62,8 +62,12 @@ describe("browser review client", () => {
     expect(shell).not.toContain('id="annotation-list"'); expect(shell).not.toContain('id="notes-section"');
     expect(shell).not.toContain("<aside"); expect(shell).not.toContain('id="root-comment"'); expect(shell).not.toContain("Drawing index"); expect(shell).not.toContain("Markup rail");
     const css = await readFile(new URL("../plan/browser/styles.css", import.meta.url), "utf8");
-    expect(css).toContain("color-scheme:dark"); expect(css).toContain(".single-plan"); expect(css).toContain(".annotation-badge:focus-visible"); expect(css).toContain(".clarification-question");
-    expect(css).toContain("@media(max-width:700px)"); expect(css).toContain("prefers-reduced-motion"); expect(css).toContain("min-height:40px"); expect(css).not.toContain("transition:all");
+    const compactCss = css.replace(/\s+/gu, "");
+    expect(compactCss).toContain("color-scheme:dark"); expect(compactCss).toContain(".single-plan"); expect(compactCss).toContain(".annotation-badge:focus-visible"); expect(compactCss).toContain(".clarification-question");
+    const toastStyles = compactCss.match(/\.toast\{([^}]*)\}/)?.[1] ?? "";
+    expect(toastStyles).toContain("background:var(--surface)"); expect(toastStyles).toContain("color:var(--ink)"); expect(toastStyles).toContain("border:1pxsolidvar(--line-strong)");
+    expect(toastStyles).not.toContain("background:var(--ink)"); expect(toastStyles).not.toContain("color:#fff");
+    expect(compactCss).toContain("@media(max-width:700px)"); expect(compactCss).toContain("prefers-reduced-motion"); expect(compactCss).toContain("min-height:40px"); expect(compactCss).not.toContain("transition:all");
   });
 
   it("maps public platform argv without shell interpolation", () => {
@@ -140,6 +144,26 @@ describe("browser review client", () => {
     await port.close?.();
     expect(setStatus).toHaveBeenLastCalledWith("pi-prompt-plan", undefined);
     expect(setStatus.mock.calls.length).toBe(statusCalls + 1);
+  });
+
+  it("does not restore terminal progress when a stale browser launch finishes after close", async () => {
+    const liveState: PlanSession = {
+      ...state, status: "generating", stateVersion: 2, documentRevision: 0, document: null, annotations: [],
+      generationJob: { jobId: "job-stale", operation: "initial", baseDocumentRevision: 0, selectedAnnotationIds: [], startedAt: "2026-07-11T13:00:00.000Z" },
+    };
+    let finishLaunch!: () => void;
+    const opening = new Promise<void>((resolve) => { finishLaunch = resolve; });
+    const launcher = { open: vi.fn(() => opening) };
+    const setStatus = vi.fn();
+    const controller = { snapshot: () => liveState, acceptedStagingPending: () => false, subscribe: () => () => undefined, configureWriterEndpoint: () => ({ ok: true, value: undefined }) } as unknown as PlanController;
+    const port = createBrowserPlanReviewPort({ launcher, reopen: vi.fn() });
+    const ctx = { ui: { notify: vi.fn(), setStatus, setWidget: vi.fn() } } as unknown as ExtensionContext;
+    const start = port.start?.({ controller, state: liveState, ctx });
+    await vi.waitFor(() => expect(launcher.open).toHaveBeenCalledOnce());
+    await port.close?.();
+    finishLaunch();
+    await start;
+    expect(setStatus).toHaveBeenLastCalledWith("pi-prompt-plan", undefined);
   });
 
   it("hosts one injected controller, launches the fragment URL, exposes only a bounded prompt preview, and reopens Pi", async () => {

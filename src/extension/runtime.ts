@@ -109,8 +109,10 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
     const state = controller.snapshot();
     if (!state || (state.status !== "ready" && state.status !== "awaiting-clarification") || (!state.document && !state.clarifications?.pending)) return false;
     if (!owns(controller, epoch)) return false;
-    try { await options.review.ready({ controller, state, ctx }); }
-    catch { notifyOwned(ctx, controller, epoch, "Browser review could not be opened. Resume the saved plan to try again.", "error"); }
+    try {
+      await options.review.ready({ controller, state, ctx });
+      if (owns(controller, epoch)) clearPlanProgress(ctx);
+    } catch { notifyOwned(ctx, controller, epoch, "Browser review could not be opened. Resume the saved plan to try again.", "error"); }
     return owns(controller, epoch);
   };
 
