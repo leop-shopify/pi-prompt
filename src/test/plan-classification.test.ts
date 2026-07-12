@@ -14,7 +14,12 @@ const document: PlanDocument = {
   ],
 };
 
-function expectNormalized(input: string, expectedKind: "normal" | "goal" | "loop", expectedText: string, selected: "normal" | "goal" | "loop" = "normal"): void {
+function expectNormalized(
+  input: string,
+  expectedKind: "normal" | "goal" | "loop" | "create-goal",
+  expectedText: string,
+  selected: "normal" | "goal" | "loop" | "create-goal" = "normal",
+): void {
   const result = normalizeExecutionInput(input, selected);
   expect(result.ok).toBe(true);
   if (result.ok) expect(result.value).toEqual({ execution: { kind: expectedKind }, promptText: expectedText });
@@ -29,15 +34,20 @@ describe("execution classification", () => {
   it("consumes every consecutive exact leading command and deduplicates one kind", () => {
     expectNormalized("/goal /goal\nBuild it", "goal", "Build it");
     expectNormalized("  /loop\t/loop Run it", "loop", "Run it");
+    expectNormalized("/create-goal /create-goal\nCreate it", "create-goal", "Create it");
     expectNormalized("/goalie remains text", "normal", "/goalie remains text");
+    expectNormalized("/create-goalie remains text", "normal", "/create-goalie remains text");
     expectNormalized("/goal-not-a-command", "normal", "/goal-not-a-command");
   });
 
   it("rejects mixed typed kinds and typed-vs-selected conflicts", () => {
     expect(normalizeExecutionInput("/goal /loop Build").ok).toBe(false);
+    expect(normalizeExecutionInput("/create-goal /goal Build").ok).toBe(false);
     expect(normalizeExecutionInput("/loop Build", "goal").ok).toBe(false);
+    expect(normalizeExecutionInput("/create-goal Build", "loop").ok).toBe(false);
     expectNormalized("/loop Build", "loop", "Build", "normal");
     expectNormalized("/goal Build", "goal", "Build", "goal");
+    expectNormalized("/create-goal Build", "create-goal", "Build", "create-goal");
   });
 });
 
@@ -54,19 +64,21 @@ describe("plan Markdown and final staging", () => {
     expect(first).toContain("Revert the focused change.");
   });
 
-  it("stages exact normal, goal, and loop strings without an invented skills label", () => {
+  it("stages exact normal, goal, loop, and create-goal strings without an invented skills label", () => {
     const skills = ["<skill>A</skill>", "<skill>B</skill>"];
     const plan = "# Plan\n\nBody";
     expect(formatStagedPlan(plan, { kind: "normal" }, skills)).toBe("<skill>A</skill>\n\n<skill>B</skill>\n\n# Plan\n\nBody");
     expect(formatStagedPlan(plan, { kind: "goal" }, skills)).toBe("/goal <skill>A</skill>\n\n<skill>B</skill>\n\n# Plan\n\nBody");
     expect(formatStagedPlan(plan, { kind: "loop" }, skills)).toBe("/loop <skill>A</skill>\n\n<skill>B</skill>\n\n# Plan\n\nBody");
+    expect(formatStagedPlan(plan, { kind: "create-goal" }, skills)).toBe("/create-goal <skill>A</skill>\n\n<skill>B</skill>\n\n# Plan\n\nBody");
     expect(formatStagedPlan(plan, { kind: "normal" }, skills)).not.toContain("Selected skills:");
   });
 
   it("strips accidental prefixes and applies at most one controlled first-token prefix", () => {
     expect(formatStagedPlan("/goal /loop\n# Plan", { kind: "goal" })).toBe("/goal # Plan");
-    expect(formatStagedPlan("/loop /loop # Plan", { kind: "loop" }).match(/\/(?:goal|loop)/g)).toHaveLength(1);
-    expect(formatStagedPlan("/goal # Plan", { kind: "normal" })).toBe("# Plan");
+    expect(formatStagedPlan("/loop /loop # Plan", { kind: "loop" }).match(/\/(?:goal|loop|create-goal)/g)).toHaveLength(1);
+    expect(formatStagedPlan("/goal /create-goal /loop # Plan", { kind: "create-goal" })).toBe("/create-goal # Plan");
+    expect(formatStagedPlan("/create-goal # Plan", { kind: "normal" })).toBe("# Plan");
     expect(formatStagedPlan(document, { kind: "goal" }, ["<skill>A</skill>"]).startsWith("/goal <skill>A</skill>\n\n# Ship the feature")).toBe(true);
   });
 });

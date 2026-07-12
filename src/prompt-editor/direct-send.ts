@@ -56,7 +56,7 @@ function splitLeadingSlashCommand(value: string): { readonly command: string; re
 function stripControlledPrefixes(value: string): string {
   let output = value;
   while (true) {
-    const match = output.match(/^\s*\/(?:goal|loop)(?=$|\s)/);
+    const match = output.match(/^\s*\/(?:goal|loop|create-goal)(?=$|\s)/);
     if (!match) return output.trimStart();
     output = output.slice(match[0].length);
   }

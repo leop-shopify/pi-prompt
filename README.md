@@ -64,7 +64,7 @@ The loopback review page starts immediately after the durable job transition. It
 - only the latest safe `report_progress` thinking summary in the activity card;
 - the saved `plan.md` content directly below the run information.
 
-The dark review page presents the plan as one continuous text surface with no outline sidebar or per-section boxes. Selecting plan text opens the contextual note composer. Comments appear as gold inline badges at the ends of their annotated text: hover or focus previews a comment, and click or keyboard activation opens editing. **Send notes to agent** starts an in-place revision from the committed plan plus `annotations.json`. A short batch of clarification questions can appear before an initial or revision plan; submitting every answer continues the same planning operation. While answers are pending, the visible plan and comments remain read-only. **Accept & send** commits the exact accepted Markdown, sends the selected Normal/Goal/Loop form to Pi as the next user message, and starts the receiving agent immediately.
+The dark review page presents the plan as one continuous text surface with no outline sidebar or per-section boxes. Selecting plan text opens the contextual note composer. Comments appear as gold inline badges at the ends of their annotated text: hover or focus previews a comment, and click or keyboard activation opens editing. **Send notes to agent** starts an in-place revision from the committed plan plus `annotations.json`. A short batch of clarification questions can appear before an initial or revision plan; submitting every answer continues the same planning operation. While answers are pending, the visible plan and comments remain read-only. **Accept & send** commits the exact accepted Markdown, sends the selected Normal/Goal/Loop/Create Goal form to Pi as the next user message, and starts the receiving agent immediately.
 
 The server binds only to `127.0.0.1` on an operating-system port. A 256-bit fragment capability is copied into that tab's per-origin `sessionStorage` and removed from browser history. Because the port is part of the origin, separate review servers remain isolated and refresh works in the original tab. Browser API requests require the browser bearer and exact origin headers; the separate writer POST accepts only the current writer bearer, exact Host, supported result/content-type headers, and a bounded body. Snapshots are explicit allowlists: selected skill bodies, paths, cwd, nonces, controller/agent/team identity, tool arguments/results, report content, provenance metadata, and injected instructions are not exposed.
 
@@ -75,10 +75,11 @@ The browser loads the exact committed Markdown through an authenticated endpoint
 Planning depth is separate from accepted execution:
 
 - **Normal** sends plain Markdown;
+- **Create Goal** sends exactly one `/create-goal ` prefix so the `pi-codex-goal` prompt template can create a tracked goal from the accepted reviewed plan;
 - **Goal** sends exactly one `/goal ` prefix;
 - **Loop** sends exactly one `/loop ` prefix and reuses the existing pi-goal command.
 
-Typed leading `/goal` or `/loop` input is normalized into the same exclusive field. Final acceptance sends the selected execution form immediately; it does not copy the plan into the editor. The execution prompt tells the receiving agent to inspect its available leadership/orchestration skills, preload the best fit without assuming a specific skill name, organize specific ordered tasks, manage dependencies, and verify completion.
+Typed leading `/goal`, `/loop`, or `/create-goal` input is normalized into the same exclusive field. Final acceptance sends the selected execution form immediately; it does not copy the plan into the editor. The execution prompt tells the receiving agent to inspect its available leadership/orchestration skills, preload the best fit without assuming a specific skill name, organize specific ordered tasks, manage dependencies, and verify completion.
 
 ## Verification
 

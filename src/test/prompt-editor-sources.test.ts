@@ -39,7 +39,14 @@ describe("prompt editor sources", () => {
     expect(normalizeEditorSource("/goal\nBuild it", { kind: "goal" })).toEqual({
       ok: true, value: { promptText: "Build it", execution: { kind: "goal" } },
     });
+    expect(normalizeEditorSource("/create-goal /create-goal Build it", { kind: "create-goal" })).toEqual({
+      ok: true, value: { promptText: "Build it", execution: { kind: "create-goal" } },
+    });
+    expect(normalizeEditorSource("/create-goalie Build it")).toEqual({
+      ok: true, value: { promptText: "/create-goalie Build it", execution: { kind: "normal" } },
+    });
     expect(normalizeEditorSource("/loop /goal Build it", { kind: "loop" })).toMatchObject({ ok: false });
+    expect(normalizeEditorSource("/create-goal /goal Build it", { kind: "create-goal" })).toMatchObject({ ok: false });
     expect(normalizeEditorSource("/goal Build it", { kind: "loop" })).toMatchObject({ ok: false });
   });
 });

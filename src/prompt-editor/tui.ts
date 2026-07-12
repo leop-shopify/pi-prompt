@@ -6,8 +6,8 @@ import { buildShortcutBar, frameChromeHeight, frameContentWidth, renderFrame, st
 import { GENERATION_PROFILES } from "../plan/modes.js";
 import { normalizeEditorSource } from "./sources.js";
 import {
-  PROMPT_PLANNING_MODE_ORDER, createPromptEditorState, cycleExecutionKind, cycleGenerationMode, generationModeHelp,
-  promptFieldFocusForInput, skillSuggestions,
+  EXECUTION_KIND_ORDER, PROMPT_PLANNING_MODE_ORDER, createPromptEditorState, cycleExecutionKind, cycleGenerationMode,
+  generationModeHelp, promptFieldFocusForInput, skillSuggestions,
 } from "./state.js";
 import type { PromptEditorInitialState, PromptEditorOutcome, PromptEditorSubmission } from "./types.js";
 
@@ -198,15 +198,19 @@ function renderModeChoices(theme: Theme, width: number, selected: string, focuse
   }).join(theme.fg("dim", " ")), width, "…", false);
 }
 function renderExecutionChoices(theme: Theme, width: number, selected: string, focused: boolean): string {
-  return truncateToWidth((["normal", "goal", "loop"] as const).map((kind) => {
-    const label = kind === "normal" ? "Normal" : kind === "goal" ? "Goal (/goal)" : "Loop (/loop)";
+  return truncateToWidth(EXECUTION_KIND_ORDER.map((kind) => {
+    const label = kind === "normal" ? "Normal"
+      : kind === "goal" ? "Goal (/goal)"
+      : kind === "loop" ? "Loop (/loop)"
+      : "Create Goal (/create-goal)";
     const text = kind === selected ? `[${label}]` : ` ${label} `;
     return kind === selected ? theme.fg(focused ? "accent" : "muted", theme.bold(text)) : theme.fg("dim", text);
   }).join(theme.fg("dim", " ")), width, "…", false);
 }
-function executionHelp(kind: "normal" | "goal" | "loop"): string {
+function executionHelp(kind: (typeof EXECUTION_KIND_ORDER)[number]): string {
   if (kind === "goal") return "The ready plan remains persisted; final acceptance will stage one /goal prefix for human review.";
   if (kind === "loop") return "The ready plan remains persisted; final acceptance will stage one /loop prefix for human review.";
+  if (kind === "create-goal") return "Stages one /create-goal prefix so pi-codex-goal can create a tracked goal from the accepted reviewed plan.";
   return "The ready plan remains persisted; final acceptance will stage plain text for human review.";
 }
 function renderSkillValue(theme: Theme, width: number, selected: readonly string[], query: string, available: readonly string[], focused: boolean): string {

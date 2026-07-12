@@ -40,8 +40,8 @@ describe("direct send", () => {
     expect(sendUserMessage).toHaveBeenCalledWith("Plain request", { deliverAs: "followUp" });
   });
 
-  it("stages goal and loop without dispatching or using a private TUI handleInput", () => {
-    for (const kind of ["goal", "loop"] as const) {
+  it("stages goal, loop, and create-goal without dispatching or using a private TUI handleInput", () => {
+    for (const kind of ["goal", "loop", "create-goal"] as const) {
       const sendUserMessage = vi.fn();
       const setEditorText = vi.fn();
       dispatchDirectSend({ sendUserMessage, setEditorText, isIdle: () => true }, {
@@ -54,7 +54,18 @@ describe("direct send", () => {
     }
   });
 
+  it("deduplicates create-goal while preserving non-token text", () => {
+    expect(buildDirectSendMessage({ text: "/create-goal /create-goal Build", execution: { kind: "normal" } })).toEqual({
+      ok: true, value: "/create-goal Build",
+    });
+    expect(buildDirectSendMessage({ text: "/create-goalie Build", execution: { kind: "normal" } })).toEqual({
+      ok: true, value: "/create-goalie Build",
+    });
+  });
+
   it("rejects conflicting controlled prefixes", () => {
     expect(buildDirectSendMessage({ text: "/loop Build", execution: { kind: "goal" } })).toMatchObject({ ok: false });
+    expect(buildDirectSendMessage({ text: "/goal /create-goal Build", execution: { kind: "normal" } })).toMatchObject({ ok: false });
+    expect(buildDirectSendMessage({ text: "/create-goal Build", execution: { kind: "loop" } })).toMatchObject({ ok: false });
   });
 });

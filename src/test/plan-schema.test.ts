@@ -52,6 +52,13 @@ describe("canonical plan validation", () => {
     expectInvalid({ ...input, lastError: { ...input.lastError, retryable: true } }, "invalid-structure");
   });
 
+  it("persists create-goal as an exclusive execution kind", () => {
+    const result = validatePlanSession({ ...validSession(), execution: { kind: "create-goal" } });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.execution).toEqual({ kind: "create-goal" });
+    expectInvalid({ ...validSession(), execution: { kind: "create-goalie" } }, "invalid-structure");
+  });
+
   it("enforces empty/materialized revision invariants", () => {
     const empty = { ...validSession(), status: "generating", documentRevision: 0, document: null, annotations: [], generationJob: { jobId: "job-1", operation: "initial", baseDocumentRevision: 0, selectedAnnotationIds: [], startedAt: NOW } };
     expect(validatePlanSession(empty).ok).toBe(true);

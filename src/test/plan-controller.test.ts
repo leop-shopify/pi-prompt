@@ -3,7 +3,7 @@ import { PlanController, type LoadedPrivateSkills, type PlanControllerOptions, t
 import type { PlanGeneratorInput, PlanGeneratorResult, WriterSubmissionInput } from "../plan/generator.js";
 import type { CommitAcceptedPlanInput, CommitPlanInput, CommittedPlanState, RecoveredPlanState } from "../plan/repository.js";
 import type { PlanBranchLocator } from "../plan/locator.js";
-import type { PlanSession, SkillReference, ValidationResult } from "../plan/types.js";
+import type { ExecutionKind, PlanSession, SkillReference, ValidationResult } from "../plan/types.js";
 
 const NOW = "2026-07-10T12:00:00.000Z";
 const reference: SkillReference = { name: "testing", path: "/private/testing/SKILL.md", baseDir: "/private/testing", sha256: "a".repeat(64) };
@@ -36,14 +36,14 @@ class FakeGenerator {
   finish(value: PlanGeneratorResult): void { const resolve = this.pending.shift(); if (!resolve) throw new Error("no job"); resolve(value); }
 }
 function locator(state: PlanSession): PlanBranchLocator { return { schemaVersion: 1, sessionId: state.id, artifactPath: `/tmp/${state.id}`, status: state.status, stateVersion: state.stateVersion, documentRevision: state.documentRevision, stateSha256: "b".repeat(64), committedAt: NOW }; }
-function harness(execution: "normal" | "goal" | "loop" = "normal") {
+function harness(execution: ExecutionKind["kind"] = "normal") {
   const repository = new FakeRepository(); const generator = new FakeGenerator(); const staged: string[] = []; const locators: PlanBranchLocator[] = [];
   let id = 0; let stageFailures = 0; let skillResult: ValidationResult<LoadedPrivateSkills> = { ok: true, value: loaded };
   const options: PlanControllerOptions = { repository, generator, appendLocator: (value) => locators.push(value), skills: { reload: async () => skillResult, refresh: async () => skillResult }, idFactory: () => `id-${++id}`, clock: () => NOW, stager: { stage: (value) => { if (stageFailures > 0) { stageFailures -= 1; throw new Error("editor"); } staged.push(value); } } };
   return { repository, generator, staged, locators, options, setStageFailures: (count: number) => { stageFailures = count; }, setSkillResult: (value: ValidationResult<LoadedPrivateSkills>) => { skillResult = value; }, create: () => PlanController.create(options, { prompt: "Build it", cwd: "/repo", skills: [reference], execution: { kind: execution }, mode: "normal" }) };
 }
 
-async function readyController(execution: "normal" | "goal" | "loop" = "normal") {
+async function readyController(execution: ExecutionKind["kind"] = "normal") {
   const h = harness(execution); const made = await h.create(); if (!made.ok) throw new Error(made.error.code); const controller = made.value;
   const started = await controller.generate({ expectedStateVersion: 1 }); if (!started.ok) throw new Error(started.error.code);
   expect(controller.dispatchGeneration(started.value.jobId).ok).toBe(true);
@@ -169,7 +169,7 @@ describe("PlanController", () => {
     expect(h.controller.snapshot()?.annotations[0]).toMatchObject({ body: "Updated", status: "dismissed" });
   });
 
-  it.each(["normal", "goal", "loop"] as const)("atomically accepts and stages %s exactly once", async (execution) => {
+  it.each(["normal", "goal", "loop", "create-goal"] as const)("atomically accepts and stages %s exactly once", async (execution) => {
     const h = await readyController(execution); const state = h.controller.snapshot(); if (!state) return;
     expect((await h.controller.accept({ expectedStateVersion: state.stateVersion, documentRevision: state.documentRevision, confirmed: false })).ok).toBe(false);
     expect((await h.controller.accept({ expectedStateVersion: state.stateVersion, documentRevision: state.documentRevision, confirmed: true })).ok).toBe(true);
@@ -182,7 +182,8 @@ describe("PlanController", () => {
     expect(h.staged[0]).toContain("organize the plan into specific ordered tasks");
     expect(h.staged[0]).not.toContain('<skill name="team-leader"');
     expect(h.staged[0]).toContain('<skill name="testing" baseDir="/private/testing">\nPRIVATE BODY\n</skill>');
-    expect(h.staged[0]?.match(/\/(?:goal|loop)/g)?.length ?? 0).toBe(execution === "normal" ? 0 : 1);
+    expect(h.staged[0]?.match(/\/(?:goal|loop|create-goal)/g)?.length ?? 0).toBe(execution === "normal" ? 0 : 1);
+    if (execution === "create-goal") expect(h.staged[0]).toMatch(/^\/create-goal /);
   });
 
   it("rejects byte-identical no-op revisions without advancing documentRevision or addressing feedback", async () => {

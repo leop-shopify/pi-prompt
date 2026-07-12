@@ -5,7 +5,11 @@ export type GenerationMode =
   | "hard-thinker"
   | "fully-orchestrated";
 
-export type ExecutionKind = { readonly kind: "normal" } | { readonly kind: "goal" } | { readonly kind: "loop" };
+export type ExecutionKind =
+  | { readonly kind: "normal" }
+  | { readonly kind: "goal" }
+  | { readonly kind: "loop" }
+  | { readonly kind: "create-goal" };
 export type PlanSessionStatus = "generating" | "ready" | "revising" | "awaiting-clarification" | "accepted" | "paused" | "cancelled" | "error" | "needs-input";
 
 /** Private generation input. It must never be copied into a browser snapshot. */

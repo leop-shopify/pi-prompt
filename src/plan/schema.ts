@@ -47,7 +47,7 @@ const integerSchema = { type: "integer", minimum: 0 } as const;
 const idSchema = { type: "string", pattern: "^[!-~]{1,64}$", maxLength: PLAN_LIMITS.idAscii } as const;
 
 const executionKindSchema = {
-  oneOf: ["normal", "goal", "loop"].map((kind) => ({ type: "object", properties: { kind: { const: kind } }, required: ["kind"], additionalProperties: false })),
+  oneOf: ["normal", "goal", "loop", "create-goal"].map((kind) => ({ type: "object", properties: { kind: { const: kind } }, required: ["kind"], additionalProperties: false })),
 } as const;
 const textSelectorSchema = {
   type: "object",

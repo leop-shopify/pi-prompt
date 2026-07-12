@@ -34,8 +34,23 @@ describe("prompt editor TUI", () => {
     expect(text).toContain("Full-screen editor only");
     expect(text).toContain("Goal (/goal)");
     expect(text).toContain("Loop (/loop)");
+    expect(text).toContain("Create Goal (/create-goal)");
+    expect(text.indexOf("Normal")).toBeLessThan(text.indexOf("Create Goal (/create-goal)"));
+    expect(text.indexOf("Create Goal (/create-goal)")).toBeLessThan(text.indexOf("Goal (/goal)"));
+    expect(text.indexOf("Goal (/goal)")).toBeLessThan(text.indexOf("Loop (/loop)"));
     expect(text).not.toMatch(/multiplier|custom number/i);
     expect(text).not.toContain("type skill name or /command");
+  });
+
+  it("explains Create Goal and submits its exclusive execution kind", () => {
+    const { component, done } = setup({ text: "reviewed plan", execution: { kind: "create-goal" } });
+    const text = component.render(120).map(stripAnsi).join("\n");
+    expect(text).toContain("pi-codex-goal");
+    expect(text).toContain("tracked goal");
+    component.handleInput?.("\x1b[13;5u");
+    expect(done).toHaveBeenCalledWith(expect.objectContaining({
+      submission: expect.objectContaining({ execution: { kind: "create-goal" }, text: "reviewed plan" }),
+    }));
   });
 
   it("keeps every rendered row within narrow widths", () => {
@@ -77,10 +92,10 @@ describe("prompt editor TUI", () => {
     component.handleInput?.("\x1b[C"); // normal
     component.handleInput?.("\x1b[C"); // careful
     component.handleInput?.("\t"); // execution
-    component.handleInput?.("\x1b[C"); // execution: goal
+    component.handleInput?.("\x1b[C"); // execution: create-goal
     component.handleInput?.("\x1b[13;5u");
     expect(done).toHaveBeenCalledWith(expect.objectContaining({ submission: expect.objectContaining({
-      mode: "careful", execution: { kind: "goal" }, selectedSkills: ["test-expert"],
+      mode: "careful", execution: { kind: "create-goal" }, selectedSkills: ["test-expert"],
     }) }));
   });
 
