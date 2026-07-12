@@ -177,9 +177,14 @@ describe("PlanController", () => {
     expect(h.repository.accepted[0]?.finalPlan).toContain("# Ship");
     expect(h.repository.accepted[0]?.finalPlan).not.toContain("PRIVATE BODY");
     expect(h.repository.accepted[0]?.finalPlan).not.toContain("/private/testing");
-    expect(h.staged[0]).toContain("inspect the leadership and orchestration skills available in this Pi session and preload the best fit");
-    expect(h.staged[0]).toContain("Do not assume a specific skill name; choose from the available options.");
-    expect(h.staged[0]).toContain("organize the plan into specific ordered tasks");
+    expect(h.staged[0]?.match(/## Execution leadership/g)).toHaveLength(1);
+    expect(h.staged[0]).toContain("receiving lead must inspect the leadership and orchestration skills available in the current session and preload the best fit");
+    expect(h.staged[0]).toContain("Do not assume or hard-code a tool or skill name; use the available task and agent capabilities.");
+    expect(h.staged[0]).toContain("explicit outcome-based tasks and dependencies before implementation");
+    expect(h.staged[0]).toContain("Do not treat the whole request as one lane, and do not give one teammate all substantive outcomes.");
+    expect(h.staged[0]).toContain("Keep a sole execution lane with the lead.");
+    expect(h.staged[0]).toContain("Delegate only genuinely independent, bounded lanes");
+    expect(h.staged[0]).toContain("the lead retains integration, cross-lane decisions, and final verification.");
     expect(h.staged[0]).not.toContain('<skill name="team-leader"');
     expect(h.staged[0]).toContain('<skill name="testing" baseDir="/private/testing">\nPRIVATE BODY\n</skill>');
     expect(h.staged[0]?.match(/\/(?:goal|loop|create-goal)/g)?.length ?? 0).toBe(execution === "normal" ? 0 : 1);

@@ -21,7 +21,7 @@ The editor starts in **No plan** with focus in the prompt:
 - `Tab` and `Shift+Tab` move among controls;
 - `Escape` opens the keep-draft/discard choice;
 - `Ctrl+Alt+P` returns the text to Pi's main input;
-- the **skills** field is optional: type a skill name and press Enter/comma to add it, Backspace removes chips, and `none` clears the selection. These are task-context skills; execution leadership is chosen automatically after plan acceptance from the receiving agent's available leadership/orchestration skills.
+- the **skills** field is optional: type a skill name and press Enter/comma to add it, Backspace removes chips, and `none` clears the selection. These are task-context skills; for an accepted plan or direct Create Goal request, the receiving agent chooses execution leadership from the available leadership/orchestration skills.
 
 There is no external-editor handoff.
 
@@ -79,7 +79,7 @@ Planning depth is separate from accepted execution:
 - **Goal** sends exactly one `/goal ` prefix;
 - **Loop** sends exactly one `/loop ` prefix and reuses the existing pi-goal command.
 
-Typed leading `/goal`, `/loop`, or `/create-goal` input is normalized into the same exclusive field. Final acceptance sends the selected execution form immediately; it does not copy the plan into the editor. The execution prompt tells the receiving agent to inspect its available leadership/orchestration skills, preload the best fit without assuming a specific skill name, organize specific ordered tasks, manage dependencies, and verify completion.
+Typed leading `/goal`, `/loop`, or `/create-goal` input is normalized into the same exclusive field. Final acceptance sends the selected execution form immediately; it does not copy the plan into the editor. Accepted plans receive the execution-leadership bootstrap, and direct Create Goal staging receives the same bootstrap before selected skill blocks. The receiving lead must choose an available leadership/orchestration skill, build outcome-based tasks and dependencies before implementation, keep a sole execution lane with the lead, delegate only genuinely independent bounded lanes, and retain integration, cross-lane decisions, and final verification.
 
 ## Verification
 

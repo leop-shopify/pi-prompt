@@ -11,6 +11,13 @@ export interface StagedPlanOptions {
   readonly selectedSkillBlocks?: readonly string[];
 }
 
+export const EXECUTION_LEADERSHIP_BOOTSTRAP = [
+  "## Execution leadership",
+  "Before implementation, the receiving lead must inspect the leadership and orchestration skills available in the current session and preload the best fit. Do not assume or hard-code a tool or skill name; use the available task and agent capabilities.",
+  "Convert this request or accepted plan into explicit outcome-based tasks and dependencies before implementation. Do not treat the whole request as one lane, and do not give one teammate all substantive outcomes.",
+  "Keep a sole execution lane with the lead. Delegate only genuinely independent, bounded lanes; the lead retains integration, cross-lane decisions, and final verification.",
+].join("\n\n");
+
 export function executionKindForTemplate(kind: "goal" | "loop"): ExecutionKind {
   return Object.freeze({ kind });
 }

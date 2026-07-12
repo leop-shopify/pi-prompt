@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { normalizeExecutionInput } from "../plan/classification.js";
+import { EXECUTION_LEADERSHIP_BOOTSTRAP, normalizeExecutionInput } from "../plan/classification.js";
 import type { ExecutionKind, ValidationResult } from "../plan/types.js";
 
 export interface DirectSendInput {
@@ -19,7 +19,10 @@ export function buildDirectSendMessage(input: DirectSendInput): ValidationResult
   const normalized = normalizeExecutionInput(input.text, input.execution);
   if (!normalized.ok) return normalized;
   const prompt = normalized.value.promptText.trim();
-  const blocks = (input.skillBlocks ?? []).map((block) => block.trim()).filter(Boolean);
+  const skillBlocks = (input.skillBlocks ?? []).map((block) => block.trim()).filter(Boolean);
+  const blocks = normalized.value.execution.kind === "create-goal"
+    ? [EXECUTION_LEADERSHIP_BOOTSTRAP, ...skillBlocks]
+    : skillBlocks;
   const slash = normalized.value.execution.kind === "normal" ? splitLeadingSlashCommand(prompt) : null;
   const promptBody = slash?.rest ?? prompt;
   const body = blocks.length === 0 ? promptBody : [blocks.join("\n\n"), "", "User prompt:", promptBody].join("\n");

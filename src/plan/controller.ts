@@ -1,4 +1,4 @@
-import { formatStagedPlan, renderPlanMarkdown } from "./classification.js";
+import { EXECUTION_LEADERSHIP_BOOTSTRAP, formatStagedPlan, renderPlanMarkdown } from "./classification.js";
 import type {
   DispatchablePlanGenerator, PlanGeneratorInput, PlanGeneratorResult, PrivateSkillContent,
   WriterSubmissionInput, WriterSubmissionKind,
@@ -266,7 +266,7 @@ export class PlanController {
       });
     }
     const blocks = [
-      EXECUTION_LEADERSHIP_INSTRUCTION,
+      EXECUTION_LEADERSHIP_BOOTSTRAP,
       ...loaded.value.contexts.map((context, index) => skillBlock(context, observed.source.skills[index]?.baseDir ?? "")),
     ];
     const markdown = observed.committedMarkdown ?? renderPlanMarkdown(observed.document);
@@ -477,11 +477,6 @@ function sameDocumentContent(left: NonNullable<PlanSession["document"]>, right: 
   };
   return JSON.stringify(content(left)) === JSON.stringify(content(right));
 }
-const EXECUTION_LEADERSHIP_INSTRUCTION = [
-  "## Execution leadership",
-  "Before executing this accepted plan, inspect the leadership and orchestration skills available in this Pi session and preload the best fit. Do not assume a specific skill name; choose from the available options.",
-  "Use that leadership skill to organize the plan into specific ordered tasks, manage dependencies and agent assignments where useful, keep work within the accepted scope, and verify each task before declaring completion.",
-].join("\n\n");
 function skillBlock(context: PrivateSkillContent, baseDir: string): string {
   return `<skill name="${escapeXml(context.name)}" baseDir="${escapeXml(baseDir)}">\n${context.body}\n</skill>`;
 }
