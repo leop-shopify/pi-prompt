@@ -1,15 +1,18 @@
 import { formatStagedPlan, renderPlanMarkdown } from "./classification.js";
-import type { DispatchablePlanGenerator, PlanGeneratorInput, PlanGeneratorResult, PrivateSkillContent } from "./generator.js";
+import type {
+  DispatchablePlanGenerator, PlanGeneratorInput, PlanGeneratorResult, PrivateSkillContent,
+  WriterSubmissionInput, WriterSubmissionKind,
+} from "./generator.js";
 import type { AppendPlanBranchLocator } from "./locator.js";
 import {
   allocateInitialPlanDocument, collectPlanElementIds, createAnnotation, reconcileRevision, transitionAnnotationStatus,
   type PlanIdFactory,
 } from "./reconcile.js";
 import type { CommitAcceptedPlanInput, CommitPlanInput, CommittedPlanState, PlanAuditKind } from "./repository.js";
-import { PLAN_LIMITS, normalizePlanText, validatePlanSession } from "./schema.js";
+import { PLAN_LIMITS, normalizePlanText, validateClarificationAnswers, validatePlanSession } from "./schema.js";
 import type {
-  AnnotationStatus, AnnotationTarget, ExecutionKind, GenerationMode, PlanSession, SafeError,
-  SkillReference, ValidationIssue, ValidationResult,
+  AnnotationStatus, AnnotationTarget, ClarificationAnswerEntry, ClarificationOrigin, ExecutionKind, GenerationMode,
+  PendingClarification, PlanSession, SafeError, SkillReference, ValidationIssue, ValidationResult,
 } from "./types.js";
 
 export interface PlanControllerRepository {
@@ -43,7 +46,6 @@ export interface PlanControllerOptions {
   readonly idFactory: PlanIdFactory;
   readonly clock: () => Date | string;
   readonly stager: PlanControllerStager;
-  readonly readPlan?: (sessionId: string) => Promise<string>;
 }
 export interface CreatePlanInput {
   readonly prompt: string;
@@ -53,7 +55,9 @@ export interface CreatePlanInput {
   readonly mode: GenerationMode;
 }
 export interface RevisionInput { readonly expectedStateVersion: number; readonly selectedAnnotationIds: readonly string[]; readonly instruction?: string }
+export interface ClarificationAnswerInput { readonly expectedStateVersion: number; readonly clarificationId: string; readonly answers: readonly ClarificationAnswerEntry[] }
 export interface VersionedInput { readonly expectedStateVersion: number }
+export interface WriterHttpSubmission { readonly attemptId: string; readonly kind: WriterSubmissionKind; readonly body: Buffer }
 export interface PlanJobHandle { readonly jobId: string; readonly completion: Promise<PlanControllerResult> }
 export type PlanControllerResult<T = void> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: SafeError };
 
@@ -80,6 +84,8 @@ export class PlanController {
     if (state?.generationJob) this.#reserved.add(state.generationJob.jobId);
     if (state?.document) for (const id of collectPlanElementIds(state.document)) this.#reserved.add(id);
     for (const annotation of state?.annotations ?? []) this.#reserved.add(annotation.id);
+    for (const round of state?.clarifications?.history ?? []) { this.#reserved.add(round.id); for (const question of round.questions) { this.#reserved.add(question.id); for (const option of question.options) this.#reserved.add(option.id); } }
+    const pending = state?.clarifications?.pending; if (pending) { this.#reserved.add(pending.id); for (const question of pending.questions) { this.#reserved.add(question.id); for (const option of question.options) this.#reserved.add(option.id); } }
   }
 
   static async create(options: PlanControllerOptions, input: CreatePlanInput): Promise<PlanControllerResult<PlanController>> {
@@ -89,7 +95,7 @@ export class PlanController {
     const candidate: PlanSession = {
       schemaVersion: 1, id: id.value, stateVersion: 1, documentRevision: 0, status: "paused",
       source: { prompt: input.prompt, cwd: input.cwd, skills: [...input.skills] }, execution: { kind: input.execution.kind },
-      generation: { mode: input.mode }, document: null, annotations: [],
+      generation: { mode: input.mode }, document: null, annotations: [], clarifications: { history: [] },
     };
     const committed = await controller.#commit(candidate, null, "created");
     if (committed.ok) controller.#reserved.add(id.value);
@@ -103,7 +109,7 @@ export class PlanController {
   }
 
   snapshot(): PlanSession | null { return this.#state; }
-  /** Privacy-safe host signal: accepted content still needs an explicit idempotent staging attempt. */
+  /** Privacy-safe host signal: accepted content still needs an explicit idempotent send attempt. */
   acceptedStagingPending(): boolean { return this.#state?.status === "accepted" && !this.#acceptedStaged; }
   subscribe(listener: (event: PlanControllerEvent) => void): () => void {
     if (this.#closed || this.#closing) return () => undefined;
@@ -116,6 +122,47 @@ export class PlanController {
   async revise(input: RevisionInput): Promise<PlanControllerResult<PlanJobHandle>> {
     return this.#startJob("revision", input.expectedStateVersion, input.selectedAnnotationIds, input.instruction);
   }
+  async resumeClarification(input: VersionedInput): Promise<PlanControllerResult<PlanJobHandle>> {
+    const origin = this.#state?.clarifications?.origin;
+    if (!origin || this.#state?.clarifications?.pending) return failure("clarification-conflict", "No interrupted clarification continuation is resumable.");
+    return this.#startJob(origin.operation, input.expectedStateVersion, origin.selectedAnnotationIds, origin.instruction);
+  }
+  async answerClarification(input: ClarificationAnswerInput): Promise<PlanControllerResult<PlanJobHandle>> {
+    const started = await this.#enqueue(async (): Promise<PlanControllerResult<{ readonly state: PlanSession; readonly runtime: JobRuntime }>> => {
+      const current = this.#mutableState(input.expectedStateVersion); if (!current.ok) return current;
+      const pending = current.value.clarifications?.pending;
+      if (current.value.status !== "awaiting-clarification" || !pending || pending.id !== input.clarificationId) return failure("clarification-conflict", "The clarification batch is stale or already consumed.");
+      if (this.#active || current.value.generationJob) return failure("job-active", "A generation job is already active.");
+      const validatedAnswers = validateClarificationAnswers(input.answers, pending.questions); if (!validatedAnswers.ok) return validationFailure(validatedAnswers.issues);
+      const allocated = this.#allocateId(); if (!allocated.ok) return allocated;
+      const runtime = { id: allocated.value, abort: new AbortController() };
+      const origin = originOf(pending); const status = origin.operation === "initial" ? "generating" : "revising";
+      const answered = { id: pending.id, questions: pending.questions, answers: validatedAnswers.value, answeredAt: this.#now() };
+      const next = { ...current.value, stateVersion: current.value.stateVersion + 1, status,
+        generationJob: { jobId: runtime.id, ...origin, startedAt: this.#now() },
+        clarifications: { history: [...(current.value.clarifications?.history ?? []), answered], origin }, lastError: undefined } as PlanSession;
+      const committed = await this.#commit(next, current.value, "state-changed"); if (!committed.ok) return committed;
+      this.#active = runtime; this.#reserved.add(runtime.id); return success({ state: next, runtime });
+    });
+    if (!started.ok) return started;
+    return success({ jobId: started.value.runtime.id, completion: this.#runJob(started.value.state, started.value.runtime) });
+  }
+  configureWriterEndpoint(url: string): PlanControllerResult {
+    if (this.#closed || this.#closing) return failure("controller-closed", "The plan controller is closed.");
+    return this.#options.generator.configureWriterEndpoint(url);
+  }
+  async submitWriterResult(input: WriterHttpSubmission): Promise<PlanControllerResult> {
+    const state = this.#state; const job = state?.generationJob;
+    if (this.#closed || this.#closing) return failure("controller-closed", "The plan controller is closed.");
+    if (!state || !job || this.#active?.id !== job.jobId || job.baseDocumentRevision !== state.documentRevision) {
+      return failure("writer-submission-stale", "The writer submission is not active.");
+    }
+    const submission: WriterSubmissionInput = {
+      sessionId: state.id, jobId: job.jobId, operation: job.operation, baseDocumentRevision: job.baseDocumentRevision,
+      attemptId: input.attemptId, kind: input.kind, body: input.body,
+    };
+    return this.#options.generator.submitWriterResult(submission);
+  }
   dispatchGeneration(jobId: string): PlanControllerResult {
     const state = this.#state;
     if (this.#closed || this.#closing) return failure("controller-closed", "The plan controller is closed.");
@@ -126,6 +173,7 @@ export class PlanController {
   async addAnnotation(input: VersionedInput & { readonly target: AnnotationTarget; readonly body: string }): Promise<PlanControllerResult> {
     return this.#enqueue(async () => {
       const state = this.#mutableState(input.expectedStateVersion); if (!state.ok) return state;
+      if (state.value.status === "awaiting-clarification") return failure("clarification-read-only", "Annotations are read-only while clarification answers are pending.");
       if (!state.value.document) return failure("plan-not-ready", "A materialized plan is required.");
       const made = createAnnotation(state.value.document, state.value.documentRevision, input.target, input.body, { idFactory: this.#options.idFactory, reservedIds: this.#reserved, now: this.#now() });
       if (!made.ok) return validationFailure(made.issues);
@@ -179,10 +227,10 @@ export class PlanController {
   async resumeReview(input: VersionedInput): Promise<PlanControllerResult> {
     return this.#enqueue(async () => {
       const current = this.#mutableState(input.expectedStateVersion); if (!current.ok) return current;
-      if (current.value.status !== "paused" || !current.value.document || current.value.generationJob || this.#active) {
-        return failure("invalid-status", "Only a paused materialized plan without an active job can resume review.");
+      if (current.value.status !== "paused" || (!current.value.document && !current.value.clarifications?.pending) || current.value.generationJob || this.#active) {
+        return failure("invalid-status", "Only a paused review or clarification without an active job can resume.");
       }
-      const next = { ...current.value, stateVersion: current.value.stateVersion + 1, status: "ready", lastError: undefined } as PlanSession;
+      const next = { ...current.value, stateVersion: current.value.stateVersion + 1, status: current.value.clarifications?.pending ? "awaiting-clarification" : "ready", lastError: undefined } as PlanSession;
       return this.#commit(next, current.value, "state-changed");
     });
   }
@@ -217,10 +265,11 @@ export class PlanController {
         const current = this.#mutableState(input.expectedStateVersion); return current.ok ? this.#commitSkillFailure(current.value) : current;
       });
     }
-    const blocks = loaded.value.contexts.map((context, index) => skillBlock(context, observed.source.skills[index]?.baseDir ?? ""));
-    let markdown: string;
-    try { markdown = this.#options.readPlan ? await this.#options.readPlan(observed.id) : renderPlanMarkdown(observed.document); }
-    catch { return failure("plan-file-unavailable", "The saved plan.md file could not be read."); }
+    const blocks = [
+      EXECUTION_LEADERSHIP_INSTRUCTION,
+      ...loaded.value.contexts.map((context, index) => skillBlock(context, observed.source.skills[index]?.baseDir ?? "")),
+    ];
+    const markdown = observed.committedMarkdown ?? renderPlanMarkdown(observed.document);
     const staged = formatStagedPlan(markdown, observed.execution, blocks);
     if (!acceptedRetry) {
       const committed = await this.#enqueue(async () => {
@@ -232,7 +281,7 @@ export class PlanController {
       if (!committed.ok) return committed;
     }
     try { await this.#options.stager.stage(staged); this.#acceptedStaged = true; return success(undefined); }
-    catch { return failure("stage-failed", "The accepted plan was saved but could not be staged."); }
+    catch { return failure("stage-failed", "The accepted plan was saved but could not be sent to the agent."); }
   }
 
   close(): Promise<void> {
@@ -247,7 +296,7 @@ export class PlanController {
     const runtime = this.#active;
     const stopped = await this.#enqueue(async () => {
       const state = this.#state;
-      if (state && (state.status === "generating" || state.status === "revising")) {
+      if (state && (state.status === "generating" || state.status === "revising" || state.status === "awaiting-clarification")) {
         const next = { ...state, stateVersion: state.stateVersion + 1, status: "paused", generationJob: undefined } as PlanSession;
         return this.#commit(next, state, "paused");
       }
@@ -261,18 +310,23 @@ export class PlanController {
   }
 
   async #startJob(operation: "initial" | "revision", expected: number, selectedIds: readonly string[], instruction?: string): Promise<PlanControllerResult<PlanJobHandle>> {
-    const canonicalInstruction = instruction === undefined ? undefined : normalizePlanText(instruction);
+    const resumable = this.#state?.clarifications?.origin && !this.#state.clarifications.pending ? this.#state.clarifications.origin : undefined;
+    const effectiveOperation = resumable?.operation ?? operation;
+    const effectiveSelectedIds = resumable?.selectedAnnotationIds ?? selectedIds;
+    const canonicalInstruction = resumable?.instruction ?? (instruction === undefined ? undefined : normalizePlanText(instruction));
     if (canonicalInstruction !== undefined && Buffer.byteLength(canonicalInstruction, "utf8") > PLAN_LIMITS.generationInstructionBytes) return failure("invalid-instruction", "Generation instruction is too long.");
     const started = await this.#enqueue(async (): Promise<PlanControllerResult<{ readonly state: PlanSession; readonly runtime: JobRuntime }>> => {
       const current = this.#mutableState(expected); if (!current.ok) return current;
       if (this.#active || current.value.generationJob) return failure("job-active", "A generation job is already active.");
+      if (effectiveOperation !== operation) return failure("clarification-conflict", "The resumable clarification operation does not match this request.");
       if (operation === "initial" && (current.value.document || !["paused", "error"].includes(current.value.status))) return failure("invalid-status", "Initial generation requires an empty paused or error session.");
       if (operation === "revision" && (!current.value.document || !["ready", "error"].includes(current.value.status))) return failure("invalid-status", "Revision requires a materialized ready or error session.");
-      if (new Set(selectedIds).size !== selectedIds.length || selectedIds.some((id) => !current.value.annotations.some((annotation) => annotation.id === id))) return failure("invalid-annotations", "Selected annotation IDs must be unique and current.");
+      if (new Set(effectiveSelectedIds).size !== effectiveSelectedIds.length || effectiveSelectedIds.some((id) => !current.value.annotations.some((annotation) => annotation.id === id))) return failure("invalid-annotations", "Selected annotation IDs must be unique and current.");
       const allocated = this.#allocateId(); if (!allocated.ok) return allocated;
       const runtime = { id: allocated.value, abort: new AbortController() };
       const status = operation === "initial" ? "generating" : "revising";
-      const next = { ...current.value, stateVersion: current.value.stateVersion + 1, status, generationJob: { jobId: runtime.id, operation, baseDocumentRevision: current.value.documentRevision, selectedAnnotationIds: [...selectedIds], ...(canonicalInstruction === undefined ? {} : { instruction: canonicalInstruction }), startedAt: this.#now() }, lastError: undefined } as PlanSession;
+      const baseDocumentRevision = resumable?.baseDocumentRevision ?? current.value.documentRevision;
+      const next = { ...current.value, stateVersion: current.value.stateVersion + 1, status, generationJob: { jobId: runtime.id, operation, baseDocumentRevision, selectedAnnotationIds: [...effectiveSelectedIds], ...(canonicalInstruction === undefined ? {} : { instruction: canonicalInstruction }), startedAt: this.#now() }, lastError: undefined } as PlanSession;
       const committed = await this.#commit(next, current.value, "state-changed");
       if (!committed.ok) return committed;
       this.#active = runtime; this.#reserved.add(runtime.id); return success({ state: next, runtime });
@@ -314,11 +368,24 @@ export class PlanController {
       return this.#commit(next, state, "state-changed");
     }
     const outcome = result.outcome;
+    if (outcome.kind === "clarification") {
+      const history = state.clarifications?.history ?? [];
+      if (history.length >= PLAN_LIMITS.clarificationRounds || clarificationIds(outcome.questions).some((id) => this.#reserved.has(id))) return this.#commitGenerationError(state, "invalid-clarification", "The generated clarification batch was invalid.");
+      const clarificationId = this.#allocateId(); if (!clarificationId.ok) return clarificationId;
+      const origin: ClarificationOrigin = { operation: job.operation, baseDocumentRevision: job.baseDocumentRevision, selectedAnnotationIds: [...job.selectedAnnotationIds], ...(job.instruction === undefined ? {} : { instruction: job.instruction }) };
+      const pending: PendingClarification = { id: clarificationId.value, questions: outcome.questions, ...origin };
+      const next = { ...state, stateVersion: state.stateVersion + 1, status: "awaiting-clarification", generationJob: undefined,
+        clarifications: { history, origin, pending }, lastError: undefined } as PlanSession;
+      const committed = await this.#commit(next, state, "state-changed");
+      if (committed.ok) { this.#reserved.add(clarificationId.value); for (const id of clarificationIds(outcome.questions)) this.#reserved.add(id); }
+      return committed;
+    }
     if (job.operation === "initial") {
       if (outcome.kind !== "plan") return this.#commitGenerationError(state);
       const allocated = allocateInitialPlanDocument(outcome.document, { idFactory: this.#options.idFactory, reservedIds: this.#reserved });
       if (!allocated.ok) return this.#commitGenerationError(state);
-      const next = { ...state, stateVersion: state.stateVersion + 1, documentRevision: 1, document: allocated.value, annotations: [], status: "ready", generationJob: undefined, lastError: undefined } as PlanSession;
+      const markdown = outcome.markdown ?? renderPlanMarkdown(allocated.value);
+      const next = { ...state, stateVersion: state.stateVersion + 1, documentRevision: 1, document: allocated.value, committedMarkdown: markdown, annotations: [], status: "ready", generationJob: undefined, clarifications: { history: state.clarifications?.history ?? [] }, lastError: undefined } as PlanSession;
       const committed = await this.#commit(next, state, "revision-committed"); if (committed.ok) for (const id of collectPlanElementIds(allocated.value)) this.#reserved.add(id); return committed;
     }
     if (outcome.kind !== "revision" || !state.document) return this.#commitGenerationError(state);
@@ -327,7 +394,8 @@ export class PlanController {
     if (sameDocumentContent(reconciled.value.document, state.document)) {
       return this.#commitGenerationError(state, "no-op-revision", "The generated revision did not change the plan.");
     }
-    const next = { ...state, stateVersion: state.stateVersion + 1, documentRevision: reconciled.value.documentRevision, document: reconciled.value.document, annotations: reconciled.value.annotations, status: "ready", generationJob: undefined, lastError: undefined } as PlanSession;
+    const markdown = outcome.markdown ?? renderPlanMarkdown(reconciled.value.document);
+    const next = { ...state, stateVersion: state.stateVersion + 1, documentRevision: reconciled.value.documentRevision, document: reconciled.value.document, committedMarkdown: markdown, annotations: reconciled.value.annotations, status: "ready", generationJob: undefined, clarifications: { history: state.clarifications?.history ?? [] }, lastError: undefined } as PlanSession;
     const committed = await this.#commit(next, state, "revision-committed"); if (committed.ok) for (const id of collectPlanElementIds(reconciled.value.document)) this.#reserved.add(id); return committed;
   }
 
@@ -345,9 +413,10 @@ export class PlanController {
   async #updateAnnotation(input: VersionedInput & { readonly annotationId: string }, change: (annotation: PlanSession["annotations"][number]) => PlanControllerResult<PlanSession["annotations"][number]>): Promise<PlanControllerResult> {
     return this.#enqueue(async () => {
       const current = this.#mutableState(input.expectedStateVersion); if (!current.ok) return current;
+      if (current.value.status === "awaiting-clarification") return failure("clarification-read-only", "Annotations are read-only while clarification answers are pending.");
       const index = current.value.annotations.findIndex((annotation) => annotation.id === input.annotationId); const annotation = current.value.annotations[index];
       if (annotation === undefined) return failure("annotation-not-found", "The annotation does not exist.");
-      if (current.value.generationJob?.selectedAnnotationIds.includes(annotation.id)) return failure("annotation-locked", "Selected feedback is locked while its generation job is active.");
+      if (current.value.generationJob?.selectedAnnotationIds.includes(annotation.id) || current.value.clarifications?.pending?.selectedAnnotationIds.includes(annotation.id)) return failure("annotation-locked", "Selected feedback is locked while its planning operation is active.");
       const changed = change(annotation); if (!changed.ok) return changed;
       const annotations = [...current.value.annotations]; annotations[index] = changed.value;
       const next = { ...current.value, stateVersion: current.value.stateVersion + 1, annotations } as PlanSession;
@@ -397,6 +466,8 @@ export class PlanController {
   #now(): string { const raw = this.#options.clock(); return raw instanceof Date ? raw.toISOString() : raw; }
 }
 
+function originOf(value: ClarificationOrigin): ClarificationOrigin { return { operation: value.operation, baseDocumentRevision: value.baseDocumentRevision, selectedAnnotationIds: [...value.selectedAnnotationIds], ...(value.instruction === undefined ? {} : { instruction: value.instruction }) }; }
+function clarificationIds(questions: readonly { readonly id: string; readonly options: readonly { readonly id: string }[] }[]): string[] { return questions.flatMap((question) => [question.id, ...question.options.map((option) => option.id)]); }
 function sameDocumentContent(left: NonNullable<PlanSession["document"]>, right: NonNullable<PlanSession["document"]>): boolean {
   const content = (document: NonNullable<PlanSession["document"]>): unknown => {
     const element = (value: NonNullable<PlanSession["document"]>["title"]): unknown => ({
@@ -406,6 +477,11 @@ function sameDocumentContent(left: NonNullable<PlanSession["document"]>, right: 
   };
   return JSON.stringify(content(left)) === JSON.stringify(content(right));
 }
+const EXECUTION_LEADERSHIP_INSTRUCTION = [
+  "## Execution leadership",
+  "Before executing this accepted plan, inspect the leadership and orchestration skills available in this Pi session and preload the best fit. Do not assume a specific skill name; choose from the available options.",
+  "Use that leadership skill to organize the plan into specific ordered tasks, manage dependencies and agent assignments where useful, keep work within the accepted scope, and verify each task before declaring completion.",
+].join("\n\n");
 function skillBlock(context: PrivateSkillContent, baseDir: string): string {
   return `<skill name="${escapeXml(context.name)}" baseDir="${escapeXml(baseDir)}">\n${context.body}\n</skill>`;
 }

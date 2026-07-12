@@ -18,19 +18,30 @@ function readyState(overrides: Partial<PlanSession> = {}): PlanSession {
 function fakeController(initial = readyState(), behavior: { stageFailures?: number } = {}) {
   let state = initial;
   let stageFailures = behavior.stageFailures ?? 0;
-  let staged = false;
+  let staged = false; let writerSettled = false;
+  const writerSubmissions: Array<{ readonly attemptId: string; readonly kind: string; readonly body: Buffer }> = [];
   const listeners = new Set<(event: PlanControllerEvent) => void>();
   let note = 0; let job = 0;
   const publish = (kind = "state-changed") => { for (const listener of listeners) listener({ kind: kind as any, sessionId: state.id, status: state.status, stateVersion: state.stateVersion, documentRevision: state.documentRevision }); };
   const commit = (patch: Partial<PlanSession>, kind?: string) => { state = { ...state, stateVersion: state.stateVersion + 1, ...patch } as PlanSession; publish(kind); return { ok: true as const, value: undefined }; };
   const controller = {
     snapshot: vi.fn(() => state),
+    configureWriterEndpoint: vi.fn(() => ({ ok: true as const, value: undefined })),
+    submitWriterResult: vi.fn(async ({ attemptId, kind, body }: any) => {
+      if (attemptId !== "attempt_identity_0001" || writerSettled) return { ok: false as const, error: { code: "writer-attempt-rejected", message: "The writer submission is not active." } };
+      if (kind === "clarification") {
+        try { const value = JSON.parse(body.toString("utf8")); if (!value || Object.keys(value).length !== 1 || !Array.isArray(value.questions) || value.questions.length === 0) throw new Error("invalid"); }
+        catch { return { ok: false as const, error: { code: "invalid-clarification", message: "The clarification submission is invalid." } }; }
+      }
+      writerSubmissions.push({ attemptId, kind, body }); writerSettled = true; return { ok: true as const, value: undefined };
+    }),
     subscribe: vi.fn((listener: (event: PlanControllerEvent) => void) => { listeners.add(listener); return () => listeners.delete(listener); }),
-    addAnnotation: vi.fn(async ({ target, body }: any) => commit({ annotations: [...state.annotations, { id: `note-${++note}`, target, targetSnapshot: { documentRevision: state.documentRevision, target, elementKind: target.kind === "root" ? "root" : "step", text: target.kind === "root" ? "" : "Do it" }, body, status: "open", history: [], createdAgainstRevision: state.documentRevision, createdAt: "2026-07-10T00:00:00.000Z", updatedAt: "2026-07-10T00:00:00.000Z" }] })),
-    updateAnnotationBody: vi.fn(async ({ annotationId, body }: any) => commit({ annotations: state.annotations.map((entry) => entry.id === annotationId ? { ...entry, body } : entry) })),
-    transitionAnnotation: vi.fn(async ({ annotationId, status }: any) => commit({ annotations: state.annotations.map((entry) => entry.id === annotationId ? { ...entry, status } : entry) })),
+    addAnnotation: vi.fn(async ({ target, body }: any) => state.status === "awaiting-clarification" ? { ok: false as const, error: { code: "clarification-read-only", message: "Annotations are read-only while clarification answers are pending." } } : commit({ annotations: [...state.annotations, { id: `note-${++note}`, target, targetSnapshot: { documentRevision: state.documentRevision, target, elementKind: target.kind === "root" ? "root" : "step", text: target.kind === "root" ? "" : "Do it" }, body, status: "open", history: [], createdAgainstRevision: state.documentRevision, createdAt: "2026-07-10T00:00:00.000Z", updatedAt: "2026-07-10T00:00:00.000Z" }] })),
+    updateAnnotationBody: vi.fn(async ({ annotationId, body }: any) => state.status === "awaiting-clarification" ? { ok: false as const, error: { code: "clarification-read-only", message: "Annotations are read-only while clarification answers are pending." } } : commit({ annotations: state.annotations.map((entry) => entry.id === annotationId ? { ...entry, body } : entry) })),
+    transitionAnnotation: vi.fn(async ({ annotationId, status }: any) => state.status === "awaiting-clarification" ? { ok: false as const, error: { code: "clarification-read-only", message: "Annotations are read-only while clarification answers are pending." } } : commit({ annotations: state.annotations.map((entry) => entry.id === annotationId ? { ...entry, status } : entry) })),
     revise: vi.fn(async ({ selectedAnnotationIds }: any) => { const id = `job-${++job}`; commit({ status: "revising", generationJob: { jobId: id, operation: "revision", baseDocumentRevision: state.documentRevision, selectedAnnotationIds, startedAt: "2026-07-10T00:00:00.000Z" } }); return { ok: true as const, value: { jobId: id, completion: new Promise(() => undefined) } }; }),
     generate: vi.fn(async () => { const id = `job-${++job}`; commit({ status: "generating" }); return { ok: true as const, value: { jobId: id, completion: new Promise(() => undefined) } }; }),
+    answerClarification: vi.fn(async () => { const id = `job-${++job}`; const operation = state.clarifications?.pending?.operation ?? "initial"; commit({ status: operation === "initial" ? "generating" : "revising", clarifications: { history: state.clarifications?.history ?? [], origin: state.clarifications?.origin }, generationJob: { jobId: id, operation, baseDocumentRevision: state.documentRevision, selectedAnnotationIds: [], startedAt: "2026-07-10T00:00:00.000Z" } }); return { ok: true as const, value: { jobId: id, completion: new Promise(() => undefined) } }; }),
     dispatchGeneration: vi.fn(() => ({ ok: true as const, value: undefined })),
     acceptedStagingPending: vi.fn(() => state.status === "accepted" && !staged),
     accept: vi.fn(async () => {
@@ -41,11 +52,14 @@ function fakeController(initial = readyState(), behavior: { stageFailures?: numb
     pause: vi.fn(async () => commit({ status: "paused", generationJob: undefined }, "paused")),
     cancel: vi.fn(async () => commit({ status: "cancelled", generationJob: undefined }, "cancelled")),
   };
-  return { controller: controller as unknown as PlanController, raw: controller, getState: () => state, listeners };
+  return { controller: controller as unknown as PlanController, raw: controller, getState: () => state, listeners, writerSubmissions };
 }
 function auth(host: Awaited<ReturnType<typeof startPlanHttpHost>>, mutation = false, etag?: string) {
   const token = new URL(host.launchUrl).hash.slice("#capability=".length);
   return { Authorization: `Bearer ${token}`, "X-Pi-Prompt-Origin": host.origin, ...(mutation ? { Origin: host.origin, "Content-Type": "application/json", ...(etag ? { "If-Match": etag } : {}) } : {}) };
+}
+function writerHeaders(attemptId: string, result: "plan" | "clarification", contentType = result === "plan" ? "text/markdown" : "application/json") {
+  return { Authorization: `Bearer ${attemptId}`, "Content-Type": contentType, "X-Pi-Prompt-Result": result };
 }
 async function json(response: Response) { return response.json() as Promise<any>; }
 
@@ -68,7 +82,7 @@ describe("secure plan HTTP host", () => {
     const planRoot = await mkdtemp(join(tmpdir(), "pi-prompt-http-plan-"));
     await mkdir(join(planRoot, "session"), { recursive: true });
     await writeFile(join(planRoot, "session", "plan.md"), "# Saved plan\n\n## Execution\nNormal\n", { mode: 0o600 });
-    const fake = fakeController(readyState({ status: "generating", documentRevision: 0, document: null, annotations: [] } as Partial<PlanSession>));
+    const fake = fakeController(readyState({ committedMarkdown: "# Saved plan\n\n## Execution\nNormal\n" }));
     const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn(), planRoot });
     try {
       expect((await fetch(`${host.origin}/api/v1/plan`)).status).toBe(401);
@@ -90,6 +104,56 @@ describe("secure plan HTTP host", () => {
       const noOrigin = await fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers: { ...auth(host, false), "Content-Type": "application/json", "If-Match": '"pi-plan-state-3"' }, body: JSON.stringify({ requestId: "request-id-00000001", target: { kind: "element", elementId: "step" }, body: "x" }) });
       expect(noOrigin.status).toBe(403);
     } finally { await host.close(); }
+  });
+
+  it("configures a private writer endpoint before returning and never exposes its URL or bearer publicly", async () => {
+    const fake = fakeController(); const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn() });
+    try {
+      expect(fake.raw.configureWriterEndpoint).toHaveBeenCalledWith(`${host.origin}/api/v1/writer-results`);
+      expect(host).not.toHaveProperty("writerEndpoint"); expect(host.launchUrl).not.toContain("writer-results");
+      const snapshot = await json(await fetch(`${host.origin}/api/v1/snapshot`, { headers: auth(host) }));
+      expect(JSON.stringify(snapshot)).not.toContain("writer-results"); expect(JSON.stringify(snapshot)).not.toContain("attempt_identity");
+    } finally { await host.close(); }
+  });
+
+  it("accepts exact writer bytes without Origin and rejects browser, wrong, duplicate, malformed, and unsupported submissions", async () => {
+    const fake = fakeController(); const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn() });
+    const path = `${host.origin}/api/v1/writer-results`;
+    try {
+      const browserToken = new URL(host.launchUrl).hash.slice("#capability=".length);
+      const wrongHost = await new Promise<string>((resolve, reject) => {
+        const socket = connect(host.port, "127.0.0.1"); let raw = ""; socket.setEncoding("utf8"); socket.once("error", reject);
+        socket.on("data", (chunk) => { raw += chunk; }); socket.once("end", () => resolve(raw));
+        socket.once("connect", () => socket.write(["POST /api/v1/writer-results HTTP/1.1", "Host: evil.invalid", "Authorization: Bearer attempt_identity_0001", "Content-Type: text/markdown", "X-Pi-Prompt-Result: plan", "Content-Length: 1", "Connection: close", "", "x"].join("\r\n")));
+      });
+      expect(wrongHost).toContain("HTTP/1.1 400 Bad Request");
+      expect((await fetch(path, { method: "POST", headers: writerHeaders(browserToken, "plan"), body: "# Browser" })).status).toBe(401);
+      expect((await fetch(path, { method: "POST", headers: writerHeaders("attempt_identity_wrong", "plan"), body: "# Wrong" })).status).toBe(401);
+      expect((await fetch(path, { method: "GET", headers: { Authorization: "Bearer attempt_identity_0001" } })).status).toBe(405);
+      expect((await fetch(path, { method: "POST", headers: { ...writerHeaders("attempt_identity_0001", "plan"), "X-Pi-Prompt-Result": "unknown" }, body: "x" })).status).toBe(422);
+      const wrongType = await fetch(path, { method: "POST", headers: writerHeaders("attempt_identity_0001", "plan", "application/json"), body: "PRIVATE BODY MUST NOT ECHO" });
+      expect(wrongType.status).toBe(415); expect(JSON.stringify(await json(wrongType))).not.toContain("PRIVATE BODY");
+      expect((await fetch(path, { method: "POST", headers: writerHeaders("attempt_identity_0001", "clarification"), body: "{" })).status).toBe(422);
+
+      const exact = Buffer.from("# Exact\r\n\r\n## Execution\r\nNormal\r\n", "utf8");
+      const accepted = await fetch(path, { method: "POST", headers: writerHeaders("attempt_identity_0001", "plan"), body: exact });
+      expect(accepted.status).toBe(202); expect(fake.writerSubmissions).toHaveLength(1); expect(fake.writerSubmissions[0]!.body.equals(exact)).toBe(true);
+      expect((await fetch(path, { method: "POST", headers: writerHeaders("attempt_identity_0001", "plan"), body: exact })).status).toBe(401);
+    } finally { await host.close(); }
+  });
+
+  it("accepts a strict clarification body and rejects over-limit streaming declarations", async () => {
+    const clarification = fakeController(); const host = await startPlanHttpHost({ controller: clarification.controller, reopenInPi: vi.fn() });
+    try {
+      const body = Buffer.from(JSON.stringify({ questions: [{ id: "q", prompt: "Choose?", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] }] }));
+      const response = await fetch(`${host.origin}/api/v1/writer-results`, { method: "POST", headers: writerHeaders("attempt_identity_0001", "clarification"), body });
+      expect(response.status).toBe(202); expect(clarification.writerSubmissions[0]).toMatchObject({ kind: "clarification" });
+    } finally { await host.close(); }
+    const oversized = fakeController(); const oversizedHost = await startPlanHttpHost({ controller: oversized.controller, reopenInPi: vi.fn() });
+    try {
+      const response = await fetch(`${oversizedHost.origin}/api/v1/writer-results`, { method: "POST", headers: writerHeaders("attempt_identity_0001", "clarification"), body: Buffer.alloc(64 * 1024 + 1, 0x61) });
+      expect(response.status).toBe(413); expect(oversized.raw.submitWriterResult).not.toHaveBeenCalled();
+    } finally { await oversizedHost.close(); }
   });
 
   it("adds the normal security headers to raw parser errors", async () => {
@@ -135,6 +199,41 @@ describe("secure plan HTTP host", () => {
       const events = await fetch(`${host.origin}/api/v1/events?after=0`, { headers: auth(host) }); const eventBody = await json(events); expect(eventBody.events.map((event: any) => event.stateVersion)).toEqual([4, 5, 6]);
       expect(JSON.stringify(eventBody)).not.toContain("instruction");
       const future = await fetch(`${host.origin}/api/v1/events?after=999`, { headers: auth(host) }); expect(future.status).toBe(400);
+    } finally { await host.close(); }
+  });
+
+  it("accepts clarification answers once with replay-safe 202 and returns 409/422 without consuming stale input", async () => {
+    const question = { id: "question", prompt: "Choose?", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] };
+    const pending = { id: "round", operation: "revision" as const, baseDocumentRevision: 1, selectedAnnotationIds: [], questions: [question] };
+    const fake = fakeController(readyState({ status: "awaiting-clarification", clarifications: { history: [], origin: { operation: "revision", baseDocumentRevision: 1, selectedAnnotationIds: [] }, pending } }));
+    const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn() });
+    try {
+      const body = { requestId: "request-id-clarify-01", clarificationId: "round", answers: [{ questionId: "question", answer: { kind: "option", optionId: "a" } }] };
+      const [first, replay] = await Promise.all([1, 2].map(() => fetch(`${host.origin}/api/v1/clarification-answers`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body: JSON.stringify(body) })));
+      expect(first.status).toBe(202); expect(replay.status).toBe(202); expect(await json(replay)).toEqual(await json(first)); expect(fake.raw.answerClarification).toHaveBeenCalledTimes(1); expect(fake.raw.dispatchGeneration).toHaveBeenCalledTimes(1);
+      const stale = fakeController(readyState({ status: "awaiting-clarification", clarifications: { history: [], origin: { operation: "revision", baseDocumentRevision: 1, selectedAnnotationIds: [] }, pending } }));
+      const staleHost = await startPlanHttpHost({ controller: stale.controller, reopenInPi: vi.fn() });
+      try {
+        const wrong = await fetch(`${staleHost.origin}/api/v1/clarification-answers`, { method: "POST", headers: auth(staleHost, true, '"pi-plan-state-3"'), body: JSON.stringify({ ...body, requestId: "request-id-clarify-02", clarificationId: "wrong" }) }); expect(wrong.status).toBe(409); expect(await json(wrong)).toHaveProperty("snapshot.clarification.id", "round");
+        const blank = await fetch(`${staleHost.origin}/api/v1/clarification-answers`, { method: "POST", headers: auth(staleHost, true, '"pi-plan-state-3"'), body: JSON.stringify({ ...body, requestId: "request-id-clarify-03", answers: [{ questionId: "question", answer: { kind: "custom", text: " " } }] }) }); expect(blank.status).toBe(422); expect(stale.raw.answerClarification).not.toHaveBeenCalled(); expect(JSON.stringify(await json(blank))).not.toContain("question");
+      } finally { await staleHost.close(); }
+    } finally { await host.close(); }
+  });
+
+  it("returns safe conflicts for every annotation mutation while awaiting clarification", async () => {
+    const question = { id: "question", prompt: "Choose?", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] };
+    const pending = { id: "round", operation: "revision" as const, baseDocumentRevision: 1, selectedAnnotationIds: [], questions: [question] };
+    const note = { id: "note-1", target: { kind: "element" as const, elementId: "step" }, targetSnapshot: { documentRevision: 1, target: { kind: "element" as const, elementId: "step" }, elementKind: "step" as const, text: "Do it" }, body: "Visible", status: "open" as const, history: [], createdAgainstRevision: 1, createdAt: "2026-07-10T00:00:00.000Z", updatedAt: "2026-07-10T00:00:00.000Z" };
+    const fake = fakeController(readyState({ status: "awaiting-clarification", annotations: [note], clarifications: { history: [], origin: { operation: "revision", baseDocumentRevision: 1, selectedAnnotationIds: [] }, pending } }));
+    const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn() });
+    try {
+      const requests = [
+        fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body: JSON.stringify({ requestId: "request-readonly-create", target: { kind: "element", elementId: "step" }, body: "Blocked" }) }),
+        fetch(`${host.origin}/api/v1/annotations/note-1`, { method: "PATCH", headers: auth(host, true, '"pi-plan-state-3"'), body: JSON.stringify({ requestId: "request-readonly-update", update: { body: "Blocked" } }) }),
+        fetch(`${host.origin}/api/v1/annotations/note-1`, { method: "PATCH", headers: auth(host, true, '"pi-plan-state-3"'), body: JSON.stringify({ requestId: "request-readonly-status", update: { status: "dismissed" } }) }),
+      ];
+      for (const response of await Promise.all(requests)) { expect(response.status).toBe(409); expect(await json(response)).toMatchObject({ error: { code: "clarification-read-only" } }); }
+      expect(fake.getState().annotations).toEqual([note]);
     } finally { await host.close(); }
   });
 

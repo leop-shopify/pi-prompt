@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { PlanController, type LoadedPrivateSkills, type PlanControllerOptions, type PlanControllerRepository } from "../plan/controller.js";
-import type { PlanGeneratorInput, PlanGeneratorResult } from "../plan/generator.js";
+import type { PlanGeneratorInput, PlanGeneratorResult, WriterSubmissionInput } from "../plan/generator.js";
 import type { CommitAcceptedPlanInput, CommitPlanInput, CommittedPlanState, RecoveredPlanState } from "../plan/repository.js";
 import type { PlanBranchLocator } from "../plan/locator.js";
 import type { PlanSession, SkillReference, ValidationResult } from "../plan/types.js";
@@ -27,8 +27,10 @@ class FakeRepository implements PlanControllerRepository {
   async close(): Promise<void> { this.closed += 1; }
 }
 class FakeGenerator {
-  readonly calls: PlanGeneratorInput[] = []; readonly pending: Array<(value: PlanGeneratorResult) => void> = []; readonly dispatched: string[] = []; closed = 0;
+  readonly calls: PlanGeneratorInput[] = []; readonly pending: Array<(value: PlanGeneratorResult) => void> = []; readonly dispatched: string[] = []; readonly submissions: WriterSubmissionInput[] = []; closed = 0;
   generate(input: PlanGeneratorInput): Promise<PlanGeneratorResult> { this.calls.push(input); return new Promise((resolve) => this.pending.push(resolve)); }
+  configureWriterEndpoint(_url: string) { return { ok: true as const, value: undefined }; }
+  async submitWriterResult(input: WriterSubmissionInput) { this.submissions.push(input); return { ok: true as const, value: undefined }; }
   dispatch(jobId: string) { this.dispatched.push(jobId); return { ok: true as const, value: undefined }; }
   close(): void { this.closed += 1; }
   finish(value: PlanGeneratorResult): void { const resolve = this.pending.shift(); if (!resolve) throw new Error("no job"); resolve(value); }
@@ -65,6 +67,66 @@ describe("PlanController", () => {
     h.generator.finish({ ok: true, outcome: initial }); expect((await started.value.completion).ok).toBe(true);
     expect(made.value.snapshot()).toMatchObject({ status: "ready", stateVersion: 3, documentRevision: 1 });
     expect(h.repository.commits.map((entry) => entry.session.status)).toEqual(["paused", "generating", "ready"]);
+  });
+
+  it("correlates writer submissions from the exact active canonical job and rejects them after pause", async () => {
+    const h = harness(); const made = await h.create(); if (!made.ok) return; const controller = made.value;
+    const started = await controller.generate({ expectedStateVersion: 1 }); if (!started.ok) return;
+    const bytes = Buffer.from("# Exact bytes\r\n");
+    expect(await controller.submitWriterResult({ attemptId: "attempt_identity_0001", kind: "plan", body: bytes })).toMatchObject({ ok: true });
+    expect(h.generator.submissions).toEqual([{ sessionId: "id-1", jobId: started.value.jobId, operation: "initial", baseDocumentRevision: 0, attemptId: "attempt_identity_0001", kind: "plan", body: bytes }]);
+    expect((await controller.pause({ expectedStateVersion: 2 })).ok).toBe(true);
+    expect(await controller.submitWriterResult({ attemptId: "attempt_identity_0001", kind: "plan", body: bytes })).toMatchObject({ ok: false, error: { code: "writer-submission-stale" } });
+  });
+
+  it("persists repeated clarification rounds, validates answers atomically, and commits exact writer Markdown", async () => {
+    const h = harness(); const made = await h.create(); if (!made.ok) return; const controller = made.value;
+    const first = await controller.generate({ expectedStateVersion: 1 }); if (!first.ok) return; controller.dispatchGeneration(first.value.jobId);
+    h.generator.finish({ ok: true, outcome: { kind: "clarification", questions: [{ id: "q-one", prompt: "Choose a target?", options: [{ id: "o-one", label: "First" }, { id: "o-two", label: "Second" }] }] } });
+    await first.value.completion; expect(controller.snapshot()).toMatchObject({ status: "awaiting-clarification", stateVersion: 3, clarifications: { history: [], pending: { operation: "initial", baseDocumentRevision: 0, selectedAnnotationIds: [] } } });
+    const pendingOne = controller.snapshot()!.clarifications!.pending!;
+    expect(await controller.answerClarification({ expectedStateVersion: 3, clarificationId: pendingOne.id, answers: [{ questionId: "q-one", answer: { kind: "option", optionId: "unknown" } }] })).toMatchObject({ ok: false, error: { code: "unknown-option" } });
+    expect(controller.snapshot()?.stateVersion).toBe(3);
+    const continued = await controller.answerClarification({ expectedStateVersion: 3, clarificationId: pendingOne.id, answers: [{ questionId: "q-one", answer: { kind: "custom", text: "The API" } }] }); if (!continued.ok) return;
+    h.generator.finish({ ok: true, outcome: { kind: "clarification", questions: [{ id: "q-two", prompt: "Choose timing?", options: [{ id: "o-three", label: "Now" }, { id: "o-four", label: "Later" }] }] } }); await continued.value.completion;
+    expect(controller.snapshot()).toMatchObject({ status: "awaiting-clarification", clarifications: { history: [{ id: pendingOne.id, answers: [{ answer: { kind: "custom", text: "The API" } }] }], pending: { questions: [{ id: "q-two" }] } } });
+    const pendingTwo = controller.snapshot()!.clarifications!.pending!;
+    const final = await controller.answerClarification({ expectedStateVersion: controller.snapshot()!.stateVersion, clarificationId: pendingTwo.id, answers: [{ questionId: "q-two", answer: { kind: "option", optionId: "o-three" } }] }); if (!final.ok) return;
+    const exact = `# Ship\r\n\r\n## Execution\r\nRun\r\n\r\n## Implementation Tasks\r\nTasks\r\n\r\n### Build\r\nScope: src/a.ts\r\nTest first: Add a failing test.\r\nImplement: Make the change.\r\nVerify: Run the test.\r\nDone when: The test passes.\r\n`;
+    h.generator.finish({ ok: true, outcome: { ...initial, markdown: exact } }); await final.value.completion;
+    expect(controller.snapshot()).toMatchObject({ status: "ready", documentRevision: 1, committedMarkdown: exact, clarifications: { history: [{ id: pendingOne.id }, { id: pendingTwo.id }] } });
+    expect(controller.snapshot()?.clarifications).not.toHaveProperty("pending"); expect(controller.snapshot()?.clarifications).not.toHaveProperty("origin");
+    const ready = controller.snapshot()!; expect((await controller.accept({ expectedStateVersion: ready.stateVersion, documentRevision: ready.documentRevision, confirmed: true })).ok).toBe(true);
+    expect(h.repository.accepted.at(-1)?.finalPlan).toBe(exact);
+  });
+
+  it("keeps selected revision notes locked throughout clarification wait", async () => {
+    const h = await readyController(); let state = h.controller.snapshot(); if (!state?.document) return; const step = state.document.elements[1]!;
+    await h.controller.addAnnotation({ expectedStateVersion: state.stateVersion, target: { kind: "element", elementId: step.id }, body: "Selected" }); state = h.controller.snapshot();
+    await h.controller.addAnnotation({ expectedStateVersion: state!.stateVersion, target: { kind: "root", elementId: state!.document!.id }, body: "Unselected" }); state = h.controller.snapshot();
+    const note = state?.annotations[0]; const unselected = state?.annotations[1]; if (!state || !note || !unselected) return;
+    const job = await h.controller.revise({ expectedStateVersion: state.stateVersion, selectedAnnotationIds: [note.id], instruction: "Only this" }); if (!job.ok) return;
+    h.generator.finish({ ok: true, outcome: { kind: "clarification", questions: [{ id: "revision-question", prompt: "Which variant?", options: [{ id: "variant-a", label: "A" }, { id: "variant-b", label: "B" }] }] } }); await job.value.completion;
+    const waiting = h.controller.snapshot()!; expect(waiting).toMatchObject({ status: "awaiting-clarification", document: state.document, clarifications: { pending: { selectedAnnotationIds: [note.id], instruction: "Only this" } } });
+    expect(await h.controller.addAnnotation({ expectedStateVersion: waiting.stateVersion, target: { kind: "root", elementId: waiting.document!.id }, body: "Blocked" })).toMatchObject({ ok: false, error: { code: "clarification-read-only" } });
+    expect(await h.controller.updateAnnotationBody({ expectedStateVersion: waiting.stateVersion, annotationId: note.id, body: "Changed" })).toMatchObject({ ok: false, error: { code: "clarification-read-only" } });
+    expect(await h.controller.updateAnnotationBody({ expectedStateVersion: waiting.stateVersion, annotationId: unselected.id, body: "Changed" })).toMatchObject({ ok: false, error: { code: "clarification-read-only" } });
+    expect(await h.controller.transitionAnnotation({ expectedStateVersion: waiting.stateVersion, annotationId: unselected.id, status: "dismissed" })).toMatchObject({ ok: false, error: { code: "clarification-read-only" } });
+    expect((await h.controller.pause({ expectedStateVersion: waiting.stateVersion })).ok).toBe(true); expect(h.controller.snapshot()?.clarifications?.pending?.id).toBe(waiting.clarifications?.pending?.id);
+    expect((await h.controller.resumeReview({ expectedStateVersion: waiting.stateVersion + 1 })).ok).toBe(true); expect(h.controller.snapshot()?.status).toBe("awaiting-clarification");
+  });
+
+  it("recovers an awaiting revision clarification with its questions, origin, and selected-note lock intact", async () => {
+    const h = await readyController(); let state = h.controller.snapshot(); if (!state?.document) return; const step = state.document.elements[1]!;
+    await h.controller.addAnnotation({ expectedStateVersion: state.stateVersion, target: { kind: "element", elementId: step.id }, body: "Selected" }); state = h.controller.snapshot(); const note = state?.annotations[0]; if (!state || !note) return;
+    const job = await h.controller.revise({ expectedStateVersion: state.stateVersion, selectedAnnotationIds: [note.id], instruction: "Preserve this origin" }); if (!job.ok) return;
+    h.generator.finish({ ok: true, outcome: { kind: "clarification", questions: [{ id: "recover-question", prompt: "Which variant?", options: [{ id: "recover-a", label: "A" }, { id: "recover-b", label: "B" }] }] } }); await job.value.completion;
+    const persisted = h.controller.snapshot()!; const recovered = PlanController.fromRecovered(h.options, persisted, ["historical-id"]); if (!recovered.ok) return;
+    expect(recovered.value.snapshot()).toMatchObject({ status: "awaiting-clarification", document: persisted.document, clarifications: { pending: { questions: [{ id: "recover-question" }], operation: "revision", baseDocumentRevision: 1, selectedAnnotationIds: [note.id], instruction: "Preserve this origin" }, origin: { selectedAnnotationIds: [note.id] } } });
+    expect(await recovered.value.transitionAnnotation({ expectedStateVersion: persisted.stateVersion, annotationId: note.id, status: "dismissed" })).toMatchObject({ ok: false, error: { code: "clarification-read-only" } });
+    const continued = await recovered.value.answerClarification({ expectedStateVersion: persisted.stateVersion, clarificationId: persisted.clarifications!.pending!.id, answers: [{ questionId: "recover-question", answer: { kind: "option", optionId: "recover-a" } }] }); if (!continued.ok) return;
+    expect(h.generator.calls.at(-1)).toMatchObject({ operation: "revision", selectedAnnotationIds: [note.id], instruction: "Preserve this origin", session: { clarifications: { history: [{ answers: [{ answer: { kind: "option", optionId: "recover-a" } }] }], origin: { baseDocumentRevision: 1, selectedAnnotationIds: [note.id] } } } });
+    expect(recovered.value.snapshot()?.generationJob).toMatchObject({ operation: "revision", baseDocumentRevision: 1, selectedAnnotationIds: [note.id] });
   });
 
   it("durably resumes only a paused materialized review with one version increment", async () => {
@@ -115,6 +177,10 @@ describe("PlanController", () => {
     expect(h.repository.accepted[0]?.finalPlan).toContain("# Ship");
     expect(h.repository.accepted[0]?.finalPlan).not.toContain("PRIVATE BODY");
     expect(h.repository.accepted[0]?.finalPlan).not.toContain("/private/testing");
+    expect(h.staged[0]).toContain("inspect the leadership and orchestration skills available in this Pi session and preload the best fit");
+    expect(h.staged[0]).toContain("Do not assume a specific skill name; choose from the available options.");
+    expect(h.staged[0]).toContain("organize the plan into specific ordered tasks");
+    expect(h.staged[0]).not.toContain('<skill name="team-leader"');
     expect(h.staged[0]).toContain('<skill name="testing" baseDir="/private/testing">\nPRIVATE BODY\n</skill>');
     expect(h.staged[0]?.match(/\/(?:goal|loop)/g)?.length ?? 0).toBe(execution === "normal" ? 0 : 1);
   });

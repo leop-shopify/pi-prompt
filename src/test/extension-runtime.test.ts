@@ -17,6 +17,7 @@ function controllerHarness() {
   const completion = new Promise<any>((resolve) => { finish = resolve; });
   const controller = {
     snapshot: vi.fn(() => state),
+    configureWriterEndpoint: vi.fn(() => ({ ok: true, value: undefined })),
     generate: vi.fn(async () => { state = empty("generating"); return { ok: true, value: { jobId: "job", completion } }; }),
     dispatchGeneration: vi.fn(() => ({ ok: true, value: undefined })),
     pause: vi.fn(async () => { state = { ...state, stateVersion: state.stateVersion + 1, status: "paused", generationJob: undefined } as PlanSession; return { ok: true, value: undefined }; }),
@@ -37,11 +38,20 @@ describe("extension runtime", () => {
     const order: string[] = []; const controller = controllerHarness();
     controller.generate.mockImplementation(async () => { order.push("durable"); return { ok: true, value: { jobId: "job", completion: new Promise(() => undefined) } } as any; });
     controller.dispatchGeneration.mockImplementation(() => { order.push("dispatch"); return { ok: true, value: undefined }; });
-    const review = { start: vi.fn(async () => { order.push("browser"); }), ready: vi.fn() };
+    const review = { start: vi.fn(async () => { order.push("endpoint"); controller.configureWriterEndpoint("http://127.0.0.1:43210/api/v1/writer-results"); order.push("browser"); }), ready: vi.fn() };
     const { runtime } = runtimeFor(controller, review); const ctx = context();
     await runtime.generate(ctx, submission);
-    expect(order).toEqual(["durable", "browser", "dispatch"]);
+    expect(order).toEqual(["durable", "endpoint", "browser", "dispatch"]);
+    expect(controller.configureWriterEndpoint).toHaveBeenCalledBefore(controller.dispatchGeneration);
     expect(controller.snapshot()?.status).toBe("paused");
+  });
+
+  it("pauses safely and never dispatches when the private review host cannot start", async () => {
+    const controller = controllerHarness(); const review = { start: vi.fn(async () => { throw new Error("host failed"); }), ready: vi.fn() };
+    const { runtime } = runtimeFor(controller, review); const ctx = context();
+    await runtime.generate(ctx, submission);
+    expect(controller.dispatchGeneration).not.toHaveBeenCalled(); expect(controller.pause).toHaveBeenCalledWith({ expectedStateVersion: 2 });
+    expect(controller.snapshot()?.status).toBe("paused"); expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("paused before writer dispatch"), "error");
   });
 
   it("publishes the ready plan asynchronously when completion settles", async () => {
@@ -49,6 +59,32 @@ describe("extension runtime", () => {
     await runtime.generate(context(), submission); expect(review.ready).not.toHaveBeenCalled();
     controller.setReady(); controller.finish({ ok: true, value: undefined });
     await vi.waitFor(() => expect(review.ready).toHaveBeenCalledWith(expect.objectContaining({ controller, state: expect.objectContaining({ status: "ready" }) })));
+  });
+
+  it("resumes an interrupted answered clarification continuation from its persisted origin", async () => {
+    const question = { id: "question", prompt: "Which variant?", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] };
+    const interrupted = { ...ready(), status: "error" as const, stateVersion: 8,
+      annotations: [{ id: "note", target: { kind: "element" as const, elementId: "execution" }, targetSnapshot: { documentRevision: 1, target: { kind: "element" as const, elementId: "execution" }, elementKind: "execution" as const, text: "Normal" }, body: "Keep locked origin", status: "open" as const, history: [], createdAgainstRevision: 1, createdAt: "2026-07-11T00:00:00.000Z", updatedAt: "2026-07-11T00:00:00.000Z" }],
+      clarifications: { history: [{ id: "batch", questions: [question], answers: [{ questionId: "question", answer: { kind: "option" as const, optionId: "a" } }], answeredAt: "2026-07-11T00:01:00.000Z" }], origin: { operation: "revision" as const, baseDocumentRevision: 1, selectedAnnotationIds: ["note"], instruction: "Preserve origin" } },
+      lastError: { code: "interrupted", message: "Interrupted safely" },
+    } as PlanSession;
+    let state = interrupted; const completion = new Promise<any>(() => undefined);
+    const controller = {
+      snapshot: vi.fn(() => state), close: vi.fn(async () => undefined), acceptedStagingPending: vi.fn(() => false),
+      verifySkills: vi.fn(async () => ({ ok: true, value: undefined })),
+      resumeClarification: vi.fn(async () => {
+        expect(state.clarifications).toEqual(interrupted.clarifications);
+        state = { ...state, status: "revising", stateVersion: 9, generationJob: { jobId: "continued-job", ...interrupted.clarifications!.origin!, startedAt: "2026-07-11T00:02:00.000Z" } } as PlanSession;
+        return { ok: true, value: { jobId: "continued-job", completion } };
+      }),
+      dispatchGeneration: vi.fn(() => ({ ok: true, value: undefined })),
+    } as unknown as PlanController;
+    const review = { start: vi.fn(), ready: vi.fn(), close: vi.fn() }; const { runtime } = runtimeFor(controller, review);
+    await runtime.resume(context());
+    expect((controller as any).resumeClarification).toHaveBeenCalledWith({ expectedStateVersion: 8 });
+    expect((controller as any).dispatchGeneration).toHaveBeenCalledWith("continued-job");
+    expect(review.start).toHaveBeenCalledWith(expect.objectContaining({ state: expect.objectContaining({ generationJob: expect.objectContaining({ selectedAnnotationIds: ["note"], instruction: "Preserve origin" }) }) }));
+    expect(review.ready).not.toHaveBeenCalled();
   });
 
   it("closes browser first and controller second on lifecycle pause", async () => {

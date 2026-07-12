@@ -70,6 +70,21 @@ describe("canonical plan validation", () => {
     expectInvalid({ ...needsInput, lastError: undefined }, "missing-error");
   });
 
+  it("enforces bounded clarification rounds, questions, options, origins, and exact answers", () => {
+    const question = { id: "question-1", prompt: "Which target?", options: [{ id: "option-1", label: "One" }, { id: "option-2", label: "Two" }] };
+    const pending = { id: "round-1", operation: "revision" as const, baseDocumentRevision: 1, selectedAnnotationIds: [], questions: [question] };
+    const waiting = { ...validSession(), status: "awaiting-clarification" as const, clarifications: { history: [], origin: { operation: "revision" as const, baseDocumentRevision: 1, selectedAnnotationIds: [] }, pending } };
+    expect(validatePlanSession(waiting).ok).toBe(true);
+    expectInvalid({ ...waiting, clarifications: { ...waiting.clarifications, pending: { ...pending, questions: [] } } }, "invalid-structure");
+    expectInvalid({ ...waiting, clarifications: { ...waiting.clarifications, pending: { ...pending, questions: [{ ...question, options: [question.options[0]] }] } } }, "invalid-structure");
+    expectInvalid({ ...waiting, clarifications: { ...waiting.clarifications, origin: { ...waiting.clarifications.origin, baseDocumentRevision: 0 } } }, "origin-mismatch");
+    const answered = { id: "answered", questions: [question], answers: [{ questionId: question.id, answer: { kind: "option" as const, optionId: "missing" } }], answeredAt: NOW };
+    expectInvalid({ ...validSession(), clarifications: { history: [answered] } }, "unknown-option");
+    const rounds = Array.from({ length: PLAN_LIMITS.clarificationRounds }, (_, index) => ({ id: `round-${index}`, questions: [{ id: `question-${index}`, prompt: "Prompt?", options: [{ id: `a-${index}`, label: "A" }, { id: `b-${index}`, label: "B" }] }], answers: [{ questionId: `question-${index}`, answer: { kind: "custom" as const, text: "Answer" } }], answeredAt: NOW }));
+    expect(validatePlanSession({ ...validSession(), clarifications: { history: rounds } }).ok).toBe(true);
+    expectInvalid({ ...waiting, clarifications: { ...waiting.clarifications, history: rounds } }, "too-many-rounds");
+  });
+
   it("accepts generic printable ASCII IDs and rejects spaces and lengths outside 1..64", () => {
     expect(validatePlanSession({ ...validSession(), id: documentId }).ok).toBe(true);
     const crossPrefix = validSession(); (crossPrefix.document!.elements[1] as { id: string }).id = annotationId; expect(validatePlanSession(crossPrefix).ok).toBe(true);

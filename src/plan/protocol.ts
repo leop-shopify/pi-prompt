@@ -1,5 +1,5 @@
 import { PLAN_LIMITS, normalizePlanText } from "./schema.js";
-import type { Annotation, AnnotationStatus, AnnotationTarget, PlanDocument, PlanElement, PlanSession } from "./types.js";
+import type { Annotation, AnnotationStatus, AnnotationTarget, ClarificationAnswerEntry, PlanDocument, PlanElement, PlanSession } from "./types.js";
 
 export const PROTOCOL_VERSION = 1 as const;
 export const MUTATION_BODY_MAX_BYTES = 256 * 1024;
@@ -20,6 +20,10 @@ export interface PublicAnnotation {
   readonly createdAgainstRevision: number; readonly createdAt: string; readonly updatedAt: string;
 }
 export interface PublicSnapshotActions { readonly canRetryStaging: boolean }
+export interface PublicPendingClarification {
+  readonly id: string; readonly context: "initial" | "revision"; readonly baseDocumentRevision: number;
+  readonly questions: readonly { readonly id: string; readonly prompt: string; readonly options: readonly { readonly id: string; readonly label: string }[] }[];
+}
 export type PublicActivityPhase =
   | "capability-detected" | "primary-starting" | "primary-active" | "waiting-report" | "report-received"
   | "synthesizing" | "validating" | "recovering" | "completed" | "direct-fallback" | "paused";
@@ -40,6 +44,7 @@ export interface PublicSnapshot {
   readonly annotations: readonly PublicAnnotation[];
   readonly actions: PublicSnapshotActions;
   readonly activity?: PublicActivity;
+  readonly clarification?: PublicPendingClarification;
   readonly job?: { readonly operation: "initial" | "revision"; readonly baseDocumentRevision: number; readonly startedAt: string };
   readonly error?: { readonly code: string; readonly message: string };
 }
@@ -51,7 +56,8 @@ export type RevisionRequest = { readonly requestId: string; readonly selectedAnn
 export type AcceptRequest = { readonly requestId: string; readonly stateVersion: number; readonly documentRevision: number; readonly confirmed: true };
 export type CancelRequest = { readonly requestId: string; readonly disposition: "pause" | "cancel" };
 export type ReopenRequest = { readonly requestId: string };
-export type MutationRequest = AnnotationCreateRequest | AnnotationPatchRequest | RevisionRequest | AcceptRequest | CancelRequest | ReopenRequest;
+export type ClarificationAnswersRequest = { readonly requestId: string; readonly clarificationId: string; readonly answers: readonly ClarificationAnswerEntry[] };
+export type MutationRequest = AnnotationCreateRequest | AnnotationPatchRequest | RevisionRequest | AcceptRequest | CancelRequest | ReopenRequest | ClarificationAnswersRequest;
 
 /** Explicit public allowlist. Never replace this with a spread or controller.snapshot() serialization. */
 export function toPublicSnapshot(session: PlanSession, actions: Partial<PublicSnapshotActions> = {}, activity?: PublicActivity): PublicSnapshot {
@@ -68,6 +74,7 @@ export function toPublicSnapshot(session: PlanSession, actions: Partial<PublicSn
     annotations: Object.freeze(session.annotations.map((annotation) => publicAnnotation(annotation, session))),
     actions: Object.freeze({ canRetryStaging: actions.canRetryStaging === true }),
     ...(activity ? { activity: publicActivity(activity) } : {}),
+    ...(session.clarifications?.pending ? { clarification: publicClarification(session.clarifications.pending) } : {}),
     ...(session.generationJob ? { job: Object.freeze({ operation: session.generationJob.operation, baseDocumentRevision: session.generationJob.baseDocumentRevision, startedAt: session.generationJob.startedAt }) } : {}),
     ...(session.lastError ? { error: Object.freeze({ code: session.lastError.code, message: session.lastError.message }) } : {}),
   });
@@ -82,7 +89,7 @@ export function parseStateIfMatch(value: string | undefined): number | null {
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
-export type RequestKind = "annotation-create" | "annotation-patch" | "revision" | "accept" | "cancel" | "reopen";
+export type RequestKind = "annotation-create" | "annotation-patch" | "revision" | "accept" | "cancel" | "reopen" | "clarification-answers";
 export type ParseProtocolResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly code: string; readonly message: string };
 
 export function parseMutation(kind: "annotation-create", value: unknown): ParseProtocolResult<AnnotationCreateRequest>;
@@ -91,6 +98,7 @@ export function parseMutation(kind: "revision", value: unknown): ParseProtocolRe
 export function parseMutation(kind: "accept", value: unknown): ParseProtocolResult<AcceptRequest>;
 export function parseMutation(kind: "cancel", value: unknown): ParseProtocolResult<CancelRequest>;
 export function parseMutation(kind: "reopen", value: unknown): ParseProtocolResult<ReopenRequest>;
+export function parseMutation(kind: "clarification-answers", value: unknown): ParseProtocolResult<ClarificationAnswersRequest>;
 export function parseMutation(kind: RequestKind, value: unknown): ParseProtocolResult<MutationRequest> {
   if (!record(value)) return invalid("invalid-request", "The request body is invalid.");
   if (!requestId(value.requestId)) return invalid("invalid-request-id", "The request ID is invalid.");
@@ -125,6 +133,21 @@ export function parseMutation(kind: RequestKind, value: unknown): ParseProtocolR
     if (!keys(value, ["requestId", "disposition"]) || (value.disposition !== "pause" && value.disposition !== "cancel")) return invalid("invalid-disposition", "Pause or cancel must be selected explicitly.");
     return valid({ requestId: value.requestId, disposition: value.disposition });
   }
+  if (kind === "clarification-answers") {
+    if (!keys(value, ["requestId", "clarificationId", "answers"]) || !id(value.clarificationId) || !Array.isArray(value.answers)
+      || value.answers.length < 1 || value.answers.length > PLAN_LIMITS.clarificationQuestions) return invalid("invalid-answers", "Clarification answers are invalid.");
+    const answers: ClarificationAnswerEntry[] = [];
+    for (const entry of value.answers) {
+      if (!record(entry) || !keys(entry, ["questionId", "answer"]) || !id(entry.questionId) || !record(entry.answer)) return invalid("invalid-answers", "Clarification answers are invalid.");
+      if (keys(entry.answer, ["kind", "optionId"]) && entry.answer.kind === "option" && id(entry.answer.optionId)) answers.push({ questionId: entry.questionId, answer: { kind: "option", optionId: entry.answer.optionId } });
+      else if (keys(entry.answer, ["kind", "text"]) && entry.answer.kind === "custom" && typeof entry.answer.text === "string") {
+        const text = normalizePlanText(entry.answer.text); if (!boundedText(text, PLAN_LIMITS.clarificationAnswerCodePoints, true)) return invalid("invalid-answers", "Clarification answers are invalid.");
+        answers.push({ questionId: entry.questionId, answer: { kind: "custom", text } });
+      } else return invalid("invalid-answers", "Clarification answers are invalid.");
+    }
+    if (new Set(answers.map((entry) => entry.questionId)).size !== answers.length) return invalid("invalid-answers", "Clarification question IDs must be unique.");
+    return valid({ requestId: value.requestId, clarificationId: value.clarificationId, answers });
+  }
   if (!keys(value, ["requestId"])) return invalid("invalid-request", "The reopen request is invalid.");
   return valid({ requestId: value.requestId });
 }
@@ -133,6 +156,12 @@ export function mutationFingerprint(kind: RequestKind, ifMatch: number, body: Mu
   return `${kind}\n${ifMatch}\n${stableJson(body)}`;
 }
 
+function publicClarification(pending: NonNullable<PlanSession["clarifications"]>["pending"]): PublicPendingClarification | undefined {
+  if (!pending) return undefined;
+  return Object.freeze({ id: pending.id, context: pending.operation, baseDocumentRevision: pending.baseDocumentRevision,
+    questions: Object.freeze(pending.questions.map((question) => Object.freeze({ id: question.id, prompt: question.prompt, options: Object.freeze(question.options.map((option) => Object.freeze({ id: option.id, label: option.label }))) }))),
+  });
+}
 function publicActivity(activity: PublicActivity): PublicActivity {
   return Object.freeze({
     phase: activity.phase,
@@ -157,7 +186,7 @@ function publicElement(element: PlanElement): PublicPlanElement {
   return Object.freeze({ id: element.id, kind: element.kind, ...(element.title === undefined ? {} : { title: element.title }), body: element.body, children: Object.freeze(element.children.map(publicElement)) });
 }
 function publicAnnotation(annotation: Annotation, session: PlanSession): PublicAnnotation {
-  const locked = session.generationJob?.selectedAnnotationIds.includes(annotation.id) === true;
+  const locked = session.generationJob?.selectedAnnotationIds.includes(annotation.id) === true || session.clarifications?.pending?.selectedAnnotationIds.includes(annotation.id) === true;
   return Object.freeze({
     id: annotation.id, target: cloneTarget(annotation.target), targetSummary: annotationTargetSummary(annotation, session),
     body: annotation.body, status: annotation.status, locked,

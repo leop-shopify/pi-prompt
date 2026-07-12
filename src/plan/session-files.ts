@@ -1,9 +1,10 @@
-import { lstat, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { isSafePlanSessionId } from "./locator.js";
 
+/** Writer HTTP body limits. These files are ergonomic local drafts only and are never trusted as submissions. */
 export const MAX_PLAN_FILE_BYTES = 512 * 1024;
+export const MAX_WRITER_RESULT_BYTES = 64 * 1024;
 
 export function defaultPlanRoot(): string {
   return join(homedir(), ".pi", "agent", "pi-prompt", "plans");
@@ -26,12 +27,11 @@ export function annotationsFilePath(rootDir: string, sessionId: string): string 
   return join(planSessionDirectory(rootDir, sessionId), "annotations.json");
 }
 
-export async function readPlanFile(rootDir: string, sessionId: string): Promise<string> {
-  const path = planFilePath(rootDir, sessionId);
-  const stat = await lstat(path);
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > MAX_PLAN_FILE_BYTES) throw new Error("invalid-plan-file");
-  const text = await readFile(path, "utf8");
-  const normalized = text.replace(/\r\n?/gu, "\n").normalize("NFC").trim();
-  if (!normalized) throw new Error("empty-plan-file");
-  return `${normalized}\n`;
+export function clarificationsFilePath(rootDir: string, sessionId: string): string {
+  return join(planSessionDirectory(rootDir, sessionId), "clarifications.json");
+}
+
+/** Local writer draft path; canonical clarification state is repository-owned clarifications.json. */
+export function writerQuestionsFilePath(rootDir: string, sessionId: string): string {
+  return join(planSessionDirectory(rootDir, sessionId), "questions.json");
 }

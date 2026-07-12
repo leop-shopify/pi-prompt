@@ -1,10 +1,11 @@
 import { Compile } from "typebox/compile";
 import { Check, Errors } from "typebox/value";
 import type {
-  Annotation, AnnotationHistoryEntry, AnnotationTarget, AnnotationTargetSnapshot, EmptyPlanSession, InitialPlanResultDraft,
-  MaterializedPlanSession, ModelPlanDocumentDraft, ModelPlanElementDraft, ModelRevisionPlanDocumentDraft,
-  ModelRevisionPlanElementDraft, PlanDocument, PlanElement, PlanSession,
-  RevisionPlanResultDraft, SkillReference, TextSelector, ValidationIssue, ValidationResult,
+  Annotation, AnnotationHistoryEntry, AnnotationTarget, AnnotationTargetSnapshot, ClarificationAnswerEntry, ClarificationOrigin,
+  ClarificationQuestion, ClarificationTranscript, EmptyPlanSession, InitialPlanResultDraft, MaterializedPlanSession,
+  ModelPlanDocumentDraft, ModelPlanElementDraft, ModelRevisionPlanDocumentDraft, ModelRevisionPlanElementDraft,
+  PendingClarification, PlanDocument, PlanElement, PlanSession, RevisionPlanResultDraft, SkillReference, TextSelector,
+  ValidationIssue, ValidationResult,
 } from "./types.js";
 import { PLAN_ELEMENT_KINDS } from "./types.js";
 
@@ -31,6 +32,13 @@ export const PLAN_LIMITS = deepFreeze({
   safeErrorCodeCodePoints: 64,
   safeErrorMessageCodePoints: 1_024,
   generationInstructionBytes: 16_384,
+  clarificationRounds: 16,
+  clarificationQuestions: 5,
+  clarificationOptions: 6,
+  clarificationPromptCodePoints: 1_024,
+  clarificationLabelCodePoints: 256,
+  clarificationAnswerCodePoints: 4_096,
+  committedMarkdownBytes: 512 * 1_024,
   idAscii: 64,
 } as const);
 
@@ -86,18 +94,34 @@ const generationSchema = { type: "object", properties: { mode: { enum: ["quick-w
 const skillSchema = { type: "object", properties: { name: stringSchema, path: stringSchema, baseDir: stringSchema, sha256: stringSchema }, required: ["name", "path", "baseDir", "sha256"], additionalProperties: false } as const;
 const sourceSchema = { type: "object", properties: { prompt: stringSchema, cwd: stringSchema, skills: { type: "array", items: skillSchema, maxItems: PLAN_LIMITS.skills } }, required: ["prompt", "cwd", "skills"], additionalProperties: false } as const;
 const safeErrorSchema = { type: "object", properties: { code: stringSchema, message: stringSchema }, required: ["code", "message"], additionalProperties: false } as const;
+const originProperties = {
+  operation: { enum: ["initial", "revision"] }, baseDocumentRevision: integerSchema,
+  selectedAnnotationIds: { type: "array", items: idSchema, maxItems: PLAN_LIMITS.annotations }, instruction: stringSchema,
+} as const;
+const clarificationOptionSchema = { type: "object", properties: { id: idSchema, label: stringSchema }, required: ["id", "label"], additionalProperties: false } as const;
+const clarificationQuestionSchema = { type: "object", properties: { id: idSchema, prompt: stringSchema, options: { type: "array", items: clarificationOptionSchema, minItems: 2, maxItems: PLAN_LIMITS.clarificationOptions } }, required: ["id", "prompt", "options"], additionalProperties: false } as const;
+const clarificationQuestionsSchema = { type: "array", items: clarificationQuestionSchema, minItems: 1, maxItems: PLAN_LIMITS.clarificationQuestions } as const;
+const clarificationAnswerSchema = { oneOf: [
+  { type: "object", properties: { kind: { const: "option" }, optionId: idSchema }, required: ["kind", "optionId"], additionalProperties: false },
+  { type: "object", properties: { kind: { const: "custom" }, text: stringSchema }, required: ["kind", "text"], additionalProperties: false },
+] } as const;
+const clarificationAnswerEntrySchema = { type: "object", properties: { questionId: idSchema, answer: clarificationAnswerSchema }, required: ["questionId", "answer"], additionalProperties: false } as const;
+const clarificationOriginSchema = { type: "object", properties: originProperties, required: ["operation", "baseDocumentRevision", "selectedAnnotationIds"], additionalProperties: false } as const;
+const pendingClarificationSchema = { type: "object", properties: { id: idSchema, questions: clarificationQuestionsSchema, ...originProperties }, required: ["id", "questions", "operation", "baseDocumentRevision", "selectedAnnotationIds"], additionalProperties: false } as const;
+const answeredClarificationSchema = { type: "object", properties: { id: idSchema, questions: clarificationQuestionsSchema, answers: { type: "array", items: clarificationAnswerEntrySchema, minItems: 1, maxItems: PLAN_LIMITS.clarificationQuestions }, answeredAt: stringSchema }, required: ["id", "questions", "answers", "answeredAt"], additionalProperties: false } as const;
+const clarificationTranscriptSchema = { type: "object", properties: { history: { type: "array", items: answeredClarificationSchema, maxItems: PLAN_LIMITS.clarificationRounds }, origin: clarificationOriginSchema, pending: pendingClarificationSchema }, required: ["history"], additionalProperties: false } as const;
 const generationJobSchema = {
   type: "object", properties: {
-    jobId: idSchema, operation: { enum: ["initial", "revision"] }, baseDocumentRevision: integerSchema,
-    selectedAnnotationIds: { type: "array", items: idSchema, maxItems: PLAN_LIMITS.annotations }, instruction: stringSchema, startedAt: stringSchema,
+    jobId: idSchema, ...originProperties, startedAt: stringSchema,
   }, required: ["jobId", "operation", "baseDocumentRevision", "selectedAnnotationIds", "startedAt"], additionalProperties: false,
 } as const;
 export const PLAN_SESSION_SCHEMA = {
   $schema: "https://json-schema.org/draft/2020-12/schema", $defs: { element: elementDefinition }, type: "object",
   properties: {
     schemaVersion: { const: 1 }, id: idSchema, documentRevision: integerSchema, stateVersion: integerSchema,
-    status: { enum: ["generating", "ready", "revising", "accepted", "paused", "cancelled", "error", "needs-input"] }, source: sourceSchema,
+    status: { enum: ["generating", "ready", "revising", "awaiting-clarification", "accepted", "paused", "cancelled", "error", "needs-input"] }, source: sourceSchema,
     execution: executionKindSchema, generation: generationSchema, generationJob: generationJobSchema,
+    committedMarkdown: stringSchema, clarifications: clarificationTranscriptSchema,
     document: { anyOf: [{ type: "null" }, { ...planDocumentSchema, $schema: undefined, $defs: undefined }] },
     annotations: { type: "array", items: annotationSchema, maxItems: PLAN_LIMITS.annotations }, lastError: safeErrorSchema,
   },
@@ -126,6 +150,8 @@ const planDocumentValidator = Compile(planDocumentSchema);
 const annotationsValidator = Compile({ type: "array", items: annotationSchema, maxItems: PLAN_LIMITS.annotations } as const);
 const initialValidator = Compile(INITIAL_PLAN_RESULT_SCHEMA);
 const revisionValidator = Compile(REVISION_PLAN_RESULT_SCHEMA);
+const clarificationQuestionsValidator = Compile(clarificationQuestionsSchema);
+const clarificationAnswersValidator = Compile({ type: "array", items: clarificationAnswerEntrySchema, minItems: 1, maxItems: PLAN_LIMITS.clarificationQuestions } as const);
 
 /** Validates an already-parsed JSON value. Duplicate-key rejection belongs to the Milestone 4 raw JSON parser boundary. */
 export function validatePlanDocument(input: unknown): ValidationResult<PlanDocument> {
@@ -160,6 +186,20 @@ export function validateRevisionPlanResult(input: unknown): ValidationResult<Rev
   uniqueStrings(value.addressedAnnotationIds, "$.addressedAnnotationIds", issues);
   return issues.length ? failure(issues) : success(deepFreeze(value));
 }
+export function validateClarificationQuestions(input: unknown): ValidationResult<readonly ClarificationQuestion[]> {
+  const structural = structuralCheck(clarificationQuestionsSchema, clarificationQuestionsValidator, input); if (structural) return failure(structural);
+  const value = (input as readonly ClarificationQuestion[]).map(normalizeClarificationQuestion); const issues: ValidationIssue[] = [];
+  validateQuestions(value, "$.questions", issues);
+  return issues.length ? failure(issues) : success(deepFreeze(value));
+}
+export function validateClarificationAnswers(
+  input: unknown, questions: readonly ClarificationQuestion[],
+): ValidationResult<readonly ClarificationAnswerEntry[]> {
+  const structural = structuralCheck({ type: "array", items: clarificationAnswerEntrySchema, minItems: 1, maxItems: PLAN_LIMITS.clarificationQuestions }, clarificationAnswersValidator, input); if (structural) return failure(structural);
+  const value = (input as readonly ClarificationAnswerEntry[]).map(normalizeClarificationAnswer); const issues: ValidationIssue[] = [];
+  validateAnswers(value, questions, "$.answers", issues);
+  return issues.length ? failure(issues) : success(deepFreeze(value));
+}
 function structuralCheck(schema: object, validator: { Check(value: unknown): boolean }, input: unknown): ValidationIssue[] | undefined {
   if (validator.Check(input) && Check(schema, input)) return undefined;
   const errors = Errors(schema as never, input).slice(0, 8).map((error) => issue(
@@ -189,7 +229,9 @@ function normalizeSession(session: PlanSession): PlanSession {
     source: { prompt: normalizeCanonicalText(session.source.prompt), cwd: normalizeCanonicalText(session.source.cwd), skills: session.source.skills.map(normalizeSkill) },
     execution: { kind: session.execution.kind }, generation: { mode: session.generation.mode },
     document: session.document ? normalizeDocument(session.document) : null, annotations: session.annotations.map(normalizeAnnotation),
-    ...(session.generationJob ? { generationJob: { ...session.generationJob, selectedAnnotationIds: [...session.generationJob.selectedAnnotationIds], ...(session.generationJob.instruction === undefined ? {} : { instruction: normalizeCanonicalText(session.generationJob.instruction) }) } } : {}),
+    ...(session.generationJob ? { generationJob: normalizeGenerationOrigin(session.generationJob, { jobId: session.generationJob.jobId, startedAt: session.generationJob.startedAt }) } : {}),
+    ...(session.committedMarkdown === undefined ? {} : { committedMarkdown: session.committedMarkdown }),
+    ...(session.clarifications ? { clarifications: normalizeClarificationTranscript(session.clarifications) } : {}),
     ...(session.lastError ? { lastError: { code: normalizeCanonicalText(session.lastError.code), message: normalizeCanonicalText(session.lastError.message) } } : {}),
   };
   return common as EmptyPlanSession | MaterializedPlanSession;
@@ -202,6 +244,14 @@ function normalizeTarget(target: AnnotationTarget): AnnotationTarget { return ta
 function normalizeSnapshot(snapshot: AnnotationTargetSnapshot): AnnotationTargetSnapshot { return { documentRevision: snapshot.documentRevision, target: normalizeTarget(snapshot.target), elementKind: snapshot.elementKind, text: normalizeCanonicalText(snapshot.text) }; }
 function normalizeHistory(entry: AnnotationHistoryEntry): AnnotationHistoryEntry { return { from: entry.from, to: entry.to, at: entry.at }; }
 function normalizeAnnotation(annotation: Annotation): Annotation { return { id: annotation.id, target: normalizeTarget(annotation.target), targetSnapshot: normalizeSnapshot(annotation.targetSnapshot), body: normalizeCanonicalText(annotation.body), status: annotation.status, ...(annotation.statusBeforeOrphan ? { statusBeforeOrphan: annotation.statusBeforeOrphan } : {}), history: annotation.history.map(normalizeHistory), createdAgainstRevision: annotation.createdAgainstRevision, createdAt: annotation.createdAt, updatedAt: annotation.updatedAt }; }
+function normalizeGenerationOrigin<T extends ClarificationOrigin>(origin: T, extra: Record<string, string> = {}): T { return { ...extra, operation: origin.operation, baseDocumentRevision: origin.baseDocumentRevision, selectedAnnotationIds: [...origin.selectedAnnotationIds], ...(origin.instruction === undefined ? {} : { instruction: normalizeCanonicalText(origin.instruction) }) } as unknown as T; }
+function normalizeClarificationQuestion(question: ClarificationQuestion): ClarificationQuestion { return { id: question.id, prompt: normalizeCanonicalText(question.prompt), options: question.options.map((option) => ({ id: option.id, label: normalizeCanonicalText(option.label) })) }; }
+function normalizeClarificationAnswer(entry: ClarificationAnswerEntry): ClarificationAnswerEntry { return { questionId: entry.questionId, answer: entry.answer.kind === "option" ? { kind: "option", optionId: entry.answer.optionId } : { kind: "custom", text: normalizeCanonicalText(entry.answer.text) } }; }
+function normalizeClarificationTranscript(value: ClarificationTranscript): ClarificationTranscript { return {
+  history: value.history.map((round) => ({ id: round.id, questions: round.questions.map(normalizeClarificationQuestion), answers: round.answers.map(normalizeClarificationAnswer), answeredAt: round.answeredAt })),
+  ...(value.origin ? { origin: normalizeGenerationOrigin(value.origin) } : {}),
+  ...(value.pending ? { pending: { id: value.pending.id, questions: value.pending.questions.map(normalizeClarificationQuestion), ...normalizeGenerationOrigin({ operation: value.pending.operation, baseDocumentRevision: value.pending.baseDocumentRevision, selectedAnnotationIds: value.pending.selectedAnnotationIds, ...(value.pending.instruction === undefined ? {} : { instruction: value.pending.instruction }) }) } } : {}),
+}; }
 function normalizeInitialResult(value: InitialPlanResultDraft): InitialPlanResultDraft { return { kind: "plan", document: normalizeDraftDocument(value.document, false) as ModelPlanDocumentDraft }; }
 function normalizeRevisionResult(value: RevisionPlanResultDraft): RevisionPlanResultDraft { return { kind: "revision", document: normalizeDraftDocument(value.document, true) as ModelRevisionPlanDocumentDraft, addressedAnnotationIds: [...value.addressedAnnotationIds] }; }
 function normalizeDraftDocument(document: ModelPlanDocumentDraft | ModelRevisionPlanDocumentDraft, revision: boolean): ModelPlanDocumentDraft | ModelRevisionPlanDocumentDraft { return { ...(revision && "retainedId" in document && document.retainedId ? { retainedId: document.retainedId } : {}), title: normalizeDraftElement(document.title, revision), elements: document.elements.map((element) => normalizeDraftElement(element, revision)) } as ModelPlanDocumentDraft | ModelRevisionPlanDocumentDraft; }
@@ -228,6 +278,9 @@ function validateSessionSemantics(session: PlanSession, issues: ValidationIssue[
     const annotationIds = new Set(session.annotations.map((annotation) => annotation.id));
     if (job.selectedAnnotationIds.some((id) => !annotationIds.has(id))) issues.push(issue("$.generationJob.selectedAnnotationIds", "unknown-annotation", "Generation jobs may select only current annotations."));
   } else if (session.status === "generating" || session.status === "revising") issues.push(issue("$.generationJob", "missing-job", "Generating and revising status require a generation job."));
+  validateClarificationTranscript(session.clarifications, session, issues);
+  if (session.status === "awaiting-clarification" && !session.clarifications?.pending) issues.push(issue("$.clarifications.pending", "missing-clarification", "Awaiting clarification requires one pending round."));
+  if (session.clarifications?.pending && session.status === "ready") issues.push(issue("$.status", "clarification-status", "A pending clarification cannot be ready for review."));
   if (session.status === "needs-input" && session.lastError?.code !== "skill-context-changed") issues.push(issue("$.lastError", "missing-error", "Needs-input requires a skill-context-changed error."));
   if (session.document === null) {
     if (session.documentRevision !== 0) issues.push(issue("$.documentRevision", "empty-revision", "A session without a document must have revision 0."));
@@ -238,8 +291,51 @@ function validateSessionSemantics(session: PlanSession, issues: ValidationIssue[
     validateDocumentSemantics(session.document, "$.document", issues); validateAnnotations(session.annotations, session.document, session.documentRevision, issues);
     if (utf8Bytes(JSON.stringify(session.document)) > PLAN_LIMITS.planBytes) issues.push(issue("$.document", "plan-too-large", "Plan exceeds the UTF-8 byte limit."));
   }
+  if (session.committedMarkdown !== undefined) {
+    validateText(session.committedMarkdown, "$.committedMarkdown", PLAN_LIMITS.committedMarkdownBytes, true, issues);
+    if (utf8Bytes(session.committedMarkdown) > PLAN_LIMITS.committedMarkdownBytes) issues.push(issue("$.committedMarkdown", "too-long", "Committed Markdown exceeds the byte limit."));
+    if (!session.document) issues.push(issue("$.committedMarkdown", "markdown-without-document", "Committed Markdown requires a materialized document."));
+  }
   if (utf8Bytes(JSON.stringify(session)) > PLAN_LIMITS.sessionBytes) issues.push(issue("$", "session-too-large", "Session exceeds the UTF-8 byte limit."));
 }
+function validateClarificationTranscript(value: ClarificationTranscript | undefined, session: PlanSession, issues: ValidationIssue[]): void {
+  if (!value) return;
+  if (value.history.length + (value.pending ? 1 : 0) > PLAN_LIMITS.clarificationRounds) issues.push(issue("$.clarifications", "too-many-rounds", "Clarification transcript exceeds 16 rounds."));
+  const roundIds: string[] = []; const questionIds: string[] = []; const optionIds: string[] = [];
+  value.history.forEach((round, index) => {
+    const path = `$.clarifications.history[${index}]`; roundIds.push(round.id); validateId(round.id, `${path}.id`, issues); validateTimestamp(round.answeredAt, `${path}.answeredAt`, issues);
+    validateQuestions(round.questions, `${path}.questions`, issues, questionIds, optionIds); validateAnswers(round.answers, round.questions, `${path}.answers`, issues);
+  });
+  if (value.origin) validateOrigin(value.origin, "$.clarifications.origin", session, issues);
+  if (value.pending) {
+    const path = "$.clarifications.pending"; roundIds.push(value.pending.id); validateId(value.pending.id, `${path}.id`, issues);
+    validateQuestions(value.pending.questions, `${path}.questions`, issues, questionIds, optionIds); validateOrigin(value.pending, path, session, issues);
+    if (!value.origin || !sameOrigin(value.origin, value.pending)) issues.push(issue(path, "origin-mismatch", "Pending clarification origin must match its resumable origin."));
+  }
+  uniqueStrings(roundIds, "$.clarifications.id", issues); uniqueStrings(questionIds, "$.clarifications.questions.id", issues); uniqueStrings(optionIds, "$.clarifications.options.id", issues);
+  if (!value.origin && value.pending) issues.push(issue("$.clarifications.origin", "missing-origin", "Pending clarification requires a resumable origin."));
+  if (value.origin && session.generationJob && !sameOrigin(value.origin, session.generationJob)) issues.push(issue("$.generationJob", "origin-mismatch", "Continuation job must preserve the clarification origin."));
+}
+function validateOrigin(origin: ClarificationOrigin, path: string, session: PlanSession, issues: ValidationIssue[]): void {
+  validateSafeInteger(origin.baseDocumentRevision, `${path}.baseDocumentRevision`, issues); uniqueStrings(origin.selectedAnnotationIds, `${path}.selectedAnnotationIds`, issues);
+  if (origin.instruction !== undefined) { validateText(origin.instruction, `${path}.instruction`, PLAN_LIMITS.generationInstructionBytes, false, issues); if (utf8Bytes(origin.instruction) > PLAN_LIMITS.generationInstructionBytes) issues.push(issue(`${path}.instruction`, "too-long", "Clarification instruction exceeds 16 KiB.")); }
+  if (origin.operation === "initial" && (origin.baseDocumentRevision !== 0 || origin.selectedAnnotationIds.length !== 0)) issues.push(issue(path, "origin-operation", "Initial clarification must originate at revision zero without selected notes."));
+  if (origin.operation === "revision" && origin.baseDocumentRevision < 1) issues.push(issue(path, "origin-operation", "Revision clarification requires a materialized base revision."));
+  if (origin.baseDocumentRevision !== session.documentRevision) issues.push(issue(`${path}.baseDocumentRevision`, "origin-revision", "Clarification origin must match the current document revision."));
+  const ids = new Set(session.annotations.map((annotation) => annotation.id)); if (origin.selectedAnnotationIds.some((id) => !ids.has(id))) issues.push(issue(`${path}.selectedAnnotationIds`, "unknown-annotation", "Clarification origin may select only current annotations."));
+}
+function validateQuestions(questions: readonly ClarificationQuestion[], path: string, issues: ValidationIssue[], questionIds: string[] = [], optionIds: string[] = []): void {
+  const localQuestions: string[] = [];
+  questions.forEach((question, index) => { const questionPath = `${path}[${index}]`; validateId(question.id, `${questionPath}.id`, issues); validateText(question.prompt, `${questionPath}.prompt`, PLAN_LIMITS.clarificationPromptCodePoints, true, issues); localQuestions.push(question.id); questionIds.push(question.id);
+    const localOptions: string[] = []; question.options.forEach((option, optionIndex) => { const optionPath = `${questionPath}.options[${optionIndex}]`; validateId(option.id, `${optionPath}.id`, issues); validateText(option.label, `${optionPath}.label`, PLAN_LIMITS.clarificationLabelCodePoints, true, issues); localOptions.push(option.id); optionIds.push(option.id); }); uniqueStrings(localOptions, `${questionPath}.options.id`, issues); });
+  uniqueStrings(localQuestions, `${path}.id`, issues);
+}
+function validateAnswers(answers: readonly ClarificationAnswerEntry[], questions: readonly ClarificationQuestion[], path: string, issues: ValidationIssue[]): void {
+  const questionMap = new Map(questions.map((question) => [question.id, question])); uniqueStrings(answers.map((entry) => entry.questionId), `${path}.questionId`, issues);
+  if (answers.length !== questions.length || answers.some((entry) => !questionMap.has(entry.questionId))) issues.push(issue(path, "incomplete-answers", "Every clarification question requires exactly one answer."));
+  answers.forEach((entry, index) => { const answerPath = `${path}[${index}].answer`; validateId(entry.questionId, `${path}[${index}].questionId`, issues); const question = questionMap.get(entry.questionId); const answer = entry.answer; if (answer.kind === "custom") validateText(answer.text, `${answerPath}.text`, PLAN_LIMITS.clarificationAnswerCodePoints, true, issues); else if (!question?.options.some((option) => option.id === answer.optionId)) issues.push(issue(`${answerPath}.optionId`, "unknown-option", "The selected clarification option does not exist.")); });
+}
+function sameOrigin(left: ClarificationOrigin, right: ClarificationOrigin): boolean { return left.operation === right.operation && left.baseDocumentRevision === right.baseDocumentRevision && left.instruction === right.instruction && left.selectedAnnotationIds.length === right.selectedAnnotationIds.length && left.selectedAnnotationIds.every((id, index) => id === right.selectedAnnotationIds[index]); }
 function validateDocumentSemantics(document: PlanDocument, rootPath: string, issues: ValidationIssue[]): void {
   validateId(document.id, `${rootPath}.id`, issues); const ids = new Set<string>([document.id]); let count = 0, executions = 0;
   const walk = (element: PlanElement, depth: number, path: string, topLevel: boolean): void => {

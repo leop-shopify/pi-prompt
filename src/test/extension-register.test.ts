@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { access, readFile } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
+import { createAcceptedPlanSubmitter } from "../extension/controller-factory.js";
 import { registerPromptExtension } from "../extension/register.js";
 import type { PromptExtensionRuntime } from "../extension/runtime.js";
 
@@ -50,6 +51,15 @@ describe("extension registration", () => {
     expect(bridge).not.toContain("createAgentSession");
     await expect(access("src/plan/team-adapter.ts")).rejects.toThrow();
     await expect(access("src/plan/generator-types.ts")).rejects.toThrow();
+  });
+
+  it("submits an accepted plan immediately instead of copying it into the editor", async () => {
+    const sendUserMessage = vi.fn();
+    await createAcceptedPlanSubmitter({ sendUserMessage }, { isIdle: () => true }).stage("# Accepted plan");
+    expect(sendUserMessage).toHaveBeenCalledWith("# Accepted plan");
+    sendUserMessage.mockClear();
+    await createAcceptedPlanSubmitter({ sendUserMessage }, { isIdle: () => false }).stage("# Accepted plan");
+    expect(sendUserMessage).toHaveBeenCalledWith("# Accepted plan", { deliverAs: "followUp" });
   });
 
   it("registers only the generic submit tool and public current-agent lifecycle hooks", () => {

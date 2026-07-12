@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
 import { platform } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { renderPlanMarkdown } from "./classification.js";
 import { collectPlanElementIds } from "./reconcile.js";
 import { validatePlanSession } from "./schema.js";
 import type { PlanDocument, PlanSession } from "./types.js";
@@ -84,13 +85,17 @@ export function createPlanRepository(options: PlanRepositoryOptions = {}): PlanR
     const metadataBytes = canonicalBytes(await metadataFor(session, committedAt, artifactPath));
     const eventsBytes = await nextEventsBytes(join(artifactPath, "events.jsonl"), auditEvent(input.eventKind, committedAt, session));
     const annotationsBytes = canonicalBytes(session.annotations);
-    const projections = finalPlan === undefined ? ["metadata.json", "events.jsonl", "plan.json", "annotations.json"] : ["metadata.json", "events.jsonl", "plan.json", "annotations.json", "final-plan.md"];
+    const clarificationsBytes = canonicalBytes(session.clarifications ?? { history: [] });
+    const committedPlan = markdownFor(session);
+    const projections = ["metadata.json", "events.jsonl", "plan.json", "annotations.json", "clarifications.json", ...(committedPlan === null ? [] : ["plan.md"]), ...(finalPlan === undefined ? [] : ["final-plan.md"])];
     const prior = await snapshotFiles(artifactPath, projections);
     try {
       await atomicPrivateWrite(join(artifactPath, "metadata.json"), metadataBytes);
       await atomicPrivateWrite(join(artifactPath, "events.jsonl"), eventsBytes);
       await atomicPrivateWrite(join(artifactPath, "plan.json"), stateBytes);
       await atomicPrivateWrite(join(artifactPath, "annotations.json"), annotationsBytes);
+      await atomicPrivateWrite(join(artifactPath, "clarifications.json"), clarificationsBytes);
+      if (committedPlan !== null) await atomicPrivateWrite(join(artifactPath, "plan.md"), Buffer.from(committedPlan, "utf8"));
       if (finalPlan !== undefined) await atomicPrivateWrite(join(artifactPath, "final-plan.md"), Buffer.from(finalPlan, "utf8"));
       const locator: PlanBranchLocator = Object.freeze({ schemaVersion: 1, sessionId: session.id, artifactPath, status: session.status, stateVersion: session.stateVersion, documentRevision: session.documentRevision, stateSha256, committedAt });
       try { input.appendLocator(locator); } catch { await restoreFiles(artifactPath, projections, prior); throw repositoryError("locator-append-failed", "Could not append the plan commit locator."); }
@@ -132,6 +137,15 @@ export function createPlanRepository(options: PlanRepositoryOptions = {}): PlanR
         if (!await fileEquals(join(locator.artifactPath, "annotations.json"), annotationsBytes)) {
           await atomicPrivateWrite(join(locator.artifactPath, "annotations.json"), annotationsBytes);
         } else await chmod(join(locator.artifactPath, "annotations.json"), 0o600);
+        const clarificationsBytes = canonicalBytes(state.clarifications ?? { history: [] });
+        if (!await fileEquals(join(locator.artifactPath, "clarifications.json"), clarificationsBytes)) await atomicPrivateWrite(join(locator.artifactPath, "clarifications.json"), clarificationsBytes);
+        else await chmod(join(locator.artifactPath, "clarifications.json"), 0o600);
+        const committedPlan = markdownFor(state);
+        if (committedPlan !== null) {
+          const planBytes = Buffer.from(committedPlan, "utf8");
+          if (!await fileEquals(join(locator.artifactPath, "plan.md"), planBytes)) { await atomicPrivateWrite(join(locator.artifactPath, "plan.md"), planBytes); warnings.push("plan-rebuilt"); }
+          else await chmod(join(locator.artifactPath, "plan.md"), 0o600);
+        }
         const eventsPath = join(locator.artifactPath, "events.jsonl");
         if (!await validProjectedEvents(eventsPath, state)) {
           await atomicPrivateWrite(eventsPath, eventLines([auditEvent("recovered", canonicalNow(clock), state)])); warnings.push("events-rebuilt");
@@ -163,8 +177,10 @@ function validateTransition(session: PlanSession, previous: PlanSession | null):
   const sameDocument = documentBytes(session.document).equals(documentBytes(previous.document));
   if (sameDocument && session.documentRevision !== previous.documentRevision) throw repositoryError("unnecessary-document-revision", "An unchanged document must keep its revision.");
   if (!sameDocument && session.documentRevision !== previous.documentRevision + 1) throw repositoryError("missing-document-revision", "A changed document must advance its revision exactly once.");
+  if (sameDocument && session.committedMarkdown !== previous.committedMarkdown) throw repositoryError("mutable-committed-markdown", "Committed Markdown cannot change without a document revision.");
 }
 function documentBytes(document: PlanDocument | null): Buffer { return document === null ? Buffer.from("null\n") : canonicalBytes(document); }
+function markdownFor(session: PlanSession): string | null { return session.document ? session.committedMarkdown ?? renderPlanMarkdown(session.document) : null; }
 function canonicalBytes(value: unknown): Buffer { return Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8"); }
 function sha256(bytes: Uint8Array): string { return createHash("sha256").update(bytes).digest("hex"); }
 function canonicalNow(clock: () => Date | string): string {

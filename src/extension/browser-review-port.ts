@@ -47,7 +47,6 @@ export function createBrowserPlanReviewPort(options: BrowserReviewPortOptions): 
       headline: "Review server is running",
       prompt: privateState.source.prompt,
       detail: "Agent is working; opening live plan progress in your browser",
-      notify: true,
     });
     try { await options.launcher.open(host.launchUrl); }
     catch (error) {
@@ -60,7 +59,6 @@ export function createBrowserPlanReviewPort(options: BrowserReviewPortOptions): 
       prompt: privateState.source.prompt,
       detail: privateState.document ? "The local review server will close when this review ends" : "The browser will update automatically when the plan is ready",
     });
-    input.ctx.ui.notify("Live plan progress opened in your browser. The private link expires when the listener closes.", "info");
   };
 
   return {
@@ -72,15 +70,10 @@ export function createBrowserPlanReviewPort(options: BrowserReviewPortOptions): 
     },
     async ready(input: PlanReadyInput) {
       const state = input.controller.snapshot();
-      const reviewable = state?.status === "ready" || state?.status === "error";
-      if (!state?.document || !reviewable) throw new Error("plan-not-reviewable");
+      const reviewable = state?.status === "ready" || state?.status === "error" || state?.status === "awaiting-clarification";
+      if (!state || !reviewable || (!state.document && !state.clarifications?.pending)) throw new Error("plan-not-reviewable");
       if (!active || activeController !== input.controller) await replaceHost(input);
-      showPlanProgress(input.ctx, {
-        headline: "Plan is ready for review",
-        prompt: state.source.prompt,
-        detail: "The open browser updated automatically",
-        notify: true,
-      });
+      clearPlanProgress(input.ctx);
     },
     async close() {
       epoch += 1;

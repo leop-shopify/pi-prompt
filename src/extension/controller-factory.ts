@@ -1,9 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { PlanController, type CreatePlanInput, type LoadedPrivateSkills } from "../plan/controller.js";
+import { PlanController, type CreatePlanInput, type LoadedPrivateSkills, type PlanControllerStager } from "../plan/controller.js";
 import type { PlanBranchEntry } from "../plan/locator.js";
 import { recoverPlanFromBranch } from "../plan/recovery.js";
 import { createPlanRepository, type PlanRecoveryWarning } from "../plan/repository.js";
-import { readPlanFile } from "../plan/session-files.js";
 import type { PlanSession, SafeError } from "../plan/types.js";
 import { captureSkills, createAppendLocator, createSkillPort, safeRuntimeId } from "./pi-adapters.js";
 import { registerLivePlanActivity, updateLivePlanActivity, type MutableLivePlanActivity } from "./live-activity.js";
@@ -34,8 +33,7 @@ export function createControllerStackFactory(pi: ExtensionAPI, bridge: CurrentAg
     });
     return { activity, options: {
       repository, generator, appendLocator: createAppendLocator(pi), skills: createSkillPort(pi),
-      idFactory: safeRuntimeId, clock: () => new Date(), stager: { stage: (value: string) => ctx.ui.setEditorText(value) },
-      readPlan: (sessionId: string) => readPlanFile(repository.rootDir, sessionId),
+      idFactory: safeRuntimeId, clock: () => new Date(), stager: createAcceptedPlanSubmitter(pi, ctx),
     } };
   };
   return {
@@ -68,6 +66,15 @@ export function createControllerStackFactory(pi: ExtensionAPI, bridge: CurrentAg
     },
   };
 }
+export function createAcceptedPlanSubmitter(
+  pi: Pick<ExtensionAPI, "sendUserMessage">, ctx: Pick<ExtensionContext, "isIdle">,
+): PlanControllerStager {
+  return { stage: (value: string) => {
+    if (ctx.isIdle()) pi.sendUserMessage(value);
+    else pi.sendUserMessage(value, { deliverAs: "followUp" });
+  } };
+}
+
 function branchEntries(ctx: ExtensionContext): readonly PlanBranchEntry[] {
   return ctx.sessionManager.getBranch().map((entry) => ({ type: entry.type, ...(entry.type === "custom" ? { customType: entry.customType, data: entry.data } : {}) }));
 }

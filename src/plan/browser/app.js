@@ -1,7 +1,7 @@
 import { clearCapability, createPlanApi, readCapability, requestId } from "./api.js";
 import { byId, isTypingTarget } from "./dom.js";
-import { createStore, openAnnotations, canAccept, canRevise, canRetryStaging } from "./store.js";
-import { renderAnnotations, renderFilters, renderPlan } from "./components.js";
+import { createStore, openAnnotations, canAccept, canRevise, canRetryStaging, isAwaitingClarification } from "./store.js";
+import { renderClarification, renderPlan } from "./components.js";
 import { selectionTarget } from "./range.js";
 
 const capability = readCapability();
@@ -13,13 +13,15 @@ if (!capability) {
   let sequence = 0;
   let stopped = false;
   let progressFrame = 0;
-  let pendingCommentTarget = null;
+  let composerState = null;
   const progressFrames = ["◐", "◓", "◑", "◒"];
   const toast = (message) => { const node = byId("toast"); node.textContent = message; clearTimeout(toast.timer); toast.timer = setTimeout(() => { node.textContent = ""; }, 4000); };
   const applySnapshot = (snapshot) => {
-    const previousMarkdown = store.get().snapshot?.planMarkdown;
+    const current = store.get(); const previousMarkdown = current.snapshot?.planMarkdown;
     const next = snapshot.planMarkdown || !previousMarkdown ? snapshot : { ...snapshot, planMarkdown: previousMarkdown };
-    api.setVersion(next.stateVersion); store.set({ snapshot: next });
+    const batchId = next.clarification?.id ?? null;
+    const clarificationDraft = current.clarificationDraft?.id === batchId ? current.clarificationDraft : batchId ? { id: batchId, answers: {} } : null;
+    api.setVersion(next.stateVersion); store.set({ snapshot: next, clarificationDraft });
   };
   const refresh = async () => {
     const snapshot = await api.snapshot();
@@ -47,47 +49,36 @@ if (!capability) {
     }
   };
 
-  const closeComposer = () => {
-    pendingCommentTarget = null;
-    byId("selection-comment").value = "";
-    byId("selection-composer").hidden = true;
-  };
+  const closeComposer = () => { composerState = null; byId("selection-comment").value = ""; byId("selection-composer").hidden = true; };
+  const positionComposer = (anchor) => { const form = byId("selection-composer"); form.hidden = false; const rect = anchor instanceof Element ? anchor.getBoundingClientRect() : anchor; const left = Math.max(16, Math.min(window.innerWidth - 336, (rect?.left ?? window.innerWidth / 2) + 8)); const top = Math.max(16, Math.min(window.innerHeight - 260, (rect?.bottom ?? window.innerHeight / 2) + 10)); form.style.left = `${left}px`; form.style.top = `${top}px`; };
   const openComposer = (target, anchor) => {
-    const snapshot = store.get().snapshot;
-    if (!snapshot || !["ready", "revising", "error", "needs-input"].includes(snapshot.status)) return;
-    pendingCommentTarget = target;
-    const form = byId("selection-composer");
-    form.hidden = false;
-    const rect = anchor instanceof Element ? anchor.getBoundingClientRect() : anchor;
-    const left = Math.max(16, Math.min(window.innerWidth - 336, (rect?.left ?? window.innerWidth / 2) + 8));
-    const top = Math.max(16, Math.min(window.innerHeight - 220, (rect?.bottom ?? window.innerHeight / 2) + 10));
-    form.style.left = `${left}px`; form.style.top = `${top}px`;
-    byId("selection-comment").focus({ preventScroll: true });
+    const snapshot = store.get().snapshot; if (!snapshot || isAwaitingClarification(snapshot) || !["ready", "revising", "error", "needs-input"].includes(snapshot.status)) return;
+    composerState = { mode: "create", target }; byId("selection-label").textContent = "Add a note to this selection"; byId("selection-comment").value = "";
+    byId("selection-revision-label").hidden = true; byId("selection-status").hidden = true; positionComposer(anchor); byId("selection-comment").focus({ preventScroll: true });
   };
+  const openAnnotation = (annotation, anchor) => {
+    const snapshot = store.get().snapshot; if (!snapshot) return; composerState = { mode: "edit", annotationId: annotation.id };
+    byId("selection-label").textContent = `Edit note (${annotation.status})`; byId("selection-comment").value = annotation.body;
+    const selected = store.get().selectedAnnotationIds.includes(annotation.id); byId("selection-revision").checked = selected;
+    byId("selection-revision-label").hidden = annotation.status !== "open"; const status = byId("selection-status"); status.hidden = annotation.status === "orphaned"; status.textContent = ["dismissed", "addressed"].includes(annotation.status) ? "Reopen" : "Dismiss";
+    positionComposer(anchor); syncComposer(snapshot, store.get().busy); byId("selection-comment").focus({ preventScroll: true });
+  };
+  const syncComposer = (snapshot, busy) => { if (!composerState) return; const annotation = composerState.mode === "edit" ? snapshot.annotations.find((note) => note.id === composerState.annotationId) : null; const disabled = busy || isAwaitingClarification(snapshot) || Boolean(annotation?.locked); for (const id of ["selection-comment", "selection-revision", "selection-status", "selection-save"]) byId(id).disabled = disabled; };
 
-  const draw = ({ snapshot, filter, busy, selectedAnnotationIds }) => {
-    if (!snapshot) return;
-    const focus = captureFocus();
-    byId("plan-content").hidden = false; byId("action-bar").hidden = false;
-    byId("original-prompt").textContent = snapshot.originalPrompt;
-    drawLiveProgress(snapshot);
+  const draw = ({ snapshot, busy, selectedAnnotationIds, clarificationDraft }) => {
+    if (!snapshot) return; const focus = captureFocus(); const awaiting = isAwaitingClarification(snapshot);
+    byId("plan-content").hidden = false; byId("action-bar").hidden = false; byId("original-prompt").textContent = snapshot.originalPrompt; drawLiveProgress(snapshot);
     const error = byId("snapshot-error"); error.hidden = !snapshot.error; error.textContent = snapshot.error?.message ?? "";
-    renderPlan(snapshot, byId("plan-tree"), openComposer, busy);
-    renderFilters(byId("filters"), filter, (value) => store.set({ filter: value }), busy);
-    renderAnnotations(snapshot, filter, selectedAnnotationIds, byId("annotation-list"),
-      (annotation, update) => { void runAction(() => mutate(`/api/v1/annotations/${encodeURIComponent(annotation.id)}`, "PATCH", { update })); },
-      (id, selected) => { const current = store.get().selectedAnnotationIds; store.set({ selectedAnnotationIds: selected ? [...new Set([...current, id])] : current.filter((value) => value !== id) }); },
-      busy,
-    );
-    const noteCount = snapshot.annotations.length;
-    byId("annotation-count").textContent = `${noteCount} ${noteCount === 1 ? "note" : "notes"}`;
-    byId("notes-section").hidden = noteCount === 0;
-    const revise = byId("revise-button"); revise.disabled = busy || !canRevise(snapshot); revise.textContent = "Send notes to agent";
-    const retryStage = byId("retry-stage-button"); retryStage.hidden = !canRetryStaging(snapshot); retryStage.disabled = busy || !canRetryStaging(snapshot);
-    byId("accept-button").disabled = busy || !canAccept(snapshot);
+    const clarificationSection = byId("clarification-section"); clarificationSection.hidden = !snapshot.clarification;
+    renderClarification(snapshot, byId("clarification-questions"), clarificationDraft, (questionId, answer) => { const current = store.get().clarificationDraft; if (!current) return; store.set({ clarificationDraft: { id: current.id, answers: { ...current.answers, [questionId]: answer } } }); }, busy);
+    byId("clarification-submit").disabled = busy || !snapshot.clarification;
+    renderPlan(snapshot, byId("plan-tree"), openComposer, openAnnotation, busy);
+    const noteCount = snapshot.annotations.length; byId("annotation-count").textContent = `${noteCount} ${noteCount === 1 ? "note" : "notes"}`;
+    const revise = byId("revise-button"); revise.hidden = awaiting; revise.disabled = busy || awaiting || !canRevise(snapshot); revise.textContent = "Send notes to agent";
+    const retryStage = byId("retry-stage-button"); retryStage.hidden = awaiting || !canRetryStaging(snapshot); retryStage.disabled = busy || awaiting || !canRetryStaging(snapshot);
+    const accept = byId("accept-button"); accept.hidden = awaiting; accept.disabled = busy || awaiting || !canAccept(snapshot);
     for (const id of ["reopen-button", "pause-button", "cancel-button"]) byId(id).disabled = busy;
-    if (!snapshot.document) closeComposer();
-    restoreFocus(focus);
+    syncComposer(snapshot, busy); if (!snapshot.document && composerState?.mode === "edit") closeComposer(); restoreFocus(focus);
   };
   store.subscribe(draw);
 
@@ -111,15 +102,21 @@ if (!capability) {
   }
 
   byId("selection-composer").addEventListener("submit", (event) => {
-    event.preventDefault();
-    void runAction(async () => {
-      const body = byId("selection-comment").value.trim();
-      if (!pendingCommentTarget || !body) return;
-      await mutate("/api/v1/annotations", "POST", { target: pendingCommentTarget, body });
+    event.preventDefault(); void runAction(async () => {
+      const body = byId("selection-comment").value.trim(); if (!composerState || !body) return;
+      if (composerState.mode === "create") await mutate("/api/v1/annotations", "POST", { target: composerState.target, body });
+      else { const annotation = store.get().snapshot?.annotations.find((note) => note.id === composerState.annotationId); if (annotation && annotation.body !== body) await mutate(`/api/v1/annotations/${encodeURIComponent(annotation.id)}`, "PATCH", { update: { body } }); }
       closeComposer();
     });
   });
   byId("selection-cancel").addEventListener("click", closeComposer);
+  byId("selection-revision").addEventListener("change", () => { if (composerState?.mode !== "edit") return; const current = store.get().selectedAnnotationIds; const id = composerState.annotationId; store.set({ selectedAnnotationIds: byId("selection-revision").checked ? [...new Set([...current, id])] : current.filter((value) => value !== id) }); });
+  byId("selection-status").addEventListener("click", () => { void runAction(async () => { if (composerState?.mode !== "edit") return; const annotation = store.get().snapshot?.annotations.find((note) => note.id === composerState.annotationId); if (!annotation) return; const status = ["dismissed", "addressed"].includes(annotation.status) ? "open" : "dismissed"; await mutate(`/api/v1/annotations/${encodeURIComponent(annotation.id)}`, "PATCH", { update: { status } }); closeComposer(); }); });
+  byId("clarification-form").addEventListener("submit", (event) => { event.preventDefault(); void runAction(async () => {
+    const current = store.get(); const pending = current.snapshot?.clarification; const draft = current.clarificationDraft; const error = byId("clarification-error"); if (!pending || !draft || draft.id !== pending.id) return;
+    const answers = []; for (const question of pending.questions) { const answer = draft.answers[question.id]; if (!answer || answer.kind === "custom" && !answer.text.trim()) { error.textContent = "Answer every question before continuing."; error.hidden = false; const prefix = `clarification-${pending.id}-${question.id}-`; const first = [...document.querySelectorAll("[data-focus-key]")].find((node) => node.dataset.focusKey?.startsWith(prefix)); first?.focus(); return; } answers.push({ questionId: question.id, answer: answer.kind === "custom" ? { kind: "custom", text: answer.text.trim() } : answer }); }
+    error.hidden = true; await mutate("/api/v1/clarification-answers", "POST", { clarificationId: pending.id, answers });
+  }); });
   byId("plan-tree").addEventListener("mouseup", () => {
     const selected = selectionTarget();
     if (!selected.ok) return;
@@ -142,15 +139,15 @@ if (!capability) {
   });
   byId("accept-button").addEventListener("click", () => { void runAction(async () => {
     const snapshot = store.get().snapshot;
-    if (!snapshot || !(await confirmDialog("Accept this plan?", "Pi will stage this exact revision in the editor. It will not execute until you press Enter.", "Accept & stage"))) return;
+    if (!snapshot || !(await confirmDialog("Accept and send this plan?", "Pi will submit this exact revision as your next message and start the agent immediately.", "Accept & send"))) return;
     await mutate("/api/v1/accept", "POST", { stateVersion: snapshot.stateVersion, documentRevision: snapshot.documentRevision, confirmed: true });
-    finishReview(); toast("Plan staged in Pi. This review listener is closing.");
+    finishReview(); toast("Plan sent to the agent. This review listener is closing.");
   }); });
   byId("retry-stage-button").addEventListener("click", () => { void runAction(async () => {
     const snapshot = store.get().snapshot;
-    if (!snapshot || !canRetryStaging(snapshot) || !(await confirmDialog("Retry staging?", "Retry staging this exact accepted revision in Pi.", "Retry staging"))) return;
+    if (!snapshot || !canRetryStaging(snapshot) || !(await confirmDialog("Retry sending?", "Submit this exact accepted revision to the agent now.", "Retry send"))) return;
     await mutate("/api/v1/accept", "POST", { stateVersion: snapshot.stateVersion, documentRevision: snapshot.documentRevision, confirmed: true });
-    finishReview(); toast("Plan staged in Pi. This review listener is closing.");
+    finishReview(); toast("Plan sent to the agent. This review listener is closing.");
   }); });
   const stop = (disposition) => { void runAction(async () => {
     if (!(await confirmDialog(disposition === "pause" ? "Pause review?" : "Cancel this plan?", disposition === "pause" ? "History remains saved. Resume later from Pi." : "The saved session becomes terminal, but history is retained.", disposition === "pause" ? "Pause" : "Cancel plan"))) return;
@@ -177,16 +174,20 @@ function elapsedSince(startedAt, endedAt) {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 }
 function label(value) { return String(value ?? "").split("-").map((part) => part ? part[0].toUpperCase() + part.slice(1) : "").join(" "); }
-function captureFocus() {
+function supportsTextSelection(node) {
+  return node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement && ["text", "search", "url", "tel", "password"].includes(node.type);
+}
+export function captureFocus() {
   const node = document.activeElement;
   if (!(node instanceof HTMLElement)) return null;
-  const selection = node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement ? { start: node.selectionStart, end: node.selectionEnd } : undefined;
+  const selection = supportsTextSelection(node) && Number.isInteger(node.selectionStart) && Number.isInteger(node.selectionEnd)
+    ? { start: node.selectionStart, end: node.selectionEnd } : undefined;
   return { key: node.dataset.focusKey, id: node.id, selection };
 }
-function restoreFocus(saved) {
+export function restoreFocus(saved) {
   if (!saved) return;
   const node = saved.key ? [...document.querySelectorAll("[data-focus-key]")].find((candidate) => candidate.dataset.focusKey === saved.key) : saved.id ? document.getElementById(saved.id) : null;
   if (!(node instanceof HTMLElement) || node.hasAttribute("disabled")) return;
   node.focus({ preventScroll: true });
-  if (saved.selection && (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement)) node.setSelectionRange(saved.selection.start, saved.selection.end);
+  if (saved.selection && supportsTextSelection(node)) node.setSelectionRange(saved.selection.start, saved.selection.end);
 }

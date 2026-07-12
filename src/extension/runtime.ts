@@ -107,7 +107,7 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
   const presentIfReady = async (ctx: ExtensionContext, controller: PlanController, epoch: number): Promise<boolean> => {
     if (!owns(controller, epoch)) return false;
     const state = controller.snapshot();
-    if (!state?.document || state.status !== "ready") return false;
+    if (!state || (state.status !== "ready" && state.status !== "awaiting-clarification") || (!state.document && !state.clarifications?.pending)) return false;
     if (!owns(controller, epoch)) return false;
     try { await options.review.ready({ controller, state, ctx }); }
     catch { notifyOwned(ctx, controller, epoch, "Browser review could not be opened. Resume the saved plan to try again.", "error"); }
@@ -140,12 +140,22 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
       const liveState = controller.snapshot();
       if (liveState) {
         try { await options.review.start({ controller, state: liveState, ctx }); }
-        catch { notifyOwned(ctx, controller, epoch, "Live browser progress could not be opened. Plan generation is still running.", "warning"); }
+        catch {
+          const failedState = controller.snapshot();
+          if (failedState?.generationJob && owns(controller, epoch)) await controller.pause({ expectedStateVersion: failedState.stateVersion });
+          notifyOwned(ctx, controller, epoch, "Live browser progress could not be opened, so planning was paused before writer dispatch.", "error");
+          clearPlanProgress(ctx);
+          return;
+        }
       }
     }
     if (!owns(controller, epoch)) return;
     const dispatched = controller.dispatchGeneration(started.value.jobId);
-    if (!dispatched.ok) { notifyOwned(ctx, controller, epoch, dispatched.error.message, "error"); return; }
+    if (!dispatched.ok) {
+      const failedState = controller.snapshot();
+      if (failedState?.generationJob && owns(controller, epoch)) await controller.pause({ expectedStateVersion: failedState.stateVersion });
+      notifyOwned(ctx, controller, epoch, dispatched.error.message, "error"); clearPlanProgress(ctx); return;
+    }
     void monitorGeneration(ctx, controller, epoch, started.value.completion);
   };
 
@@ -158,7 +168,6 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
         headline: "Plan generation started",
         prompt: submission.text,
         detail: `Preparing ${submission.mode} planning`,
-        notify: true,
       });
       const controller = await withReplacementLock(async (): Promise<PlanController | null> => {
         if (runtimeEpoch !== epoch) return null;
@@ -239,14 +248,36 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
         }
         state = controller.snapshot() ?? state;
       }
-      if (state.status === "paused" && state.document) {
+      if (["paused", "error"].includes(state.status) && state.clarifications?.origin && !state.clarifications.pending) {
+        const started = await controller.resumeClarification({ expectedStateVersion: state.stateVersion });
+        if (!owns(controller, epoch)) return;
+        if (!started.ok) { notifyOwned(ctx, controller, epoch, started.error.message, "error"); return; }
+        const liveState = controller.snapshot();
+        if (options.review.start && liveState) {
+          try { await options.review.start({ controller, state: liveState, ctx }); }
+          catch {
+            const failedState = controller.snapshot();
+            if (failedState?.generationJob && owns(controller, epoch)) await controller.pause({ expectedStateVersion: failedState.stateVersion });
+            notifyOwned(ctx, controller, epoch, "Live browser progress could not be opened, so planning was paused before writer dispatch.", "error");
+            return;
+          }
+        }
+        const dispatched = controller.dispatchGeneration(started.value.jobId);
+        if (!dispatched.ok) {
+          const failedState = controller.snapshot();
+          if (failedState?.generationJob && owns(controller, epoch)) await controller.pause({ expectedStateVersion: failedState.stateVersion });
+          notifyOwned(ctx, controller, epoch, dispatched.error.message, "error"); return;
+        }
+        void monitorGeneration(ctx, controller, epoch, started.value.completion); return;
+      }
+      if (state.status === "paused" && (state.document || state.clarifications?.pending)) {
         const resumed = await controller.resumeReview({ expectedStateVersion: state.stateVersion });
         if (!owns(controller, epoch)) return;
         if (!resumed.ok) { notifyOwned(ctx, controller, epoch, resumed.error.message, "error"); return; }
         state = controller.snapshot() ?? state;
       }
       if (!owns(controller, epoch)) return;
-      if (state.document && (state.status === "ready" || state.status === "error")) {
+      if ((state.document && (state.status === "ready" || state.status === "error")) || state.status === "awaiting-clarification") {
         try { await options.review.ready({ controller, state, ctx }); }
         catch { notifyOwned(ctx, controller, epoch, "Browser review could not be opened. Resume the saved plan to try again.", "error"); }
         if (!owns(controller, epoch)) return;
@@ -261,7 +292,7 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
           );
           if (!owns(controller, epoch)) return;
           if (retry) {
-            showPlanProgress(ctx, { headline: "Plan generation restarted", prompt: state.source.prompt, detail: `Preparing ${state.generation.mode} planning`, notify: true });
+            showPlanProgress(ctx, { headline: "Plan generation restarted", prompt: state.source.prompt, detail: `Preparing ${state.generation.mode} planning` });
             await runGeneration(ctx, controller, epoch);
             return;
           }
@@ -282,13 +313,13 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
           return;
         }
         const retry = await ctx.ui.confirm(
-          "Retry staging the accepted plan?",
-          "The accepted plan was saved but may not be in the editor. Retry only if you want to replace the editor with this exact accepted revision.",
+          "Retry sending the accepted plan?",
+          "The accepted plan was saved but was not sent to the agent. Retry to submit this exact accepted revision now.",
         );
         if (!owns(controller, epoch) || !retry) return;
         const staged = await controller.accept({ expectedStateVersion: state.stateVersion, documentRevision: state.documentRevision, confirmed: true });
         if (!owns(controller, epoch)) return;
-        notifyOwned(ctx, controller, epoch, staged.ok ? "The accepted plan was staged in the editor." : staged.error.message, staged.ok ? "info" : "error");
+        notifyOwned(ctx, controller, epoch, staged.ok ? "The accepted plan was sent to the agent." : staged.error.message, staged.ok ? "info" : "error");
       } else if (state.status === "cancelled") {
         notifyOwned(ctx, controller, epoch, "The saved plan was cancelled and cannot be reviewed.", "info");
       } else if (state.status === "needs-input") {

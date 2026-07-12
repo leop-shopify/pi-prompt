@@ -1,11 +1,11 @@
 import { parseStrictJsonObject } from "./raw-json.js";
-import { PLAN_LIMITS, validateInitialPlanResult, validatePlanSession, validateRevisionPlanResult } from "./schema.js";
+import { PLAN_LIMITS, validateClarificationQuestions, validateInitialPlanResult, validatePlanSession, validateRevisionPlanResult } from "./schema.js";
 import type {
-  InitialPlanResultDraft, ModelPlanDocumentDraft, ModelRevisionPlanDocumentDraft, PlanSession,
-  RevisionPlanResultDraft, SafeError, ValidationResult,
+  ClarificationQuestion, ClarificationResultDraft, InitialPlanResultDraft, ModelPlanDocumentDraft,
+  ModelRevisionPlanDocumentDraft, PlanOperation, PlanSession, RevisionPlanResultDraft, SafeError, ValidationResult,
 } from "./types.js";
 
-export type PlanOperation = "initial" | "revision";
+export type { PlanOperation } from "./types.js";
 
 /** Ephemeral selected-skill content. Bodies never enter persisted state or browser snapshots. */
 export interface PrivateSkillContent { readonly name: string; readonly body: string }
@@ -20,14 +20,29 @@ export interface PlanGeneratorInput {
   readonly signal: AbortSignal;
 }
 
-export type PlanGeneratorOutcome = InitialPlanResultDraft | RevisionPlanResultDraft;
+export type PlanGeneratorOutcome =
+  | (InitialPlanResultDraft & { readonly markdown?: string })
+  | (RevisionPlanResultDraft & { readonly markdown?: string })
+  | ClarificationResultDraft;
 export type PlanGeneratorResult =
   | { readonly ok: true; readonly outcome: PlanGeneratorOutcome }
   | { readonly ok: false; readonly error: SafeError };
 
 export type PlanDispatchResult = { readonly ok: true; readonly value: undefined } | { readonly ok: false; readonly error: SafeError };
+export type WriterSubmissionKind = "plan" | "clarification";
+export interface WriterSubmissionInput {
+  readonly sessionId: string;
+  readonly jobId: string;
+  readonly operation: PlanOperation;
+  readonly baseDocumentRevision: number;
+  readonly attemptId: string;
+  readonly kind: WriterSubmissionKind;
+  readonly body: Buffer;
+}
 export interface DispatchablePlanGenerator {
   generate(input: PlanGeneratorInput): Promise<PlanGeneratorResult>;
+  configureWriterEndpoint(url: string): PlanDispatchResult;
+  submitWriterResult(input: WriterSubmissionInput): Promise<PlanDispatchResult>;
   dispatch(jobId: string): PlanDispatchResult;
   close(): void | Promise<void>;
 }
@@ -62,6 +77,22 @@ export function validateGeneratorSubmission(
   if (!hasImplementationTasks(parsed.value.document)) return failed("missing-implementation-tasks", "The submitted plan omitted valid Implementation Tasks.");
   if (containsPrivateValue(parsed.value, privateValues(session, skills))) return failed("private-output-exposure", "The submitted plan contained private skill data and was rejected.");
   return { ok: true, outcome: parsed.value };
+}
+
+export function validateClarificationSubmission(
+  input: unknown, session: PlanSession, skills: readonly PrivateSkillContent[],
+): PlanGeneratorResult {
+  if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).length !== 1 || !("questions" in input)) {
+    return failed("invalid-clarification", "The clarification submission must contain exactly one questions field.");
+  }
+  const questions = validateClarificationQuestions((input as { readonly questions?: unknown }).questions);
+  if (!questions.ok) return failed("invalid-clarification", `The clarification submission is invalid: ${formatIssues(questions.issues)}`);
+  if (containsPrivateValue(questions.value, privateValues(session, skills))) return failed("private-output-exposure", "The clarification submission contained private skill data and was rejected.");
+  return { ok: true, outcome: { kind: "clarification", questions: questions.value } };
+}
+
+export function clarificationOutcome(questions: readonly ClarificationQuestion[]): PlanGeneratorResult {
+  return { ok: true, outcome: { kind: "clarification", questions } };
 }
 
 export function operationContract(operation: PlanOperation): string {

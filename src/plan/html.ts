@@ -31,26 +31,27 @@ export const PLAN_REVIEW_HTML = `<!doctype html>
 
   <div id="snapshot-error" class="snapshot-error" role="alert" aria-live="assertive" hidden></div>
 
+  <section id="clarification-section" class="clarification-section" aria-labelledby="clarification-heading" hidden>
+    <div class="section-heading"><div><p class="eyebrow">Clarification</p><h2 id="clarification-heading">A few choices before planning continues</h2></div></div>
+    <form id="clarification-form" novalidate><div id="clarification-questions"></div><div id="clarification-error" class="form-error" role="alert" hidden></div><button id="clarification-submit" type="submit" class="primary">Continue planning</button></form>
+  </section>
+
   <section class="plan-section" aria-labelledby="generated-plan-heading">
     <div class="section-heading"><div><p class="eyebrow">Generated plan</p><h2 id="generated-plan-heading">Review and annotate</h2></div><span id="annotation-count" class="meta-pill">0 notes</span></div>
     <div id="plan-tree"></div>
   </section>
-
-  <section id="notes-section" class="notes-section" aria-labelledby="notes-heading" hidden>
-    <div class="section-heading compact"><div><p class="eyebrow">Feedback</p><h2 id="notes-heading">Notes</h2></div><fieldset id="filters" class="note-filters"><legend class="sr-only">Filter notes</legend></fieldset></div>
-    <div id="annotation-list" class="notes-list"></div>
-  </section>
 </main>
 
 <form id="selection-composer" class="selection-composer" hidden>
-  <label for="selection-comment">Add a note to this selection</label>
+  <label id="selection-label" for="selection-comment">Add a note to this selection</label>
   <textarea id="selection-comment" maxlength="8192" rows="3" placeholder="Change, remove, clarify…"></textarea>
-  <div><button id="selection-cancel" type="button" class="quiet">Cancel</button><button type="submit" class="primary">Save note</button></div>
+  <label id="selection-revision-label" class="select-note" hidden><input id="selection-revision" type="checkbox"> Include in next revision</label>
+  <div><button id="selection-status" type="button" class="quiet" hidden>Dismiss</button><button id="selection-cancel" type="button" class="quiet">Cancel</button><button id="selection-save" type="submit" class="primary">Save note</button></div>
 </form>
 
 <footer id="action-bar" class="action-bar" hidden>
   <div><button id="reopen-button" class="quiet">Reopen in Pi</button><button id="pause-button" class="quiet">Pause</button><button id="cancel-button" class="danger quiet">Cancel plan</button></div>
-  <div><button id="revise-button">Send notes to agent</button><button id="retry-stage-button" class="primary" hidden>Retry staging</button><button id="accept-button" class="primary">Accept plan</button></div>
+  <div><button id="revise-button">Send notes to agent</button><button id="retry-stage-button" class="primary" hidden>Retry send</button><button id="accept-button" class="primary">Accept &amp; send</button></div>
 </footer>
 <dialog id="dialog" aria-labelledby="dialog-title" aria-describedby="dialog-body"><form method="dialog"><h2 id="dialog-title"></h2><p id="dialog-body"></p><div class="dialog-actions"><button value="cancel" class="quiet">Go back</button><button id="dialog-confirm" value="confirm" class="primary">Confirm</button></div></form></dialog>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>

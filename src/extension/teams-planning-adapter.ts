@@ -29,7 +29,6 @@ export interface TeamsPlanningAdapterOptions {
   readonly cwd: string;
   readonly mission: string;
   readonly modelSlot: PlanningModelSlot;
-  readonly submitToolName: string;
   readonly onPhase: (phase: TeamsAdapterPhase) => void;
   readonly onReport: (report: string) => void;
   readonly onProgress: (status: string, updatedAt: number) => void;
@@ -108,6 +107,7 @@ export class TeamsPlanningAdapter {
     const details = asRecord(event.details);
     if (event.isError || details?.name !== this.#options.primaryName) return;
     this.#expectedTeamName = nonblankString(details.session);
+    if (!this.#expectedTeamName) return;
     const model = safeModelInfo(details, this.#options.modelSlot);
     if (model) this.#options.onModel?.(model);
     this.#primaryStatus = "active";
@@ -133,7 +133,9 @@ export class TeamsPlanningAdapter {
   handleReport(payload: unknown): boolean {
     if (this.#closed || this.#reportAccepted || this.#primaryStatus !== "waiting") return false;
     const report = asRecord(payload);
-    if (report?.name !== this.#options.primaryName || typeof report.ok !== "boolean" || typeof report.report !== "string" || report.report.trim().length === 0) return false;
+    if (report?.name !== this.#options.primaryName || this.#expectedTeamName === null || report.teamName !== this.#expectedTeamName
+      || !reportMetadataMatches(report.metadata, this.#options.correlation)
+      || typeof report.ok !== "boolean" || typeof report.report !== "string" || report.report.trim().length === 0) return false;
     this.#reportAccepted = true;
     this.#acceptedReport = report.report;
     this.#primaryStatus = "report-received";
@@ -147,7 +149,8 @@ export class TeamsPlanningAdapter {
     const candidate = asRecord(message);
     const details = asRecord(candidate?.details);
     if (candidate?.role !== "custom" || candidate.customType !== "pi-extended-teams-report"
-      || candidate.content !== this.#acceptedReport || details?.name !== this.#options.primaryName) return false;
+      || candidate.content !== this.#acceptedReport || details?.name !== this.#options.primaryName || details.teamName !== this.#expectedTeamName
+      || !reportMetadataMatches(details.metadata, this.#options.correlation)) return false;
     this.#followUpAccepted = true;
     return true;
   }
@@ -190,6 +193,11 @@ function hasPackageIdentity(value: string): boolean {
     || /(?:^|:)pi-extended-teams(?:@[^/]+)?$/u.test(normalized);
 }
 
+function reportMetadataMatches(value: unknown, correlation: string): boolean {
+  if (value === undefined) return true;
+  const metadata = asRecord(value); const planning = asRecord(metadata?.piPromptPlanning);
+  return planning?.version === 1 && planning.correlation === correlation && Object.keys(planning).length === 2;
+}
 function normalizeProgressStatus(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const status = value.replace(/\s+/gu, " ").trim();

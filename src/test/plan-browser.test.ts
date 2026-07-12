@@ -31,20 +31,24 @@ describe("browser review client", () => {
     expect(sources[0]).toContain("captureFocus()"); expect(sources[0]).toContain("setSelectionRange");
     expect(sources[0]).toMatch(/const actionFocus = captureFocus\(\);\s*store\.set\(\{ busy: true \}\);[\s\S]*finally \{\s*store\.set\(\{ busy: false \}\);\s*restoreFocus\(actionFocus\);/);
     expect(sources[0]).toContain("retry-stage-button"); expect(sources[0]).toContain("Send notes to agent");
+    expect(sources[0]).toContain("Accept & send"); expect(sources[0]).not.toContain("It will not execute until you press Enter");
     expect(sources[0]).not.toContain("activity?.phase");
     expect(sources[0]).not.toContain("progress-model"); expect(sources[0]).not.toContain("raw thinking");
     expect(sources[0]).toContain("activity?.progress?.summary ?? activity?.summary");
     expect(sources[0]).toContain("snapshot.originalPrompt");
     expect(sources[0]).toContain("progress-detail");
     expect(sources[0]).not.toContain("window.prompt(");
-    expect(sources[0]).toContain("selection-composer");
+    expect(sources[0]).toContain("selection-composer"); expect(sources[0]).toContain("composerState"); expect(sources[0]).toContain("clarificationDraft");
+    expect(sources[0]).toContain("isAwaitingClarification"); expect(sources[0]).toContain('revise.hidden = awaiting'); expect(sources[0]).toContain('accept.hidden = awaiting');
+    expect(sources[0]).toContain("busy || isAwaitingClarification(snapshot) || Boolean(annotation?.locked)");
+    expect(sources[0]).toContain("isAwaitingClarification(snapshot) || ![\"ready\", \"revising\", \"error\", \"needs-input\"]");
     expect(sources[0]).not.toMatch(/sidebar[^\n]*(message|chat|agent)/i);
     expect(sources[2]).toContain("canRetryStaging");
-    expect(sources[4]).toContain("annotation.locked"); expect(sources[4]).toContain("targetSummary");
-    expect(sources[4]).toContain("expandedIds"); expect(sources[4]).not.toContain("Add note");
-    expect(sources[4]).toContain('element("details"'); expect(sources[4]).toContain('element("summary"');
-    expect(sources[4]).toContain('["ready", "revising", "error", "needs-input"]');
-    expect(sources[4]).not.toContain("Boolean(snapshot.job) || annotation.locked");
+    expect(sources[4]).toContain("note.locked"); expect(sources[4]).toContain("annotation-badge");
+    expect(sources[4]).toContain("target.selector.end"); expect(sources[4]).toContain("[...String(text)]");
+    expect(sources[4]).toContain('element("button"'); expect(sources[4]).toContain("annotation-fallback");
+    expect(sources[4]).toContain('element("fieldset"'); expect(sources[4]).toContain('element("legend"'); expect(sources[4]).toContain('type: "radio"'); expect(sources[4]).toContain("Custom answer");
+    expect(sources[4]).not.toContain('element("details"');
     expect(sources[0]).toContain('["ready", "revising", "error", "needs-input"].includes(snapshot.status)');
     expect(sources[1]).toContain("historyObject.replaceState(null");
     expect(sources[1]).toContain("/^#capability=");
@@ -54,10 +58,11 @@ describe("browser review client", () => {
     expect(shell).toContain("Live planner thinking"); expect(shell).toContain('id="progress-budget"'); expect(shell).toContain('id="progress-elapsed"'); expect(shell).not.toContain('id="progress-model"'); expect(shell).not.toContain('id="progress-timeline"'); expect(shell).not.toContain("raw thinking");
     const mainStart = shell.indexOf('<main id="plan-content"'); const mainEnd = shell.indexOf("</main>", mainStart); const detail = shell.indexOf('id="progress-detail"'); const plan = shell.indexOf('id="plan-tree"');
     expect(mainStart).toBeGreaterThan(-1); expect(detail).toBeGreaterThan(mainStart); expect(detail).toBeLessThan(plan); expect(plan).toBeLessThan(mainEnd);
-    expect(shell).toContain('id="original-prompt"'); expect(shell).toContain('id="selection-composer"');
+    expect(shell).toContain('id="original-prompt"'); expect(shell).toContain('id="selection-composer"'); expect(shell).toContain('id="clarification-section"');
+    expect(shell).not.toContain('id="annotation-list"'); expect(shell).not.toContain('id="notes-section"');
     expect(shell).not.toContain("<aside"); expect(shell).not.toContain('id="root-comment"'); expect(shell).not.toContain("Drawing index"); expect(shell).not.toContain("Markup rail");
     const css = await readFile(new URL("../plan/browser/styles.css", import.meta.url), "utf8");
-    expect(css).toContain("color-scheme:dark"); expect(css).toContain(".single-plan");
+    expect(css).toContain("color-scheme:dark"); expect(css).toContain(".single-plan"); expect(css).toContain(".annotation-badge:focus-visible"); expect(css).toContain(".clarification-question");
     expect(css).toContain("@media(max-width:700px)"); expect(css).toContain("prefers-reduced-motion"); expect(css).toContain("min-height:40px"); expect(css).not.toContain("transition:all");
   });
 
@@ -75,7 +80,7 @@ describe("browser review client", () => {
       generationJob: { jobId: "job-live", operation: "initial", baseDocumentRevision: 0, selectedAnnotationIds: [], instruction: "", startedAt: "2026-07-11T13:00:00.000Z" },
     };
     let launchUrl = "";
-    const controller = { snapshot: () => liveState, acceptedStagingPending: () => false, subscribe: () => () => undefined } as unknown as PlanController;
+    const controller = { snapshot: () => liveState, acceptedStagingPending: () => false, subscribe: () => () => undefined, configureWriterEndpoint: () => ({ ok: true, value: undefined }) } as unknown as PlanController;
     const activity = {}; updateLivePlanActivity(activity, {
       phase: "waiting-report", adapter: "delegated", primaryCount: 1, primaryStatus: "waiting",
       startedAt: "2026-07-11T13:00:00.000Z", updatedAt: "2026-07-11T13:01:00.000Z", budgetMinutes: 20,
@@ -116,28 +121,32 @@ describe("browser review client", () => {
     }
   });
 
-  it("announces the running server before automatically opening a materialized review", async () => {
+  it("opens a materialized review with compact status only and no white info notification", async () => {
     const errorState: PlanSession = { ...state, status: "error", lastError: { code: "generation-failed", message: "The revision failed safely." } };
     let launchUrl = "";
     const notify = vi.fn(); const setStatus = vi.fn(); const setWidget = vi.fn();
-    const controller = { snapshot: () => errorState, acceptedStagingPending: () => false, subscribe: () => () => undefined } as unknown as PlanController;
+    const controller = { snapshot: () => errorState, acceptedStagingPending: () => false, subscribe: () => () => undefined, configureWriterEndpoint: () => ({ ok: true, value: undefined }) } as unknown as PlanController;
     const port = createBrowserPlanReviewPort({ launcher: { open: async (url) => {
-      expect(notify).toHaveBeenCalledWith("Review server is running — Agent is working; opening live plan progress in your browser", "info");
+      expect(notify).not.toHaveBeenCalled();
       launchUrl = url;
     } }, reopen: vi.fn() });
     const ctx = { ui: { notify, setStatus, setWidget } } as unknown as ExtensionContext;
     await port.ready({ controller, state: errorState, ctx });
     expect(launchUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/#capability=/);
     expect(setWidget).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+    expect(setStatus).toHaveBeenLastCalledWith("pi-prompt-plan", undefined);
+    const statusCalls = setStatus.mock.calls.length;
     await port.close?.();
     expect(setStatus).toHaveBeenLastCalledWith("pi-prompt-plan", undefined);
+    expect(setStatus.mock.calls.length).toBe(statusCalls + 1);
   });
 
   it("hosts one injected controller, launches the fragment URL, exposes only a bounded prompt preview, and reopens Pi", async () => {
     let launchUrl = "";
     const reopen = vi.fn();
     const listeners = new Set();
-    const controller = { snapshot: () => state, acceptedStagingPending: () => false, subscribe: (listener: unknown) => { listeners.add(listener); return () => listeners.delete(listener); } } as unknown as PlanController;
+    const controller = { snapshot: () => state, acceptedStagingPending: () => false, subscribe: (listener: unknown) => { listeners.add(listener); return () => listeners.delete(listener); }, configureWriterEndpoint: () => ({ ok: true, value: undefined }) } as unknown as PlanController;
     const port = createBrowserPlanReviewPort({ launcher: { open: async (url) => { launchUrl = url; } }, reopen });
     const ctx = { ui: { notify: vi.fn() } } as unknown as ExtensionContext;
     await port.ready({ controller, state, ctx });

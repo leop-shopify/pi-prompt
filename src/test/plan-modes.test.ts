@@ -9,8 +9,14 @@ describe("packaged planning levels", () => {
       expect(markdown).toContain("controller-owned role");
       expect(markdown).toContain("pi_prompt_submit_plan");
       expect(markdown).toContain("never create delegation or helpers independently");
+      expect(markdown).toContain("The original user request defines the goal and scope");
+      expect(markdown).toContain("Do not infer repository changes, code, files, stack, tests, implementation, or rollout");
+      expect(markdown).toContain("Never inspect or assess a folder, repository, or working directory by default; a cwd is not authorization");
+      expect(markdown).toContain("Inspect only the smallest relevant evidence when the user explicitly asks about existing code or files");
+      expect(markdown).toContain("Treat affected areas, tests, implementation, architecture, migration, security, rollout, rollback, workstreams, and repository evidence as conditional");
+      expect(markdown).toContain("Never report generic `assessing folder` or `exploring repository` progress");
       expect(markdown).toContain("Only a submission-owning run");
-      expect(markdown).not.toMatch(/createAgentSession|pi\.events|subprocess|current Pi tool catalog/i);
+      expect(markdown).not.toMatch(/Create a concrete implementation plan for ordinary repository work|Inspect repository evidence as needed|createAgentSession|pi\.events|subprocess|current Pi tool catalog/i);
       expect(GENERATION_PROFILES[mode].fileName).toBe(`${mode}.md`);
       expect(GENERATION_PROFILES[mode].timeBudgetMinutes).toBeGreaterThan(0);
     }

@@ -8,7 +8,6 @@ export interface PlanProgressInput {
   readonly headline: string;
   readonly prompt: string;
   readonly detail?: string;
-  readonly notify?: boolean;
 }
 
 interface ActiveProgress {
@@ -37,9 +36,6 @@ export function showPlanProgress(ctx: ExtensionContext, input: PlanProgressInput
     active.detail = input.detail;
   }
   render(ctx);
-  if (input.notify) {
-    try { ctx.ui.notify(input.detail ? `${input.headline} — ${input.detail}` : input.headline, "info"); } catch { /* best effort */ }
-  }
 }
 
 export function clearPlanProgress(ctx: ExtensionContext): void {

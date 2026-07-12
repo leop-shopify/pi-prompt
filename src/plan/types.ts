@@ -6,7 +6,7 @@ export type GenerationMode =
   | "fully-orchestrated";
 
 export type ExecutionKind = { readonly kind: "normal" } | { readonly kind: "goal" } | { readonly kind: "loop" };
-export type PlanSessionStatus = "generating" | "ready" | "revising" | "accepted" | "paused" | "cancelled" | "error" | "needs-input";
+export type PlanSessionStatus = "generating" | "ready" | "revising" | "awaiting-clarification" | "accepted" | "paused" | "cancelled" | "error" | "needs-input";
 
 /** Private generation input. It must never be copied into a browser snapshot. */
 export interface SkillReference {
@@ -18,9 +18,36 @@ export interface SkillReference {
 export interface PlanSource { readonly prompt: string; readonly cwd: string; readonly skills: readonly SkillReference[] }
 export interface SafeError { readonly code: string; readonly message: string }
 
+export type PlanOperation = "initial" | "revision";
+export interface ClarificationOption { readonly id: string; readonly label: string }
+export interface ClarificationQuestion { readonly id: string; readonly prompt: string; readonly options: readonly ClarificationOption[] }
+export type ClarificationAnswer = { readonly kind: "option"; readonly optionId: string } | { readonly kind: "custom"; readonly text: string };
+export interface ClarificationAnswerEntry { readonly questionId: string; readonly answer: ClarificationAnswer }
+export interface ClarificationOrigin {
+  readonly operation: PlanOperation;
+  readonly baseDocumentRevision: number;
+  readonly selectedAnnotationIds: readonly string[];
+  readonly instruction?: string;
+}
+export interface PendingClarification extends ClarificationOrigin {
+  readonly id: string;
+  readonly questions: readonly ClarificationQuestion[];
+}
+export interface AnsweredClarification {
+  readonly id: string;
+  readonly questions: readonly ClarificationQuestion[];
+  readonly answers: readonly ClarificationAnswerEntry[];
+  readonly answeredAt: string;
+}
+export interface ClarificationTranscript {
+  readonly history: readonly AnsweredClarification[];
+  readonly origin?: ClarificationOrigin;
+  readonly pending?: PendingClarification;
+}
+
 export interface GenerationJob {
   readonly jobId: string;
-  readonly operation: "initial" | "revision";
+  readonly operation: PlanOperation;
   readonly baseDocumentRevision: number;
   readonly selectedAnnotationIds: readonly string[];
   readonly instruction?: string;
@@ -69,6 +96,7 @@ export interface RevisionPlanResultDraft {
   readonly document: ModelRevisionPlanDocumentDraft;
   readonly addressedAnnotationIds: readonly string[];
 }
+export interface ClarificationResultDraft { readonly kind: "clarification"; readonly questions: readonly ClarificationQuestion[] }
 export interface TextSelector {
   readonly field: "title" | "body";
   readonly start: number;
@@ -115,6 +143,10 @@ interface PlanSessionBase {
   readonly execution: ExecutionKind;
   readonly generation: { readonly mode: GenerationMode };
   readonly generationJob?: GenerationJob;
+  /** Exact writer-authored Markdown for the committed document. Never derive acceptance from mutable plan.md. */
+  readonly committedMarkdown?: string;
+  /** Private clarification history. Browser projections expose only the current pending questions. */
+  readonly clarifications?: ClarificationTranscript;
   readonly lastError?: SafeError;
 }
 export interface EmptyPlanSession extends PlanSessionBase {

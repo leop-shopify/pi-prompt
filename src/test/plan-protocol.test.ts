@@ -62,6 +62,14 @@ describe("browser protocol", () => {
     expect(JSON.stringify(snapshot)).not.toContain("targetSnapshot");
   });
 
+  it("projects only pending clarification questions and never private origin or answers", () => {
+    const pending = { id: "round-public", operation: "revision" as const, baseDocumentRevision: 2, selectedAnnotationIds: ["note"], instruction: "PRIVATE REVISION INSTRUCTION", questions: [{ id: "question-public", prompt: "Choose?", options: [{ id: "choice-a", label: "A" }, { id: "choice-b", label: "B" }] }] };
+    const state = { ...privateState, status: "awaiting-clarification" as const, generationJob: undefined, clarifications: { history: [{ id: "old-round", questions: pending.questions, answers: [{ questionId: "question-public", answer: { kind: "custom" as const, text: "PRIVATE ANSWER" } }], answeredAt: "2026-07-10T00:01:00.000Z" }], origin: { operation: "revision" as const, baseDocumentRevision: 2, selectedAnnotationIds: ["note"], instruction: "PRIVATE REVISION INSTRUCTION" }, pending } };
+    const snapshot = toPublicSnapshot(state);
+    expect(snapshot.clarification).toEqual({ id: "round-public", context: "revision", baseDocumentRevision: 2, questions: [{ id: "question-public", prompt: "Choose?", options: [{ id: "choice-a", label: "A" }, { id: "choice-b", label: "B" }] }] });
+    const encoded = JSON.stringify(snapshot); for (const secret of ["PRIVATE ANSWER", "PRIVATE REVISION INSTRUCTION", "selectedAnnotationIds", "old-round"]) expect(encoded).not.toContain(secret);
+  });
+
   it("uses one exact strong state ETag grammar", () => {
     expect(stateEtag(42)).toBe('"pi-plan-state-42"');
     expect(parseStateIfMatch('"pi-plan-state-42"')).toBe(42);
@@ -75,6 +83,9 @@ describe("browser protocol", () => {
     expect(parseMutation("annotation-patch", { requestId: id, update: { status: "addressed" } })).toMatchObject({ ok: false, code: "invalid-status" });
     expect(parseMutation("annotation-patch", { requestId: id, update: { status: "orphaned" } })).toMatchObject({ ok: false, code: "invalid-status" });
     expect(parseMutation("accept", { requestId: id, stateVersion: 9, documentRevision: 2, confirmed: false }).ok).toBe(false);
+    expect(parseMutation("clarification-answers", { requestId: id, clarificationId: "round", answers: [{ questionId: "q", answer: { kind: "option", optionId: "a" } }] }).ok).toBe(true);
+    expect(parseMutation("clarification-answers", { requestId: id, clarificationId: "round", answers: [{ questionId: "q", answer: { kind: "custom", text: "   " } }] })).toMatchObject({ ok: false, code: "invalid-answers" });
+    expect(parseMutation("clarification-answers", { requestId: id, clarificationId: "round", answers: [{ questionId: "q", answer: { kind: "option", optionId: "a" } }, { questionId: "q", answer: { kind: "option", optionId: "b" } }] })).toMatchObject({ ok: false, code: "invalid-answers" });
   });
 
   it("fingerprints canonical key order, route kind, and precondition", () => {

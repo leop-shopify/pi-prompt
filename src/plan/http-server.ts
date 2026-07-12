@@ -4,10 +4,13 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { Socket } from "node:net";
 import { fileURLToPath } from "node:url";
 import type { PlanController, PlanControllerResult } from "./controller.js";
+import { renderPlanMarkdown } from "./classification.js";
+import { PLAN_LIMITS } from "./schema.js";
+import { MAX_WRITER_RESULT_BYTES } from "./session-files.js";
+import type { WriterSubmissionKind } from "./generator.js";
 import { EventLedger } from "./event-ledger.js";
 import { readStrictJsonBody, rejectUnexpectedBody, validateRequestHead, type RequestFailure } from "./http-request.js";
 import { PLAN_REVIEW_HTML } from "./html.js";
-import { defaultPlanRoot, readPlanFile } from "./session-files.js";
 import {
   MAX_LONG_POLL_MS, mutationFingerprint, parseMutation, parseStateIfMatch, stateEtag, toPublicSnapshot,
   type MutationRequest, type PublicActivity, type PublicSnapshot, type RequestKind,
@@ -16,6 +19,7 @@ import { ReplayLedger } from "./replay-ledger.js";
 
 export const PLAN_SERVER_IDLE_MS = 30 * 60 * 1_000;
 export const PLAN_SERVER_HOST = "127.0.0.1";
+export const WRITER_SUBMISSION_PATH = "/api/v1/writer-results";
 export const SECURITY_HEADERS = Object.freeze({
   "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
   "Cache-Control": "no-store",
@@ -134,6 +138,11 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
     response.once("close", () => { if (!response.writableFinished) activeRequests -= 1; });
     const method = request.method ?? "";
     const mutation = method === "POST" || method === "PATCH";
+    if ((request.url ?? "").split("?", 1)[0] === WRITER_SUBMISSION_PATH) {
+      try { await handleWriterSubmission(request, response); }
+      catch { send(response, { status: 500, body: errorBody("internal-error", "The request could not be completed.") }); }
+      return;
+    }
     // Mutations already accepted by the HTTP stack still enter replay/serialization: exact duplicates
     // share their terminal response, while distinct queued work observes closing inside dispatch.
     if (closing && !mutation) { send(response, { status: 503, body: errorBody("closing", "The review listener is closing.") }); return; }
@@ -167,7 +176,35 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
   if (!address || typeof address === "string" || address.address !== PLAN_SERVER_HOST) { await close(); throw new Error("loopback-bind-failed"); }
   host = `${PLAN_SERVER_HOST}:${address.port}`;
   origin = `http://${host}`;
+  const writerEndpoint = `${origin}${WRITER_SUBMISSION_PATH}`;
+  let configured: PlanControllerResult;
+  try { configured = options.controller.configureWriterEndpoint(writerEndpoint); }
+  catch { await close(); throw new Error("writer-endpoint-configuration-failed"); }
+  if (!configured.ok) { await close(); throw new Error(configured.error.code); }
   resetIdle();
+
+  async function handleWriterSubmission(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const head = validateWriterHead(request, host, origin, capability);
+    if (!head.ok) { sendFailure(response, head); return; }
+    if (request.method !== "POST") { methodNotAllowed(response, ["POST"]); return; }
+    if (head.value.searchParams.size !== 0) { send(response, { status: 400, body: errorBody("invalid-request", "The writer submission URL is invalid.") }); return; }
+    const resultHeader = request.headers["x-pi-prompt-result"];
+    const kind: WriterSubmissionKind | null = resultHeader === "plan" || resultHeader === "clarification" ? resultHeader : null;
+    if (!kind) { send(response, { status: 422, body: errorBody("unsupported-result", "The writer result type is unsupported.") }); return; }
+    const expectedType = kind === "plan" ? "text/markdown" : "application/json";
+    if (request.headers["content-type"] !== expectedType) { send(response, { status: 415, body: errorBody("unsupported-media-type", "The writer result Content-Type is unsupported.") }); return; }
+    const maximum = kind === "plan" ? PLAN_LIMITS.committedMarkdownBytes : MAX_WRITER_RESULT_BYTES;
+    const body = await readWriterBody(request, maximum);
+    if (!body.ok) { sendFailure(response, body); return; }
+    const submitted = await options.controller.submitWriterResult({ attemptId: head.value.attemptId, kind, body: body.value });
+    if (!submitted.ok) {
+      const unauthorized = submitted.error.code === "writer-submission-stale" || submitted.error.code === "writer-attempt-rejected";
+      send(response, { status: unauthorized ? 401 : 422, body: errorBody(submitted.error.code, submitted.error.message) });
+      return;
+    }
+    resetIdle();
+    send(response, { status: 202, body: { accepted: true } });
+  }
 
   async function route(request: IncomingMessage, response: ServerResponse, pathname: string, searchParams: URLSearchParams): Promise<void> {
     const method = request.method ?? "";
@@ -187,10 +224,9 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
       if ([...searchParams].length || rejectUnexpectedBody(request)) { send(response, { status: 400, body: errorBody("invalid-request", "The request is invalid.") }); return; }
       const state = options.controller.snapshot();
       if (!state) { send(response, { status: 404, body: errorBody("plan-unavailable", "The plan file is not available yet.") }); return; }
-      try {
-        const markdown = await readPlanFile(options.planRoot ?? defaultPlanRoot(), state.id);
-        send(response, { status: 200, body: markdown, headers: { "Content-Type": "text/markdown; charset=utf-8" } });
-      } catch { send(response, { status: 503, body: errorBody("plan-unavailable", "The saved plan file could not be read.") }); }
+      if (!state.document) { send(response, { status: 404, body: errorBody("plan-unavailable", "No committed plan is available yet.") }); return; }
+      const markdown = state.committedMarkdown ?? renderPlanMarkdown(state.document);
+      send(response, { status: 200, body: markdown, headers: { "Content-Type": "text/markdown; charset=utf-8" } });
       return;
     }
     if (pathname === "/api/v1/snapshot") {
@@ -261,6 +297,12 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
       const dispatched = options.controller.dispatchGeneration(started.value.jobId);
       if (!dispatched.ok) return controllerFailure(dispatched);
       return withSnapshot(202, { job: { id: started.value.jobId, status: "revising" } });
+    } else if (kind === "clarification-answers" && "clarificationId" in body && "answers" in body) {
+      if (state.status !== "awaiting-clarification" || state.clarifications?.pending?.id !== body.clarificationId) return conflictRecord();
+      const started = await options.controller.answerClarification({ expectedStateVersion: expected, clarificationId: body.clarificationId, answers: body.answers });
+      if (!started.ok) return controllerFailure(started);
+      const dispatched = options.controller.dispatchGeneration(started.value.jobId); if (!dispatched.ok) return controllerFailure(dispatched);
+      return withSnapshot(202, { accepted: true, job: { operation: state.clarifications.pending.operation, status: state.clarifications.pending.operation === "initial" ? "generating" : "revising" } });
     } else if (kind === "accept" && "documentRevision" in body && "confirmed" in body) {
       result = await options.controller.accept({ expectedStateVersion: expected, documentRevision: body.documentRevision, confirmed: body.confirmed });
       if (!result.ok) return result.error.code === "stage-failed"
@@ -288,7 +330,7 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
   function sendConflict(response: ServerResponse): void { send(response, conflictRecord()); }
   function controllerFailure(result: { readonly ok: false; readonly error: { readonly code: string; readonly message: string } }): ResponseRecord {
     if (result.error.code === "state-conflict") return conflictRecord();
-    const status = result.error.code === "persistence-failed" || result.error.code === "controller-closed" ? 503 : result.error.code === "job-active" || result.error.code === "terminal-state" ? 409 : 422;
+    const status = result.error.code === "persistence-failed" || result.error.code === "controller-closed" ? 503 : ["job-active", "terminal-state", "clarification-conflict", "clarification-read-only"].includes(result.error.code) ? 409 : 422;
     return { status, body: errorBody(result.error.code, result.error.message) };
   }
 
@@ -299,10 +341,54 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
   });
 }
 
+function validateWriterHead(
+  request: IncomingMessage, host: string, origin: string, browserCapability: string,
+): RequestFailure | { readonly ok: true; readonly value: { readonly searchParams: URLSearchParams; readonly attemptId: string } } {
+  const rawUrl = request.url ?? "";
+  if (Buffer.byteLength(rawUrl, "utf8") > 2_048 || !rawUrl.startsWith("/") || rawUrl.startsWith("//") || /[\0\r\n]/u.test(rawUrl)) return requestFailure(400, "invalid-url", "The request URL is invalid.");
+  if (request.rawHeaders.length / 2 > 64 || Buffer.byteLength(request.rawHeaders.join("\n"), "utf8") > 16_384) return requestFailure(431, "headers-too-large", "Request headers are too large.");
+  const unique = new Set(["host", "authorization", "content-type", "content-length", "content-encoding", "transfer-encoding", "x-pi-prompt-result"]);
+  const seen = new Set<string>();
+  for (let index = 0; index < request.rawHeaders.length; index += 2) {
+    const name = request.rawHeaders[index]?.toLowerCase();
+    if (!name || !unique.has(name)) continue;
+    if (seen.has(name)) return requestFailure(400, "duplicate-header", "Duplicate request headers are not allowed.");
+    seen.add(name);
+  }
+  if (request.headers.host !== host) return requestFailure(400, "invalid-host", "The request host is invalid.");
+  let url: URL;
+  try { url = new URL(rawUrl, origin); } catch { return requestFailure(400, "invalid-url", "The request URL is invalid."); }
+  if (url.origin !== origin || url.pathname !== WRITER_SUBMISSION_PATH || url.username || url.password || url.hash) return requestFailure(400, "invalid-url", "The request URL is invalid.");
+  const authorization = request.headers.authorization;
+  if (typeof authorization !== "string" || !authorization.startsWith("Bearer ")) return requestFailure(401, "unauthorized", "Authentication is required.");
+  const attemptId = authorization.slice("Bearer ".length);
+  if (attemptId === browserCapability || !/^[A-Za-z0-9_-]{16,64}$/u.test(attemptId)) return requestFailure(401, "unauthorized", "Authentication is required.");
+  return { ok: true, value: { searchParams: url.searchParams, attemptId } };
+}
+async function readWriterBody(request: IncomingMessage, maximum: number): Promise<RequestFailure | { readonly ok: true; readonly value: Buffer }> {
+  if (request.headers["content-encoding"] !== undefined || request.headers["transfer-encoding"] !== undefined) return requestFailure(415, "encoding-not-supported", "Encoded request bodies are not supported.");
+  const lengthHeader = request.headers["content-length"];
+  if (typeof lengthHeader !== "string" || !/^(0|[1-9]\d*)$/u.test(lengthHeader)) return requestFailure(411, "length-required", "A valid Content-Length is required.");
+  const declared = Number(lengthHeader);
+  if (!Number.isSafeInteger(declared) || declared < 1 || declared > maximum) return requestFailure(declared > maximum ? 413 : 400, declared > maximum ? "body-too-large" : "empty-body", declared > maximum ? "The request body is too large." : "The request body is empty.");
+  const chunks: Buffer[] = []; let total = 0;
+  try {
+    for await (const raw of request) {
+      const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw); total += chunk.length;
+      if (total > maximum || total > declared) { request.resume(); return requestFailure(413, "body-too-large", "The request body is too large."); }
+      chunks.push(chunk);
+    }
+  } catch { return requestFailure(400, "body-read-failed", "The request body could not be read."); }
+  if (total !== declared) return requestFailure(400, "length-mismatch", "The request body length is invalid.");
+  return { ok: true, value: Buffer.concat(chunks, total) };
+}
+function requestFailure(status: number, code: string, message: string): RequestFailure { return { ok: false, status, code, message }; }
+
 function mutationDefinition(pathname: string, annotationMatch: RegExpExecArray | null): { readonly method: "POST" | "PATCH"; readonly kind: RequestKind } | null {
   if (pathname === "/api/v1/annotations") return { method: "POST", kind: "annotation-create" };
   if (annotationMatch) return { method: "PATCH", kind: "annotation-patch" };
   if (pathname === "/api/v1/revision-requests") return { method: "POST", kind: "revision" };
+  if (pathname === "/api/v1/clarification-answers") return { method: "POST", kind: "clarification-answers" };
   if (pathname === "/api/v1/accept") return { method: "POST", kind: "accept" };
   if (pathname === "/api/v1/cancel") return { method: "POST", kind: "cancel" };
   if (pathname === "/api/v1/reopen-in-pi") return { method: "POST", kind: "reopen" };

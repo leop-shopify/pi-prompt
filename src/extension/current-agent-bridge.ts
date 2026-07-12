@@ -1,16 +1,17 @@
 import { randomBytes } from "node:crypto";
-import { unwatchFile, watchFile, type Stats } from "node:fs";
 import type {
   AgentEndEvent, BeforeAgentStartEvent, ExtensionAPI, InputEvent, ToolCallEvent, ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
-  validateGeneratorInput, validateGeneratorSubmission,
-  type DispatchablePlanGenerator, type PlanDispatchResult, type PlanGeneratorInput, type PlanGeneratorResult, type PrivateSkillContent,
+  validateClarificationSubmission, validateGeneratorInput, validateGeneratorSubmission,
+  type DispatchablePlanGenerator, type PlanDispatchResult, type PlanGeneratorInput, type PlanGeneratorResult,
+  type PrivateSkillContent, type WriterSubmissionInput,
 } from "../plan/generator.js";
 import { GENERATION_PROFILES, loadPlanLevel } from "../plan/modes.js";
 import { planOutcomeFromMarkdown } from "../plan/markdown-plan.js";
-import { annotationsFilePath, defaultPlanRoot, planFilePath, readPlanFile } from "../plan/session-files.js";
+import { parseStrictJsonObject } from "../plan/raw-json.js";
+import { MAX_WRITER_RESULT_BYTES, annotationsFilePath, defaultPlanRoot, planFilePath, writerQuestionsFilePath } from "../plan/session-files.js";
 import {
   TeamsPlanningAdapter, detectTeamsPlanningCapability, observeTeamsEvents,
   type DelegatedPrimaryStatus, type PlanningModelInfo, type TeamsAdapterPhase,
@@ -40,6 +41,7 @@ export interface CurrentAgentBridgeOptions {
   readonly loadLevel?: typeof loadPlanLevel;
   readonly primaryNameFactory?: () => string;
   readonly correlationFactory?: () => string;
+  readonly attemptFactory?: () => string;
   readonly clock?: () => Date;
   readonly planRoot?: string;
 }
@@ -64,8 +66,6 @@ interface Gate {
   skills?: readonly PrivateSkillContent[];
   teams?: TeamsPlanningAdapter;
   stopReportObservation?: () => void;
-  stopPlanWatch?: () => void;
-  baselinePlan?: string | null;
   privateReport?: string;
   correctionFeedback?: string;
   correctionAttempts: number;
@@ -74,9 +74,10 @@ interface Gate {
   sentRun?: RunKind;
   queuedRun?: RunKind;
   activeRun?: RunKind;
+  activeAttempt: string;
+  writerEndpoint?: string;
   marker?: string;
 }
-
 type BridgeAPI = Pick<ExtensionAPI, "registerTool" | "sendMessage" | "sendUserMessage" | "on" | "getActiveTools" | "getAllTools" | "events">;
 
 export class CurrentAgentPlanBridge {
@@ -85,12 +86,13 @@ export class CurrentAgentPlanBridge {
   readonly #loadLevel: typeof loadPlanLevel;
   readonly #primaryNameFactory: () => string;
   readonly #correlationFactory: () => string;
+  readonly #attemptFactory: () => string;
   readonly #clock: () => Date;
   readonly #planRoot: string;
   #epoch = 0;
   readonly #issuedNonces = new Set<string>();
+  readonly #issuedAttempts = new Set<string>();
   #active: Gate | null = null;
-  #lastSettledNonce: string | null = null;
 
   constructor(pi: BridgeAPI, options: CurrentAgentBridgeOptions) {
     this.#pi = pi;
@@ -98,14 +100,15 @@ export class CurrentAgentPlanBridge {
     this.#loadLevel = options.loadLevel ?? loadPlanLevel;
     this.#primaryNameFactory = options.primaryNameFactory ?? (() => `planner-${randomToken()}`);
     this.#correlationFactory = options.correlationFactory ?? randomToken;
+    this.#attemptFactory = options.attemptFactory ?? randomToken;
     this.#clock = options.clock ?? (() => new Date());
     this.#planRoot = options.planRoot ?? defaultPlanRoot();
     pi.registerTool({
       name: PLAN_SUBMIT_TOOL_NAME,
       label: "Submit plan",
-      description: "Submit the one structured initial or revision plan requested by pi-prompt.",
+      description: "Legacy compatibility signal. Writer results are accepted only through the authenticated private HTTP handoff.",
       parameters: Type.Object({ nonce: Type.String({ minLength: 16, maxLength: 128 }), result: Type.Unknown() }, { additionalProperties: false }),
-      execute: async (_toolCallId, params) => this.#executeSubmit(params.nonce, params.result),
+      execute: async () => toolFailure("http-submission-required", "Submit the exact writer bytes through the private HTTP endpoint."),
     });
     pi.on("input", (event) => this.handleInput(event));
     pi.on("before_agent_start", (event) => this.beforeAgentStart(event));
@@ -117,8 +120,15 @@ export class CurrentAgentPlanBridge {
 
   createGenerator(isIdle: () => boolean, activity?: CurrentAgentActivity): DispatchablePlanGenerator {
     const owner = Symbol("current-agent-plan-owner");
+    let writerEndpoint: string | undefined;
     return {
-      generate: (input) => this.#generate(owner, input, activity),
+      generate: (input) => this.#generate(owner, input, activity, writerEndpoint),
+      configureWriterEndpoint: (url) => {
+        const configured = this.#configureWriterEndpoint(owner, url);
+        if (configured.ok) writerEndpoint = url;
+        return configured;
+      },
+      submitWriterResult: (input) => this.#submitWriterResult(owner, input),
       dispatch: (jobId) => this.#dispatch(owner, jobId, isIdle),
       close: () => this.#closeOwner(owner),
     };
@@ -141,7 +151,7 @@ export class CurrentAgentPlanBridge {
     gate.marker = undefined;
     if (run === "correction") this.#activity(gate, "recovering", gate.teams?.primaryStatus ?? "not-started");
     const content = gate.adapterKind === "direct"
-      ? this.#directMessage(gate)
+      ? this.#directMessage(gate, run)
       : this.#orchestrationMessage(run);
     return { message: { customType: "pi-prompt-plan-request", content, display: false } };
   }
@@ -154,6 +164,7 @@ export class CurrentAgentPlanBridge {
       gate.pendingInjectedRun = undefined;
       gate.injectedContent = undefined;
       gate.activeRun = "correction";
+      gate.correctionFeedback = undefined;
       this.#activity(gate, "recovering", gate.teams.primaryStatus);
     }
   }
@@ -176,10 +187,18 @@ export class CurrentAgentPlanBridge {
     const ended = gate.activeRun;
     gate.activeRun = undefined;
     if (gate.adapterKind === "direct") {
-      this.#settle(gate, failed("missing-plan-submission", "The correlated current-agent run ended without submitting a plan."));
+      if (gate.correctionAttempts === 1 && gate.correctionFeedback && ended === "dispatch") {
+        this.#sendRun(gate, "correction");
+        return;
+      }
+      this.#settle(gate, failed("missing-plan-submission", "The correlated current-agent run ended without an accepted HTTP submission."));
       return;
     }
     if (ended === "dispatch" || ended === "correction") {
+      if (gate.correctionFeedback && gate.correctionAttempts === 1 && gate.privateReport !== undefined) {
+        this.#beginCorrection(gate);
+        return;
+      }
       if (gate.teams?.primaryStatus === "waiting" || gate.privateReport !== undefined) {
         if (gate.privateReport === undefined) this.#activity(gate, "waiting-report", "waiting");
         return;
@@ -192,13 +211,15 @@ export class CurrentAgentPlanBridge {
     }
   }
 
-  async #generate(owner: symbol, input: PlanGeneratorInput, activity?: CurrentAgentActivity): Promise<PlanGeneratorResult> {
+  async #generate(owner: symbol, input: PlanGeneratorInput, activity?: CurrentAgentActivity, writerEndpoint?: string): Promise<PlanGeneratorResult> {
     const validated = validateGeneratorInput(input);
     if (!validated.ok) return failed("invalid-generator-input", "The plan generation input is invalid.");
     if (this.#active && !["settled", "closed"].includes(this.#active.state)) return failed("generation-active", "Another plan generation request is active.");
     const nonce = this.#nonceFactory();
     if (!/^[A-Za-z0-9_-]{16,128}$/.test(nonce) || this.#issuedNonces.has(nonce)) return failed("invalid-nonce", "The plan submission nonce could not be created.");
     this.#issuedNonces.add(nonce);
+    const activeAttempt = this.#nextAttempt();
+    if (!activeAttempt) return failed("attempt-identity-unavailable", "The private writer attempt identity could not be created.");
     const profile = GENERATION_PROFILES[input.session.generation.mode];
     const adapterKind: PlanningAdapterKind = detectTeamsPlanningCapability(this.#pi, profile.modelSlot) ? "delegated" : "direct";
     let resolve!: (result: PlanGeneratorResult) => void;
@@ -206,7 +227,7 @@ export class CurrentAgentPlanBridge {
     const gate: Gate = {
       owner, epoch: ++this.#epoch, nonce, input, resolve, activity, adapterKind,
       startedAt: this.#clock().toISOString(), budgetMinutes: profile.timeBudgetMinutes, model: { slot: profile.modelSlot },
-      state: "preparing", dispatchRequested: false, correctionAttempts: 0,
+      state: "preparing", dispatchRequested: false, correctionAttempts: 0, activeAttempt, ...(writerEndpoint ? { writerEndpoint } : {}),
     };
     this.#active = gate;
     if (adapterKind === "delegated" && !this.#configureTeams(gate)) return completion;
@@ -227,9 +248,8 @@ export class CurrentAgentPlanBridge {
       primaryName, correlation, cwd: gate.input.session.source.cwd,
       mission: "pending-controller-mission",
       modelSlot: GENERATION_PROFILES[gate.input.session.generation.mode].modelSlot,
-      submitToolName: PLAN_SUBMIT_TOOL_NAME,
       onPhase: (phase) => this.#teamsPhase(gate, phase),
-      onReport: (report) => { void this.#primaryReport(gate, report); },
+      onReport: (report) => { this.#primaryReport(gate, report); },
       onProgress: (status, updatedAt) => this.#primaryProgress(gate, status, updatedAt),
       onModel: (model) => { gate.model = model; this.#activity(gate, "primary-active", gate.teams?.primaryStatus ?? "active"); },
       now: () => this.#clock().getTime(),
@@ -246,24 +266,38 @@ export class CurrentAgentPlanBridge {
       if (!loaded.ok) { this.#settle(gate, failed("skill-context-changed", "Private skill context changed during generation.")); return; }
       gate.levelMarkdown = levelMarkdown;
       gate.skills = loaded.value;
-      try { gate.baselinePlan = await readPlanFile(this.#planRoot, gate.input.session.id); }
-      catch { gate.baselinePlan = null; }
-      this.#watchPlanFile(gate);
-      if (gate.teams && !gate.teams.setMission(this.#childMission(gate))) {
-        this.#settle(gate, failed("delegation-mission-unavailable", "The private primary planner mission could not be prepared."));
-        return;
-      }
-      gate.state = "ready";
-      if (gate.dispatchRequested) this.#sendRun(gate, "dispatch");
+      this.#prepareReadyGate(gate);
     } catch {
       if (this.#active === gate) this.#settle(gate, failed("plan-level-unavailable", "The selected planning level could not be loaded."));
     }
   }
 
 
+  #configureWriterEndpoint(owner: symbol, url: string): PlanDispatchResult {
+    if (!validWriterEndpoint(url)) return dispatchFailed("invalid-writer-endpoint", "The private writer endpoint is invalid.");
+    const gate = this.#active;
+    if (gate?.owner === owner && this.#isOpen(gate)) {
+      if (gate.dispatchRequested && gate.writerEndpoint !== url) return dispatchFailed("writer-endpoint-locked", "The active writer endpoint cannot be replaced after dispatch.");
+      gate.writerEndpoint = url;
+      this.#prepareReadyGate(gate);
+    }
+    return { ok: true, value: undefined };
+  }
+
+  #prepareReadyGate(gate: Gate): void {
+    if (!this.#isOpen(gate) || !gate.levelMarkdown || !gate.skills || !gate.writerEndpoint || gate.state !== "preparing") return;
+    if (gate.teams && !gate.teams.setMission(this.#childMission(gate))) {
+      this.#settle(gate, failed("delegation-mission-unavailable", "The private primary planner mission could not be prepared."));
+      return;
+    }
+    gate.state = "ready";
+    if (gate.dispatchRequested) this.#sendRun(gate, "dispatch");
+  }
+
   #dispatch(owner: symbol, jobId: string, isIdle: () => boolean): PlanDispatchResult {
     const gate = this.#active;
     if (!gate || gate.owner !== owner || gate.input.jobId !== jobId || gate.state === "closed" || gate.state === "settled") return dispatchFailed("stale-generation-job", "The generation job is no longer active.");
+    if (!gate.writerEndpoint) return dispatchFailed("writer-endpoint-unavailable", "The private writer endpoint is not configured.");
     if (gate.dispatchRequested) return dispatchFailed("duplicate-dispatch", "The generation job was already dispatched.");
     gate.dispatchRequested = true;
     gate.pendingIdle = isIdle;
@@ -304,36 +338,67 @@ export class CurrentAgentPlanBridge {
     }
   }
 
-  async #executeSubmit(nonce: string, result: unknown) {
-    const gate = this.#active;
-    if (!gate || nonce !== gate.nonce) {
-      const code = nonce === this.#lastSettledNonce ? "duplicate-submission" : "stale-submission";
-      return toolFailure(code, "This plan submission is not active.");
+  async #submitWriterResult(owner: symbol, input: WriterSubmissionInput): Promise<PlanDispatchResult> {
+    const gate = this.#active; const job = gate?.input.session.generationJob;
+    if (!gate || gate.owner !== owner || !this.#isOpen(gate) || !gate.skills || !job
+      || input.sessionId !== gate.input.session.id || input.jobId !== gate.input.jobId
+      || input.operation !== gate.input.operation || input.baseDocumentRevision !== job.baseDocumentRevision
+      || input.attemptId !== gate.activeAttempt || !this.#submissionRunActive(gate)) {
+      return dispatchFailed("writer-attempt-rejected", "The writer submission is not active.");
     }
-    if (gate.state === "settled") return toolFailure("duplicate-submission", "This plan was already submitted.");
-    if (!this.#isOpen(gate) || !gate.skills || !this.#submissionRunActive(gate)) return toolFailure("submission-not-started", "The correlated synthesis run has not begun.");
     this.#activity(gate, "validating", gate.teams?.primaryStatus ?? "direct");
     let validated: PlanGeneratorResult;
-    if (result === "plan saved") {
-      try {
-        const markdown = await readPlanFile(this.#planRoot, gate.input.session.id);
-        const parsed = planOutcomeFromMarkdown(markdown, gate.input.operation, gate.input.session, gate.input.selectedAnnotationIds);
-        validated = parsed.ok
-          ? validateGeneratorSubmission(parsed.value, gate.input.operation, gate.input.session, gate.skills)
-          : failed("invalid-plan-file", parsed.issues.map((issue) => `${issue.path} [${issue.code}] ${issue.message}`).join("; "));
-      } catch { validated = failed("missing-plan-file", "The plan.md file was not saved correctly."); }
-    } else validated = validateGeneratorSubmission(result, gate.input.operation, gate.input.session, gate.skills);
-    if (!validated.ok) {
-      this.#activity(gate, gate.adapterKind === "delegated" ? "synthesizing" : "direct-fallback", gate.teams?.primaryStatus ?? "direct");
-      return toolFailure(validated.error.code, validated.error.message);
+    if (input.kind === "plan") {
+      let markdown: string;
+      try { markdown = new TextDecoder("utf-8", { fatal: true }).decode(input.body); }
+      catch { return this.#rejectWriterResult(gate, failed("invalid-utf8", "The plan submission must be valid UTF-8.")); }
+      const parsed = planOutcomeFromMarkdown(markdown, gate.input.operation, gate.input.session, gate.input.selectedAnnotationIds);
+      validated = parsed.ok
+        ? validateGeneratorSubmission(parsed.value, gate.input.operation, gate.input.session, gate.skills)
+        : failed("invalid-plan-file", parsed.issues.map((issue) => `${issue.path} [${issue.code}] ${issue.message}`).join("; "));
+      if (validated.ok && validated.outcome.kind !== "clarification") validated = { ok: true, outcome: { ...validated.outcome, markdown } };
+    } else {
+      let text: string;
+      try { text = new TextDecoder("utf-8", { fatal: true }).decode(input.body); }
+      catch {
+        this.#settle(gate, failed("invalid-writer-result", "The writer could not submit a valid clarification batch."));
+        return dispatchFailed("invalid-utf8", "The clarification submission must be valid UTF-8.");
+      }
+      const parsed = parseStrictJsonObject(text, { maxBytes: MAX_WRITER_RESULT_BYTES, maxDepth: 8 });
+      validated = parsed.ok
+        ? validateClarificationSubmission(parsed.value, gate.input.session, gate.skills)
+        : failed("invalid-clarification", parsed.issues.map((issue) => `${issue.code}: ${issue.message}`).join("; "));
     }
-    this.#activity(gate, "completed", "completed");
-    this.#settle(gate, validated, false);
-    return { content: [{ type: "text" as const, text: "Plan accepted for durable controller validation and browser review." }], details: { code: "accepted", accepted: true } };
+    if (!validated.ok) {
+      if (input.kind === "clarification") {
+        this.#settle(gate, failed("invalid-writer-result", "The writer could not submit a valid clarification batch."));
+        return dispatchFailed(validated.error.code, validated.error.message);
+      }
+      return this.#rejectWriterResult(gate, validated);
+    }
+    this.#activity(gate, "completed", "completed"); this.#settle(gate, validated, false);
+    return { ok: true, value: undefined };
+  }
+
+  #rejectWriterResult(gate: Gate, invalid: PlanGeneratorResult & { readonly ok: false }): PlanDispatchResult {
+    if (gate.correctionAttempts >= 1 || gate.input.signal.aborted) {
+      this.#settle(gate, failed("invalid-writer-result", "The writer could not submit a valid result."));
+      return dispatchFailed(invalid.error.code, invalid.error.message);
+    }
+    const correctionAttempt = this.#nextAttempt();
+    if (!correctionAttempt) {
+      this.#settle(gate, failed("attempt-identity-unavailable", "The private correction attempt identity could not be created."));
+      return dispatchFailed("attempt-identity-unavailable", "The private correction attempt identity could not be created.");
+    }
+    gate.activeAttempt = correctionAttempt; gate.correctionAttempts = 1; gate.correctionFeedback = invalid.error.message;
+    this.#activity(gate, "recovering", gate.teams?.primaryStatus ?? "direct");
+    if (gate.adapterKind === "delegated") this.#beginCorrection(gate);
+    return dispatchFailed(invalid.error.code, invalid.error.message);
   }
 
   #submissionRunActive(gate: Gate): boolean {
-    return gate.adapterKind === "direct" && gate.activeRun === "dispatch";
+    if (gate.adapterKind === "direct") return gate.activeRun === "dispatch" || gate.activeRun === "correction";
+    return gate.teams?.primaryCount === 1 && ["active", "waiting", "report-received"].includes(gate.teams.primaryStatus);
   }
 
   #teamsPhase(gate: Gate, phase: TeamsAdapterPhase): void {
@@ -346,69 +411,17 @@ export class CurrentAgentPlanBridge {
     this.#activity(gate, "waiting-report", gate.teams.primaryStatus, { summary, updatedAt: new Date(updatedAt).toISOString() });
   }
 
-  #watchPlanFile(gate: Gate): void {
-    const path = planFilePath(this.#planRoot, gate.input.session.id);
-    let reading = false;
-    const inspect = async (): Promise<void> => {
-      if (reading || !this.#isOpen(gate) || !gate.skills) return;
-      reading = true;
-      try {
-        const markdown = await readPlanFile(this.#planRoot, gate.input.session.id);
-        if (!this.#isOpen(gate) || markdown === gate.baselinePlan) return;
-        const parsed = planOutcomeFromMarkdown(markdown, gate.input.operation, gate.input.session, gate.input.selectedAnnotationIds);
-        if (!parsed.ok) return;
-        const validated = validateGeneratorSubmission(parsed.value, gate.input.operation, gate.input.session, gate.skills);
-        if (!validated.ok) return;
-        this.#activity(gate, "completed", "completed");
-        this.#settle(gate, validated, false);
-      } catch { /* the writer may still be creating or replacing plan.md */ }
-      finally { reading = false; }
-    };
-    const changed = (current: Stats, previous: Stats): void => {
-      if (current.mtimeMs !== previous.mtimeMs || current.size !== previous.size) void inspect();
-    };
-    watchFile(path, { interval: 250, persistent: false }, changed);
-    gate.stopPlanWatch = () => unwatchFile(path, changed);
+  #primaryReport(gate: Gate, report: string): void {
+    if (!this.#isOpen(gate) || gate.privateReport !== undefined || !gate.skills) return;
+    gate.privateReport = report; // Cleanup/advisory signal only; correlated HTTP bytes are sole result authority.
+    this.#activity(gate, "report-received", "report-received");
+    this.#beginCorrection(gate);
   }
 
-  async #primaryReport(gate: Gate, report: string): Promise<void> {
-    if (!this.#isOpen(gate) || gate.privateReport !== undefined || !gate.skills) return;
-    gate.privateReport = report;
-    this.#activity(gate, "validating", "report-received");
-    let validationError: string | undefined;
-    if (report.trim() !== "plan saved") validationError = "The writer must report exactly `plan saved`.";
-    let validated: PlanGeneratorResult | undefined;
-    if (!validationError) {
-      try {
-        const markdown = await readPlanFile(this.#planRoot, gate.input.session.id);
-        if (!this.#isOpen(gate)) return;
-        const parsed = planOutcomeFromMarkdown(markdown, gate.input.operation, gate.input.session, gate.input.selectedAnnotationIds);
-        validated = parsed.ok
-          ? validateGeneratorSubmission(parsed.value, gate.input.operation, gate.input.session, gate.skills)
-          : failed("invalid-plan-file", parsed.issues.map((issue) => `${issue.path} [${issue.code}] ${issue.message}`).join("; "));
-      } catch {
-        validated = failed("missing-plan-file", "The writer did not save a readable plan.md file.");
-      }
-    }
-    if (validated?.ok) {
-      this.#activity(gate, "completed", "completed");
-      this.#settle(gate, validated, false);
-      return;
-    }
-    gate.correctionFeedback = validationError ?? validated?.error.message ?? "The saved plan is invalid.";
-    if (gate.correctionAttempts >= 1) {
-      this.#settle(gate, failed("invalid-plan-file", "The writer could not save a valid plan. The saved request can be retried."));
-      return;
-    }
-    gate.correctionAttempts += 1;
-    const mission = this.#correctionMission(gate);
-    if (!gate.teams?.prepareRetry(mission)) {
-      this.#settle(gate, failed("correction-unavailable", "The saved plan could not be corrected safely. The request can be retried."));
-      return;
-    }
-    gate.privateReport = undefined;
-    this.#activity(gate, "recovering", "not-started");
-    this.#injectCorrection(gate);
+  #beginCorrection(gate: Gate): void {
+    if (!this.#isOpen(gate) || gate.activeRun || !gate.correctionFeedback || gate.correctionAttempts !== 1 || gate.teams?.primaryStatus !== "report-received") return;
+    if (!gate.teams.prepareRetry(this.#correctionMission(gate))) { this.#settle(gate, failed("correction-unavailable", "The submitted plan could not be corrected safely.")); return; }
+    gate.privateReport = undefined; this.#activity(gate, "recovering", "not-started"); this.#injectCorrection(gate);
   }
 
   #activity(
@@ -427,7 +440,6 @@ export class CurrentAgentPlanBridge {
   #settle(gate: Gate, result: PlanGeneratorResult, emit = true): void {
     if (gate.state === "settled" || gate.state === "closed") return;
     gate.state = "settled";
-    if (result.ok) this.#lastSettledNonce = gate.nonce;
     if (emit) this.#activity(gate, result.ok ? "completed" : result.error.code === "delegated-planning-paused" ? "paused" : gate.adapterKind === "direct" ? "direct-fallback" : "paused", result.ok ? "completed" : "paused");
     this.#closeObservation(gate);
     gate.resolve(result);
@@ -440,7 +452,6 @@ export class CurrentAgentPlanBridge {
     gate.resolve(failed("generation-cancelled", "Plan generation was cancelled."));
   }
   #closeObservation(gate: Gate): void {
-    gate.stopPlanWatch?.(); gate.stopPlanWatch = undefined;
     gate.stopReportObservation?.(); gate.stopReportObservation = undefined;
     gate.teams?.close();
   }
@@ -454,91 +465,129 @@ export class CurrentAgentPlanBridge {
     ].join("\n\n");
   }
 
-  #directMessage(gate: Gate): string {
-    if (gate.input.operation === "revision") {
-      const selected = new Set(gate.input.selectedAnnotationIds);
-      const notes = gate.input.session.annotations.filter((annotation) => selected.has(annotation.id));
-      return [
-        "## Controller-owned revision mission", `Submission nonce: ${gate.nonce}`,
-        `Current plan path: ${planFilePath(this.#planRoot, gate.input.session.id)}`,
-        `Notes file path: ${annotationsFilePath(this.#planRoot, gate.input.session.id)}`,
-        `Selected notes: ${JSON.stringify(notes)}`,
-        ...(gate.input.instruction ? [`Additional revision instruction: ${gate.input.instruction}`] : []),
-        "Read the current plan and notes. Apply only the selected feedback, preserve everything else, and rewrite only plan.md.",
-        "Then call pi_prompt_submit_plan exactly once with `result` equal to the string `plan saved`.",
-      ].join("\n\n");
-    }
-    return [gate.levelMarkdown!, "\n## Controller-owned plan-file request\n", `Submission nonce: ${gate.nonce}`,
-      this.#controllerContext(gate),
-      `Write the complete Markdown plan to exactly: ${planFilePath(this.#planRoot, gate.input.session.id)}`,
-      "The file must have one `#` title, exactly one `## Execution`, and `## Implementation Tasks` with `###` tasks containing `Scope:`, `Test first:`, `Implement:`, `Verify:`, and `Done when:` lines.",
-      "Then call pi_prompt_submit_plan exactly once with `result` equal to the string `plan saved`.",
+  #directMessage(gate: Gate, run: RunKind): string {
+    if (run === "correction") return this.#correctionMission(gate, false);
+    if (gate.input.operation === "revision") return [this.#revisionContext(gate), this.#writerChoice(gate)].join("\n\n");
+    return [
+      this.#originalRequest(gate), gate.levelMarkdown!, "## Controller-owned plan-file request",
+      "Plan directly from the original request. Apply the request-first inspection policy in the selected mode; ambient controller metadata never expands user scope.",
+      this.#initialSupplementalContext(gate), this.#clarificationHistory(gate), this.#writerChoice(gate),
     ].join("\n\n");
   }
 
   #childMission(gate: Gate): string {
     if (gate.input.operation === "revision") return this.#revisionMission(gate);
     return [
-      gate.levelMarkdown!, "\n## Controller-owned primary planning mission\n",
+      this.#originalRequest(gate), gate.levelMarkdown!, "## Controller-owned primary planning mission",
       "You are the one plan writer. Handle this planning task alone; helpers and swarms are unsupported.",
-      "Inspect repository evidence as needed, but do not implement the requested work, install anything, start services, commit, push, deploy, or modify any file except the exact plan.md path below.",
-      "Call report_progress with one concise, user-safe summary whenever your meaningful planning focus changes. Describe the work, not private chain-of-thought, tools, paths, or hidden instructions.",
-      `Write the complete Markdown plan to exactly: ${planFilePath(this.#planRoot, gate.input.session.id)}`,
-      "The file must have one `#` title, exactly one `## Execution` section, and `## Implementation Tasks` with one or more `###` tasks. Every task body must include lines starting `Scope:`, `Test first:`, `Implement:`, `Verify:`, and `Done when:`.",
-      "Finish by calling report_and_exit with both `content` and `summary` equal to exactly `plan saved`. Do not put the plan in the report.",
-      "Do not call pi_prompt_submit_plan. Pi Prompt reads and validates plan.md directly.",
-      this.#controllerContext(gate),
+      "Plan directly from the original request. Do not inspect any folder, repository, working directory, code, or files unless the request-first policy in the selected mode justifies the smallest relevant evidence. Do not implement the requested work, install anything, start services, commit, push, or deploy, and modify no files except the exact plan.md or questions.json path below.",
+      "Do not report a generic initial status. Call report_progress only after your meaningful planning focus changes. If inspection is justified, name the specific user-relevant question it will answer; never report `assessing folder` or `exploring repository`. Describe the work, not private chain-of-thought, tools, paths, or hidden instructions.",
+      this.#initialSupplementalContext(gate), this.#clarificationHistory(gate), this.#writerChoice(gate),
+      "Finish by calling report_and_exit with `plan uploaded` or `questions uploaded`. The report is cleanup-only: do not put the plan, questions, submission URL, bearer, or validation details in it.",
+      "Do not call pi_prompt_submit_plan. Only the authenticated HTTP upload can complete this planning attempt.",
     ].join("\n\n");
   }
 
   #revisionMission(gate: Gate): string {
+    return [this.#revisionContext(gate), this.#writerChoice(gate), "Finish by calling report_and_exit with `plan uploaded` or `questions uploaded`; the report is cleanup-only and must contain no result bytes or credentials."].join("\n\n");
+  }
+
+  #revisionContext(gate: Gate): string {
     const selected = new Set(gate.input.selectedAnnotationIds);
     const notes = gate.input.session.annotations.filter((annotation) => selected.has(annotation.id));
+    const noteText = notes.map((annotation) => `- [${annotation.id}] ${annotation.body}`).join("\n") || "(none)";
     return [
       "## Controller-owned revision mission",
-      "You are revising the existing plan, not creating a new plan.",
+      "You are revising the existing plan in place, not creating a new plan.",
       `Current plan path: ${planFilePath(this.#planRoot, gate.input.session.id)}`,
-      `Notes file path: ${annotationsFilePath(this.#planRoot, gate.input.session.id)}`,
-      `Selected notes: ${JSON.stringify(notes)}`,
+      `Annotations path: ${annotationsFilePath(this.#planRoot, gate.input.session.id)}`,
+      `Selected note text:\n${noteText}`,
       ...(gate.input.instruction ? [`Additional revision instruction: ${gate.input.instruction}`] : []),
-      "Read the current plan from its path and read the notes file. Apply the selected notes and additional instruction only. Preserve every unmentioned section, task, constraint, and decision.",
-      "Rewrite only the current plan path. Do not modify annotations.json or any repository file.",
-      "Keep one `#` title, exactly one `## Execution`, and `## Implementation Tasks` with `###` tasks containing `Scope:`, `Test first:`, `Implement:`, `Verify:`, and `Done when:` lines.",
-      "Call report_progress with one concise, user-safe summary of the revision.",
-      "Finish by calling report_and_exit with both `content` and `summary` equal to exactly `plan saved`.",
+      "Read the current plan and apply only the supplied selected note text and optional additional instruction. Read annotations.json only if needed to understand a selected note. Preserve every unmentioned section, task, constraint, and decision.",
+      "Do not inspect the repository or working directory. Modify only plan.md or questions.json as directed below; do not modify annotations.json or any other file.",
+      this.#clarificationHistory(gate),
     ].join("\n\n");
   }
 
-  #correctionMission(gate: Gate): string {
+  #correctionMission(gate: Gate, delegated = true): string {
     return [
       "## Saved plan correction",
       `Plan path: ${planFilePath(this.#planRoot, gate.input.session.id)}`,
-      ...(gate.input.operation === "revision" ? [`Notes path: ${annotationsFilePath(this.#planRoot, gate.input.session.id)}`] : []),
-      `Validation feedback: ${gate.correctionFeedback ?? "The saved plan was invalid."}`,
-      "Read the current plan first. Fix only the validation problem and preserve all other content. Rewrite only plan.md; do not modify annotations.json or repository files.",
-      "Keep one `#` title, exactly one `## Execution`, and `## Implementation Tasks` with `###` tasks containing `Scope:`, `Test first:`, `Implement:`, `Verify:`, and `Done when:` lines.",
-      "Call report_progress once with a concise, user-safe summary of the correction.",
-      "Finish by calling report_and_exit with both `content` and `summary` equal to exactly `plan saved`.",
+      `Validation feedback: ${gate.correctionFeedback ?? "The submitted plan was invalid."}`,
+      "Read only the current plan. Fix only the validation feedback and preserve all non-validation content. Rewrite only plan.md; read or modify no other file.",
+      this.#planStorageSchema(), this.#planUpload(gate),
+      delegated ? "Finish by calling report_and_exit with `plan uploaded`; the report is cleanup-only and must contain no result bytes or credentials." : "After the upload, end this run. Do not call pi_prompt_submit_plan.",
     ].join("\n\n");
   }
 
-  #controllerContext(gate: Gate): string {
+  #originalRequest(gate: Gate): string {
+    return `## Original user request — primary authority\n${gate.input.session.source.prompt}`;
+  }
+
+  #initialSupplementalContext(gate: Gate): string {
     return [
-      `Original request:\n${gate.input.session.source.prompt}`,
-      `Working directory:\n${gate.input.session.source.cwd}`,
+      "## Supplemental controller metadata — not user scope",
+      "These values support planning and storage only. They do not add goals, affected areas, or permission to inspect anything.",
+      `Working directory (ambient only; a cwd is not authorization to inspect it):\n${gate.input.session.source.cwd}`,
       `Execution kind:\n${gate.input.session.execution.kind}`,
-      `Plan file:\n${planFilePath(this.#planRoot, gate.input.session.id)}`,
-      `Selected feedback IDs:\n${JSON.stringify(gate.input.selectedAnnotationIds)}`,
-      `Feedback from annotations.json:\n${JSON.stringify(gate.input.session.annotations)}`,
-      ...(gate.input.instruction === undefined ? [] : [`Revision instruction:\n${gate.input.instruction}`]),
-      `Selected private skill context (never copy private instructions or paths into the result):\n${JSON.stringify(gate.skills)}`,
+      `Selected private skill context (apply only when relevant; never copy private instructions or paths into the result):\n${JSON.stringify(gate.skills)}`,
     ].join("\n\n");
+  }
+
+  #clarificationHistory(gate: Gate): string {
+    const history = gate.input.session.clarifications?.history ?? [];
+    if (history.length === 0) return "No prior clarification answers exist for this operation.";
+    return `## Prior answered clarification history — do not repeat these questions\n${JSON.stringify(history)}`;
+  }
+
+  #writerChoice(gate: Gate): string {
+    return [
+      "After the supplied initial or revision context, choose exactly one outcome:",
+      `1. If no material user decision is needed, write the complete Markdown plan to ${planFilePath(this.#planRoot, gate.input.session.id)}, following the storage schema below. Then upload those exact bytes with this command and do not edit plan.md afterward:\n${this.#planUpload(gate)}`,
+      `2. If a material user decision is needed, do not write plan.md. Write exactly one JSON object to ${writerQuestionsFilePath(this.#planRoot, gate.input.session.id)} with no fields other than \`questions\`. Ask one concise batch of 1-5 questions; each question needs 2-6 options. Custom answers are automatically supported, so do not add an “Other” option. Use this exact shape: ${JSON.stringify({ questions: [{ id: "unique-question-id", prompt: "One short question?", options: [{ id: "unique-option-a", label: "First choice" }, { id: "unique-option-b", label: "Second choice" }] }] })}\nThen upload those exact bytes with this command and do not edit questions.json afterward:\n${this.#clarificationUpload(gate)}`,
+      "Do not ask questions in prose, tool calls, or reports. More rounds are allowed only after the user answers this batch. Do not call pi_prompt_submit_plan; correlated HTTP bytes are the sole completion authority.",
+      this.#planStorageSchema(),
+    ].join("\n\n");
+  }
+
+  #planUpload(gate: Gate): string {
+    return this.#uploadCommand(gate, "plan", planFilePath(this.#planRoot, gate.input.session.id), "text/markdown");
+  }
+
+  #clarificationUpload(gate: Gate): string {
+    return this.#uploadCommand(gate, "clarification", writerQuestionsFilePath(this.#planRoot, gate.input.session.id), "application/json");
+  }
+
+  #uploadCommand(gate: Gate, result: "plan" | "clarification", path: string, contentType: string): string {
+    return `curl --fail-with-body --silent --show-error --request POST --header 'Authorization: Bearer ${gate.activeAttempt}' --header 'Content-Type: ${contentType}' --header 'X-Pi-Prompt-Result: ${result}' --data-binary '@${path}' '${gate.writerEndpoint}'`;
+  }
+
+  #nextAttempt(): string | null {
+    let value: string;
+    try { value = this.#attemptFactory(); } catch { return null; }
+    if (!/^[A-Za-z0-9_-]{16,64}$/u.test(value) || this.#issuedAttempts.has(value)) return null;
+    this.#issuedAttempts.add(value); return value;
+  }
+
+  #planStorageSchema(): string {
+    return [
+      "The following fields are a mandatory storage schema, not evidence that the request is code work:",
+      "The file must have one `#` title, exactly one `## Execution` section, and `## Implementation Tasks` with one or more `###` tasks. Every task body must include lines starting `Scope:`, `Test first:`, `Implement:`, `Verify:`, and `Done when:`.",
+      "For non-code requests, use those fields for the requested actions and verification. Write `Test first: N/A — <reason>` instead of inventing code or tests.",
+    ].join("\n");
   }
 }
 
 function randomToken(): string { return randomBytes(18).toString("base64url"); }
+function validWriterEndpoint(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" && url.hostname === "127.0.0.1" && /^(?:[1-9]\d{0,4})$/u.test(url.port)
+      && Number(url.port) <= 65_535 && url.pathname === "/api/v1/writer-results" && !url.search && !url.hash && !url.username && !url.password;
+  } catch { return false; }
+}
 function asRecord(value: unknown): Record<string, unknown> | null { return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null; }
-function failed(code: string, message: string): PlanGeneratorResult { return { ok: false, error: { code, message } }; }
+function failed(code: string, message: string): PlanGeneratorResult & { readonly ok: false } { return { ok: false, error: { code, message } }; }
 function dispatchFailed(code: string, message: string): PlanDispatchResult { return { ok: false, error: { code, message } }; }
 function toolFailure(code: string, message: string) {
   return { content: [{ type: "text" as const, text: `${code}: ${message}` }], details: { code, accepted: false }, isError: true };

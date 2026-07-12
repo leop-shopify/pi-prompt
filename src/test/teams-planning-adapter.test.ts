@@ -45,7 +45,7 @@ describe("pi-extended-teams planning adapter", () => {
     const phases: string[] = [];
     const adapter = new TeamsPlanningAdapter({
       primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "WRITE PLAN MISSION", modelSlot: "writing-basic",
-      submitToolName: "pi_prompt_submit_plan", onPhase: (phase) => phases.push(phase), onReport: vi.fn(), onProgress: vi.fn(),
+      onPhase: (phase) => phases.push(phase), onReport: vi.fn(), onProgress: vi.fn(),
     });
     const first = call("spawn_agent", { prompt: "attacker", model_slot: "writing-hard", name: "public", cwd: "/tmp", metadata: { nonce: "leak" }, extra: true });
     expect(adapter.handleToolCall(first)).toBeUndefined();
@@ -69,7 +69,7 @@ describe("pi-extended-teams planning adapter", () => {
     const models = vi.fn();
     const adapter = new TeamsPlanningAdapter({
       primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "mission", modelSlot: "writing-basic",
-      submitToolName: "pi_prompt_submit_plan", onPhase: vi.fn(), onReport: vi.fn(), onProgress: vi.fn(), onModel: models,
+      onPhase: vi.fn(), onReport: vi.fn(), onProgress: vi.fn(), onModel: models,
     });
     adapter.handleToolCall(call("spawn_agent"));
     adapter.handleToolResult({ ...result(), details: { name: "planner-private", session: "private-session", modelSlot: "writing-basic", model: "openai/gpt-planner", thinking: "high", secret: "PRIVATE" } } as ToolResultEvent);
@@ -81,7 +81,7 @@ describe("pi-extended-teams planning adapter", () => {
     const progress = vi.fn();
     const adapter = new TeamsPlanningAdapter({
       primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "mission", modelSlot: "writing-basic",
-      submitToolName: "pi_prompt_submit_plan", onPhase: vi.fn(), onReport: vi.fn(), onProgress: progress,
+      onPhase: vi.fn(), onReport: vi.fn(), onProgress: progress,
     });
     adapter.handleToolCall(call("spawn_agent")); adapter.handleToolResult(result());
     const fresh = Date.now() + 1_000;
@@ -100,26 +100,29 @@ describe("pi-extended-teams planning adapter", () => {
     const reports: string[] = [];
     const adapter = new TeamsPlanningAdapter({
       primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "mission", modelSlot: "writing-hard",
-      submitToolName: "pi_prompt_submit_plan", onPhase: vi.fn(), onReport: (report) => reports.push(report), onProgress: vi.fn(),
+      onPhase: vi.fn(), onReport: (report) => reports.push(report), onProgress: vi.fn(),
     });
     adapter.handleToolCall(call("spawn_agent")); adapter.handleToolResult(result());
-    expect(adapter.handleReport({ name: "wrong", ok: true, report: "WRONG" })).toBe(false);
-    expect(adapter.handleReport({ name: "planner-private", ok: true, report: "EXPECTED REPORT" })).toBe(true);
-    expect(adapter.handleReport({ name: "planner-private", ok: true, report: "DUPLICATE" })).toBe(false);
+    expect(adapter.handleReport({ teamName: "private-session", name: "wrong", ok: true, report: "WRONG" })).toBe(false);
+    expect(adapter.handleReport({ teamName: "wrong-session", name: "planner-private", ok: true, report: "WRONG TEAM" })).toBe(false);
+    expect(adapter.handleReport({ teamName: "private-session", name: "planner-private", ok: true, report: "EXTRA METADATA", metadata: { piPromptPlanning: { version: 1, correlation: "correlation-private", attemptId: "must-not-be-public" } } })).toBe(false);
+    expect(adapter.handleReport({ teamName: "private-session", name: "planner-private", ok: true, report: "EXPECTED REPORT", metadata: { piPromptPlanning: { version: 1, correlation: "correlation-private" } } })).toBe(true);
+    expect(adapter.handleReport({ teamName: "private-session", name: "planner-private", ok: true, report: "DUPLICATE" })).toBe(false);
     expect(reports).toEqual(["EXPECTED REPORT"]);
-    expect(adapter.handleFollowUp({ role: "custom", customType: "pi-extended-teams-report", content: "WRONG", details: { name: "planner-private" } })).toBe(false);
-    expect(adapter.handleFollowUp({ role: "custom", customType: "pi-extended-teams-report", content: "EXPECTED REPORT", details: { name: "wrong" } })).toBe(false);
-    expect(adapter.handleFollowUp({ role: "custom", customType: "pi-extended-teams-report", content: "EXPECTED REPORT", details: { name: "planner-private" } })).toBe(true);
-    expect(adapter.handleFollowUp({ role: "custom", customType: "pi-extended-teams-report", content: "EXPECTED REPORT", details: { name: "planner-private" } })).toBe(false);
+    expect(adapter.handleFollowUp({ role: "custom", customType: "pi-extended-teams-report", content: "WRONG", details: { name: "planner-private", teamName: "private-session" } })).toBe(false);
+    expect(adapter.handleFollowUp({ role: "custom", customType: "pi-extended-teams-report", content: "EXPECTED REPORT", details: { name: "wrong", teamName: "private-session" } })).toBe(false);
+    expect(adapter.handleFollowUp({ role: "custom", customType: "pi-extended-teams-report", content: "EXPECTED REPORT", details: { name: "planner-private", teamName: "private-session" } })).toBe(true);
+    expect(adapter.handleFollowUp({ role: "custom", customType: "pi-extended-teams-report", content: "EXPECTED REPORT", details: { name: "planner-private", teamName: "private-session" } })).toBe(false);
     expect(adapter.prepareRetry("CORRECTION MISSION")).toBe(true);
     const retry = call("spawn_agent", { prompt: "wrong", model_slot: "writing-hard" });
     expect(adapter.handleToolCall(retry)).toBeUndefined();
     expect(retry.input).toMatchObject({ prompt: "CORRECTION MISSION", model_slot: "writing-hard", name: "planner-private" });
     expect(adapter.primaryCount).toBe(1);
     adapter.handleToolResult(result());
-    expect(adapter.handleReport({ name: "planner-private", ok: true, report: "SECOND REPORT" })).toBe(true);
-    expect(adapter.handleFollowUp({ role: "custom", customType: "pi-extended-teams-report", content: "SECOND REPORT", details: { name: "planner-private" } })).toBe(true);
+    expect(adapter.handleReport({ teamName: "private-session", name: "planner-private", ok: true, report: "SECOND REPORT", metadata: { piPromptPlanning: { version: 1, correlation: "wrong" } } })).toBe(false);
+    expect(adapter.handleReport({ teamName: "private-session", name: "planner-private", ok: true, report: "SECOND REPORT", metadata: { piPromptPlanning: { version: 1, correlation: "correlation-private" } } })).toBe(true);
+    expect(adapter.handleFollowUp({ role: "custom", customType: "pi-extended-teams-report", content: "SECOND REPORT", details: { name: "planner-private", teamName: "private-session" } })).toBe(true);
     adapter.close();
-    expect(adapter.handleReport({ name: "planner-private", ok: true, report: "LATE" })).toBe(false);
+    expect(adapter.handleReport({ teamName: "private-session", name: "planner-private", ok: true, report: "LATE" })).toBe(false);
   });
 });
