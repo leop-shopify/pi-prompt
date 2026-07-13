@@ -1,96 +1,109 @@
 import { element, replaceChildren } from "./dom.js";
 
-export function renderPlan(snapshot, treeNode, onComment, onEdit, busy = false) {
-  treeNode.classList.toggle("single-plan", Boolean(snapshot.planMarkdown));
-  if (!snapshot.document) {
-    replaceChildren(treeNode, [element("div", { className: "plan-placeholder" }, [
-      element("strong", {}, [snapshot.clarification ? "Planning is waiting for your answers" : snapshot.job ? "The plan is being generated" : "No plan yet"]),
-      element("p", {}, [snapshot.clarification ? "Continue above when you are ready." : snapshot.job ? "The saved plan will appear here automatically." : "Start or retry planning from Pi."]),
-    ])]);
+export function renderPlan(snapshot, treeNode, _onComment, onEdit, busy = false, stage = "plan", selectedAnnotationIds = [], onToggleSelection = () => {}) {
+  const markdown = typeof snapshot.planMarkdown === "string" ? snapshot.planMarkdown : null;
+  treeNode.classList.toggle("single-plan", markdown !== null); treeNode.dataset.stage = stage;
+  if (markdown === null || !snapshot.document) {
+    replaceChildren(treeNode, [placeholder(snapshot.clarification ? "Planning is waiting for your answers" : snapshot.job ? "The Plan is being generated" : "No Plan yet", snapshot.clarification ? "Continue above when you are ready." : snapshot.job ? "The durable Plan will appear here automatically." : "Start or retry planning from Pi.")]);
     return;
   }
-  const sections = snapshot.planMarkdown ? parseMarkdown(snapshot.planMarkdown) : [];
-  const entries = [snapshot.document.title, ...snapshot.document.elements];
-  const rendered = entries.map((entry, index) => renderEntry(entry, sections[index], snapshot, onEdit, busy, 0));
-  const fallback = snapshot.annotations.filter((note) => note.target.kind === "root" || !findEntry(snapshot.document, note.target.elementId));
-  if (fallback.length) rendered.push(element("div", { className: "root-annotation-badges", "aria-label": "Plan-level and fallback notes" }, fallback.map((note) => annotationBadge(note, onEdit, busy, true))));
-  replaceChildren(treeNode, rendered);
+  const visible = snapshot.annotations.filter((note) => stage === "grill" || note.author !== "grill");
+  const projection = projectPlanAnnotations(markdown, snapshot.document, visible); const selected = new Set(selectedAnnotationIds);
+  const surface = element("pre", { className: "plan-markdown", dataset: { commentSurface: stage }, tabIndex: 0, "aria-label": `${stage === "grill" ? "Grill review of" : "Plan"} Markdown revision ${snapshot.documentRevision ?? "current"}` }, annotatedNodes(markdown, projection.inline, onEdit, busy, selected, onToggleSelection));
+  surface.planProjection = projection.fields; surface.planDocumentId = snapshot.document.id;
+  const fallback = projection.fallback.length
+    ? [element("div", { className: "root-annotation-badges", "aria-label": "Plan-level and unmatched comments" }, projection.fallback.map((note) => annotationBadge(note, onEdit, busy, true, selected, onToggleSelection)))]
+    : [];
+  replaceChildren(treeNode, [surface, ...fallback]);
 }
 
-function renderEntry(entry, section, snapshot, onEdit, busy, depth) {
-  const article = element(depth === 0 ? "section" : "article", { className: `plan-element depth-${Math.min(depth, 4)}`, id: `element-${entry.id}`, dataset: { planElementId: entry.id } });
-  const headingField = entry.kind === "title" ? "body" : entry.title === undefined ? undefined : "title";
-  const headingText = entry.kind === "title" ? entry.body : entry.title ?? label(entry.kind);
-  const headingNotes = headingField ? rangeNotes(snapshot, entry.id, headingField) : [];
-  const heading = element(depth === 0 ? "h3" : "h4", headingField ? { dataset: { planField: headingField } } : {}, annotatedNodes(headingText, headingNotes, onEdit, busy));
-  if (entry.kind === "title") for (const note of snapshot.annotations.filter((value) => value.target.elementId === entry.id && (value.target.kind === "element" || value.status === "orphaned"))) heading.append(annotationBadge(note, onEdit, busy, note.status === "orphaned"));
-  article.append(element("div", { className: "element-header" }, [heading]));
-  if (entry.kind !== "title") {
-    const bodyText = entry.body;
-    const body = element("pre", { className: snapshot.planMarkdown ? "markdown-body" : "element-body", dataset: { planField: "body" } }, annotatedNodes(bodyText, rangeNotes(snapshot, entry.id, "body"), onEdit, busy));
-    const legacy = snapshot.annotations.filter((note) => note.target.elementId === entry.id && (note.target.kind === "element" || note.status === "orphaned"));
-    for (const note of legacy) body.append(annotationBadge(note, onEdit, busy, note.status === "orphaned"));
-    article.append(body);
+export function projectPlanAnnotations(markdown, document, annotations) {
+  const fields = projectDocumentFields(markdown, document); const inline = []; const fallback = [];
+  for (const note of annotations) {
+    if (note.status === "orphaned") { fallback.push(note); continue; }
+    if (note.target.kind === "root") { fallback.push(note); continue; }
+    const candidates = fields.filter((field) => field.elementId === note.target.elementId);
+    if (note.target.kind === "range") {
+      const field = candidates.find((candidate) => candidate.field === note.target.selector.field);
+      const start = field ? field.start + note.target.selector.start : -1; const end = field ? field.start + note.target.selector.end : -1;
+      const exact = start >= 0 && [...markdown].slice(start, end).join("") === note.target.selector.exact;
+      if (exact) { inline.push({ ...note, target: { selector: { start, end } } }); continue; }
+    }
+    const anchor = candidates.find((candidate) => candidate.field === "body") ?? candidates.at(-1);
+    if (anchor) inline.push({ ...note, target: { selector: { start: anchor.end, end: anchor.end } } }); else fallback.push(note);
   }
-  if (entry.children.length) article.append(element("div", { className: "children" }, entry.children.map((child, index) => renderEntry(child, section?.children?.[index], snapshot, onEdit, busy, depth + 1))));
-  return article;
+  return { fields, inline, fallback };
+}
+
+function projectDocumentFields(markdown, document) {
+  const points = [...markdown]; const fields = []; let cursor = 0;
+  const locate = (text) => {
+    const needle = [...String(text)]; if (!needle.length) return { start: cursor, end: cursor };
+    const matchesAt = (at) => needle.every((point, index) => points[at + index] === point);
+    let start = -1; for (let at = cursor; at <= points.length - needle.length; at += 1) if (matchesAt(at)) { start = at; break; }
+    if (start < 0) for (let at = 0; at <= points.length - needle.length; at += 1) if (matchesAt(at)) { start = at; break; }
+    if (start < 0) return null; cursor = start + needle.length; return { start, end: cursor };
+  };
+  const visit = (entry) => {
+    if (entry.title !== undefined) { const found = locate(entry.title); if (found) fields.push({ ...found, elementId: entry.id, field: "title" }); }
+    const body = locate(entry.body); if (body) fields.push({ ...body, elementId: entry.id, field: "body" });
+    for (const child of entry.children) visit(child);
+  };
+  visit(document.title); for (const entry of document.elements) visit(entry); return fields;
+}
+
+export function renderSpec(snapshot, target, onEdit, busy = false) {
+  if (!snapshot?.markdown) { replaceChildren(target, [placeholder(snapshot?.job ? "The Spec is being generated" : "No Spec yet", snapshot?.job ? "The independent Spec snapshot will appear here automatically." : "Generate To Spec from the current Plan and Grill.")]); return; }
+  const notes = snapshot.comments.filter((comment) => comment.status !== "orphaned").map((comment) => ({ ...comment, author: "user", target: { selector: comment.target } }));
+  const pre = element("pre", { className: "spec-markdown", dataset: { commentSurface: "spec" }, tabIndex: 0, "aria-label": `Implementation Spec revision ${snapshot.specRevision}` }, annotatedNodes(snapshot.markdown, notes, onEdit, busy));
+  const orphaned = snapshot.comments.filter((comment) => comment.status === "orphaned");
+  const fallback = orphaned.length
+    ? [element("div", { className: "root-annotation-badges", "aria-label": "Orphaned Spec comments" }, orphaned.map((comment) => annotationBadge({ ...comment, author: "user" }, onEdit, busy, true)))]
+    : [];
+  replaceChildren(target, [pre, ...fallback]);
 }
 
 export function inlineAnnotationSegments(text, notes) {
-  const points = [...String(text)]; const groups = new Map();
-  for (const note of [...notes].sort((left, right) => left.target.selector.end - right.target.selector.end || left.id.localeCompare(right.id))) { const end = Math.max(0, Math.min(points.length, note.target.selector.end)); groups.set(end, [...(groups.get(end) ?? []), note]); }
-  const segments = []; let cursor = 0; for (const [end, badges] of groups) { segments.push({ text: points.slice(cursor, end).join(""), badges }); cursor = end; } segments.push({ text: points.slice(cursor).join(""), badges: [] }); return segments;
+  const points = [...String(text)]; const boundaries = new Set([0, points.length]);
+  for (const note of notes) { const selector = note.target.selector; boundaries.add(Math.max(0, Math.min(points.length, selector.start))); boundaries.add(Math.max(0, Math.min(points.length, selector.end))); }
+  const sorted = [...boundaries].sort((a, b) => a - b); const segments = [];
+  for (let index = 0; index < sorted.length - 1; index += 1) { const start = sorted[index]; const end = sorted[index + 1]; const active = notes.filter((note) => note.target.selector.start < end && note.target.selector.end > start); const badges = notes.filter((note) => note.target.selector.end === end && note.target.selector.start < end).sort((a, b) => a.id.localeCompare(b.id)); segments.push({ start, end, text: points.slice(start, end).join(""), notes: active, badges }); }
+  return segments;
 }
-function annotatedNodes(text, notes, onEdit, busy) {
-  const nodes = []; for (const segment of inlineAnnotationSegments(text, notes)) { if (segment.text) nodes.push(segment.text); for (const note of segment.badges) nodes.push(annotationBadge(note, onEdit, busy, false)); } return nodes.length ? nodes : [String(text)];
+function annotatedNodes(text, notes, onEdit, busy, selected = new Set(), onToggleSelection = () => {}) {
+  if (!notes.length) return [String(text)]; const nodes = []; const anchored = new Map();
+  for (const note of notes.filter((value) => value.target.selector.start === value.target.selector.end)) anchored.set(note.target.selector.end, [...(anchored.get(note.target.selector.end) ?? []), note]);
+  for (const note of anchored.get(0) ?? []) nodes.push(annotationBadge(note, onEdit, busy, false, selected, onToggleSelection));
+  for (const segment of inlineAnnotationSegments(text, notes)) {
+    if (segment.text) {
+      const authors = new Set(segment.notes.map((note) => note.author ?? "user")); const classes = [authors.has("user") ? "your-comment-highlight" : "", authors.has("grill") ? "grill-critique-highlight" : ""].filter(Boolean).join(" ");
+      nodes.push(classes ? element("mark", { className: classes }, [segment.text]) : segment.text);
+    }
+    for (const note of [...segment.badges, ...(anchored.get(segment.end) ?? [])]) nodes.push(annotationBadge(note, onEdit, busy, false, selected, onToggleSelection));
+  }
+  return nodes;
 }
-
-function annotationBadge(note, onEdit, busy, fallback) {
-  const status = note.locked ? `${note.status}, locked` : note.status;
-  const label = `${fallback ? "Fallback " : ""}note: ${note.body}. Status: ${status}. Press Enter to edit.`;
-  const badge = element("button", { type: "button", className: `annotation-badge status-${note.status}${fallback ? " annotation-fallback" : ""}`, title: label,
-    dataset: { annotationId: note.id, focusKey: `annotation-badge-${note.id}`, preview: `${note.body} · ${status}` }, "aria-label": label }, ["◆"]);
-  badge.addEventListener("click", () => onEdit(note, badge, busy));
-  return badge;
+function annotationBadge(note, onEdit, busy, fallback, selectedIds = new Set(), onToggleSelection = () => {}) {
+  const generated = note.author === "grill"; const selectable = generated && note.status === "open"; const selected = selectable && selectedIds.has(note.id); const provenance = generated ? "Grill critique" : "Your comment"; const status = note.locked ? `${note.status}, locked` : note.status;
+  const selection = selectable ? ` ${selected ? "Selected" : "Not selected"} for Plan revision. Press Enter to ${selected ? "deselect" : "select"} and review.` : "";
+  const label = `${provenance}: ${note.body}. Status: ${status}.${generated ? ` Generated text is read-only.${selection}` : " Press Enter to edit."}`;
+  const badge = element("button", { type: "button", className: `annotation-badge author-${generated ? "grill" : "user"} status-${note.status}${selected ? " is-selected" : ""}${fallback ? " annotation-fallback" : ""}`, title: label, disabled: busy,
+    ...(selectable ? { role: "checkbox", "aria-checked": String(selected) } : {}), dataset: { annotationId: note.id, focusKey: `annotation-badge-${note.id}`, preview: `${provenance} · ${note.body} · ${status}${selectable ? selected ? " · selected" : " · not selected" : ""}` }, "aria-label": label }, [element("span", { "aria-hidden": "true" }, [selectable ? selected ? "✓" : "○" : "•"])]);
+  badge.addEventListener("click", () => { const anchor = badge.getBoundingClientRect(); if (selectable) onToggleSelection(note.id); onEdit(note, anchor); }); return badge;
 }
-
-function rangeNotes(snapshot, elementId, field) {
-  return snapshot.annotations.filter((note) => note.target.kind === "range" && note.status !== "orphaned" && note.target.elementId === elementId && note.target.selector.field === field);
-}
-function findEntry(document, id) { const visit = (entry) => entry.id === id ? entry : entry.children.map(visit).find(Boolean); return visit(document.title) ?? document.elements.map(visit).find(Boolean); }
+function placeholder(title, body) { return element("div", { className: "plan-placeholder" }, [element("strong", {}, [title]), element("p", {}, [body])]); }
 
 export function renderClarification(snapshot, target, draft, onDraft, busy = false) {
-  const pending = snapshot.clarification;
-  if (!pending) { replaceChildren(target, []); return; }
+  const pending = snapshot.clarification; if (!pending) { replaceChildren(target, []); return; }
   replaceChildren(target, pending.questions.map((question, index) => {
-    const selected = draft?.answers?.[question.id];
-    const choices = question.options.map((option) => {
-      const input = element("input", { type: "radio", name: `clarification-${question.id}`, value: option.id, checked: selected?.kind === "option" && selected.optionId === option.id, disabled: busy,
-        dataset: { focusKey: `clarification-${pending.id}-${question.id}-${option.id}` } });
-      input.addEventListener("change", () => onDraft(question.id, { kind: "option", optionId: option.id }));
-      return element("label", { className: "clarification-option" }, [input, element("span", {}, [option.label])]);
+    const selected = draft?.answers?.[question.id]; const choices = question.options.map((option) => {
+      const input = element("input", { type: "radio", name: `clarification-${question.id}`, value: option.id, checked: selected?.kind === "option" && selected.optionId === option.id, disabled: busy, dataset: { focusKey: `clarification-${pending.id}-${question.id}-${option.id}` } });
+      input.addEventListener("change", () => onDraft(question.id, { kind: "option", optionId: option.id })); return element("label", { className: "clarification-option" }, [input, element("span", {}, [option.label])]);
     });
-    const customId = `clarification-custom-${index}`;
-    const customRadio = element("input", { type: "radio", name: `clarification-${question.id}`, checked: selected?.kind === "custom", disabled: busy,
-      dataset: { focusKey: `clarification-${pending.id}-${question.id}-custom` }, "aria-label": `Custom answer for ${question.prompt}` });
-    const custom = element("textarea", { id: customId, rows: 2, maxLength: 4096, disabled: busy, value: selected?.kind === "custom" ? selected.text : "", placeholder: "Write a custom answer",
-      dataset: { focusKey: `clarification-${pending.id}-${question.id}-custom-text` } });
-    customRadio.addEventListener("change", () => onDraft(question.id, { kind: "custom", text: custom.value }));
-    custom.addEventListener("focus", () => { customRadio.checked = true; onDraft(question.id, { kind: "custom", text: custom.value }); });
-    custom.addEventListener("input", () => onDraft(question.id, { kind: "custom", text: custom.value }));
-    choices.push(element("div", { className: "clarification-custom" }, [customRadio, element("label", { htmlFor: customId }, ["Custom answer"]), custom]));
+    const customId = `clarification-custom-${index}`; const radio = element("input", { type: "radio", name: `clarification-${question.id}`, checked: selected?.kind === "custom", disabled: busy, dataset: { focusKey: `clarification-${pending.id}-${question.id}-custom` }, "aria-label": `Custom answer for ${question.prompt}` });
+    const custom = element("textarea", { id: customId, rows: 2, maxLength: 4096, disabled: busy, value: selected?.kind === "custom" ? selected.text : "", placeholder: "Write a custom answer", dataset: { focusKey: `clarification-${pending.id}-${question.id}-custom-text` } });
+    radio.addEventListener("change", () => onDraft(question.id, { kind: "custom", text: custom.value })); custom.addEventListener("focus", () => { radio.checked = true; onDraft(question.id, { kind: "custom", text: custom.value }); }); custom.addEventListener("input", () => onDraft(question.id, { kind: "custom", text: custom.value }));
+    choices.push(element("div", { className: "clarification-custom" }, [radio, element("label", { htmlFor: customId }, ["Custom answer"]), custom]));
     return element("fieldset", { className: "clarification-question" }, [element("legend", {}, [`${index + 1}. ${question.prompt}`]), ...choices]);
   }));
 }
-
-function parseMarkdown(markdown) {
-  const sections = []; let current = null; let parent = null;
-  for (const line of String(markdown).replace(/\r\n?/g, "\n").split("\n")) {
-    const heading = /^(#{1,3})\s+(.+)$/.exec(line);
-    if (heading) { const section = { title: heading[2].trim(), lines: [], children: [] }; if (heading[1].length === 3 && parent) parent.children.push(section); else { sections.push(section); parent = heading[1].length === 2 ? section : null; } current = section; continue; }
-    if (current) current.lines.push(line);
-  }
-  const materialize = (section) => ({ title: section.title, body: section.lines.join("\n").trim(), children: section.children.map(materialize) });
-  return sections.map(materialize);
-}
-function label(kind) { return kind.split("-").map((part) => part[0].toUpperCase() + part.slice(1)).join(" "); }

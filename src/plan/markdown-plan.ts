@@ -37,7 +37,8 @@ export function planOutcomeFromMarkdown(
 }
 
 function parseMarkdownPlan(markdown: string): ValidationResult<ParsedMarkdownPlan> {
-  const lines = markdown.replace(/\r\n?/gu, "\n").normalize("NFC").split("\n");
+  const structuralMarkdown = markdown.startsWith("\uFEFF") ? markdown.slice(1) : markdown;
+  const lines = structuralMarkdown.replace(/\r\n?/gu, "\n").normalize("NFC").split("\n");
   const firstContentLine = lines.findIndex((line) => line.trim().length > 0);
   if (firstContentLine < 0 || !/^#\s+\S/u.test(lines[firstContentLine]!)) {
     return invalid("$.plan.md", "title-position", "plan.md must begin with exactly one `#` title.");

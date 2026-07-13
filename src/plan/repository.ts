@@ -70,7 +70,7 @@ export function createPlanRepository(options: PlanRepositoryOptions = {}): PlanR
     if (finalPlan === undefined && session.status === "accepted") throw repositoryError("accepted-requires-final", "Accepted state and final plan must be committed together.");
     if (finalPlan !== undefined && (session.status !== "accepted" || session.document === null || input.eventKind !== "accepted")) throw repositoryError("not-accepted", "Only an accepted materialized plan can be finalized.");
     if (finalPlan !== undefined && typeof finalPlan !== "string") throw repositoryError("invalid-render", "The rendered final plan must be text.");
-    validateTransition(session, previous);
+    validateTransition(session, previous, input.eventKind);
     const knownPrevious = committed.get(session.id);
     if (knownPrevious) {
       const previousSha = previous === null ? null : sha256(canonicalBytes(previous));
@@ -86,8 +86,9 @@ export function createPlanRepository(options: PlanRepositoryOptions = {}): PlanR
     const eventsBytes = await nextEventsBytes(join(artifactPath, "events.jsonl"), auditEvent(input.eventKind, committedAt, session));
     const annotationsBytes = canonicalBytes(session.annotations);
     const clarificationsBytes = canonicalBytes(session.clarifications ?? { history: [] });
+    const grillBytes = session.grill ? canonicalBytes(session.grill) : null;
     const committedPlan = markdownFor(session);
-    const projections = ["metadata.json", "events.jsonl", "plan.json", "annotations.json", "clarifications.json", ...(committedPlan === null ? [] : ["plan.md"]), ...(finalPlan === undefined ? [] : ["final-plan.md"])];
+    const projections = ["metadata.json", "events.jsonl", "plan.json", "annotations.json", "clarifications.json", "grill.json", ...(committedPlan === null ? [] : ["plan.md"]), ...(finalPlan === undefined ? [] : ["final-plan.md"])];
     const prior = await snapshotFiles(artifactPath, projections);
     try {
       await atomicPrivateWrite(join(artifactPath, "metadata.json"), metadataBytes);
@@ -95,6 +96,7 @@ export function createPlanRepository(options: PlanRepositoryOptions = {}): PlanR
       await atomicPrivateWrite(join(artifactPath, "plan.json"), stateBytes);
       await atomicPrivateWrite(join(artifactPath, "annotations.json"), annotationsBytes);
       await atomicPrivateWrite(join(artifactPath, "clarifications.json"), clarificationsBytes);
+      if (grillBytes) await atomicPrivateWrite(join(artifactPath, "grill.json"), grillBytes); else await unlinkIfExists(join(artifactPath, "grill.json"));
       if (committedPlan !== null) await atomicPrivateWrite(join(artifactPath, "plan.md"), Buffer.from(committedPlan, "utf8"));
       if (finalPlan !== undefined) await atomicPrivateWrite(join(artifactPath, "final-plan.md"), Buffer.from(finalPlan, "utf8"));
       const locator: PlanBranchLocator = Object.freeze({ schemaVersion: 1, sessionId: session.id, artifactPath, status: session.status, stateVersion: session.stateVersion, documentRevision: session.documentRevision, stateSha256, committedAt });
@@ -140,6 +142,9 @@ export function createPlanRepository(options: PlanRepositoryOptions = {}): PlanR
         const clarificationsBytes = canonicalBytes(state.clarifications ?? { history: [] });
         if (!await fileEquals(join(locator.artifactPath, "clarifications.json"), clarificationsBytes)) await atomicPrivateWrite(join(locator.artifactPath, "clarifications.json"), clarificationsBytes);
         else await chmod(join(locator.artifactPath, "clarifications.json"), 0o600);
+        const grillPath = join(locator.artifactPath, "grill.json");
+        if (state.grill) { const grillBytes = canonicalBytes(state.grill); if (!await fileEquals(grillPath, grillBytes)) await atomicPrivateWrite(grillPath, grillBytes); else await chmod(grillPath, 0o600); }
+        else await unlinkIfExists(grillPath);
         const committedPlan = markdownFor(state);
         if (committedPlan !== null) {
           const planBytes = Buffer.from(committedPlan, "utf8");
@@ -164,7 +169,7 @@ function validatedSession(input: PlanSession, code: string): PlanSession {
   if (!result.ok) throw repositoryError(code, "Plan session validation failed.");
   return result.value;
 }
-function validateTransition(session: PlanSession, previous: PlanSession | null): void {
+function validateTransition(session: PlanSession, previous: PlanSession | null, eventKind?: Exclude<PlanAuditKind, "recovered">): void {
   if (previous === null) {
     if (session.stateVersion !== 1) throw repositoryError("invalid-state-version", "An initial commit must use state version 1.");
     return;
@@ -175,6 +180,11 @@ function validateTransition(session: PlanSession, previous: PlanSession | null):
     throw repositoryError("invalid-document-revision", "Document revisions cannot regress or skip.");
   }
   const sameDocument = documentBytes(session.document).equals(documentBytes(previous.document));
+  if (eventKind === "revision-committed") {
+    if (session.documentRevision !== previous.documentRevision + 1) throw repositoryError("missing-document-revision", "An explicit revision commit must advance the document revision exactly once.");
+    return;
+  }
+  if (eventKind === undefined && session.documentRevision === previous.documentRevision + 1) return;
   if (sameDocument && session.documentRevision !== previous.documentRevision) throw repositoryError("unnecessary-document-revision", "An unchanged document must keep its revision.");
   if (!sameDocument && session.documentRevision !== previous.documentRevision + 1) throw repositoryError("missing-document-revision", "A changed document must advance its revision exactly once.");
   if (sameDocument && session.committedMarkdown !== previous.committedMarkdown) throw repositoryError("mutable-committed-markdown", "Committed Markdown cannot change without a document revision.");
@@ -372,6 +382,7 @@ async function restoreFiles(directory: string, names: readonly string[], prior: 
     try { if (value === null || value === undefined) await unlink(path); else await atomicPrivateWrite(path, value); } catch { /* rollback is best effort */ }
   }
 }
+async function unlinkIfExists(path: string): Promise<void> { try { await unlink(path); } catch (error) { if (!hasCode(error, "ENOENT")) throw error; } }
 async function fileEquals(path: string, expected: Buffer): Promise<boolean> { try { return (await readRegularFile(path)).equals(expected); } catch { return false; } }
 async function readRegularFile(path: string): Promise<Buffer> {
   const status = await lstat(path);

@@ -15,11 +15,11 @@ export interface PublicAnnotationTargetSummary {
   readonly historical?: { readonly elementKind: PlanElement["kind"] | "root"; readonly excerpt: string };
 }
 export interface PublicAnnotation {
-  readonly id: string; readonly target: AnnotationTarget; readonly targetSummary: PublicAnnotationTargetSummary;
+  readonly id: string; readonly author: "user" | "grill"; readonly target: AnnotationTarget; readonly targetSummary: PublicAnnotationTargetSummary;
   readonly body: string; readonly status: AnnotationStatus; readonly locked: boolean;
   readonly createdAgainstRevision: number; readonly createdAt: string; readonly updatedAt: string;
 }
-export interface PublicSnapshotActions { readonly canRetryStaging: boolean }
+export interface PublicSnapshotActions { readonly canRetryGeneration: boolean; readonly canRetryStaging: boolean }
 export interface PublicPendingClarification {
   readonly id: string; readonly context: "initial" | "revision"; readonly baseDocumentRevision: number;
   readonly questions: readonly { readonly id: string; readonly prompt: string; readonly options: readonly { readonly id: string; readonly label: string }[] }[];
@@ -39,13 +39,14 @@ export interface PublicActivity {
   readonly timeline: readonly { readonly phase: PublicActivityPhase; readonly at: string }[];
 }
 export interface PublicSnapshot {
-  readonly protocolVersion: 1; readonly stateVersion: number; readonly documentRevision: number; readonly status: PlanSession["status"];
+  readonly protocolVersion: 1; readonly id: string; readonly stateVersion: number; readonly documentRevision: number; readonly status: PlanSession["status"];
   readonly execution: PlanSession["execution"]; readonly generation: PlanSession["generation"]; readonly originalPrompt: string; readonly promptPreview: string; readonly document: PublicPlanDocument | null;
   readonly annotations: readonly PublicAnnotation[];
+  readonly grill?: PlanSession["grill"];
   readonly actions: PublicSnapshotActions;
   readonly activity?: PublicActivity;
   readonly clarification?: PublicPendingClarification;
-  readonly job?: { readonly operation: "initial" | "revision"; readonly baseDocumentRevision: number; readonly startedAt: string };
+  readonly job?: { readonly operation: "initial" | "revision" | "grill"; readonly baseDocumentRevision: number; readonly startedAt: string };
   readonly error?: { readonly code: string; readonly message: string };
 }
 export interface PublicEvent { readonly sequence: number; readonly kind: string; readonly status: PlanSession["status"]; readonly stateVersion: number; readonly documentRevision: number; readonly errorCode?: string }
@@ -56,13 +57,16 @@ export type RevisionRequest = { readonly requestId: string; readonly selectedAnn
 export type AcceptRequest = { readonly requestId: string; readonly stateVersion: number; readonly documentRevision: number; readonly confirmed: true };
 export type CancelRequest = { readonly requestId: string; readonly disposition: "pause" | "cancel" };
 export type ReopenRequest = { readonly requestId: string };
+export type GenerationRetryRequest = { readonly requestId: string };
+export type GrillRequest = { readonly requestId: string };
 export type ClarificationAnswersRequest = { readonly requestId: string; readonly clarificationId: string; readonly answers: readonly ClarificationAnswerEntry[] };
-export type MutationRequest = AnnotationCreateRequest | AnnotationPatchRequest | RevisionRequest | AcceptRequest | CancelRequest | ReopenRequest | ClarificationAnswersRequest;
+export type MutationRequest = AnnotationCreateRequest | AnnotationPatchRequest | GenerationRetryRequest | GrillRequest | RevisionRequest | AcceptRequest | CancelRequest | ReopenRequest | ClarificationAnswersRequest;
 
 /** Explicit public allowlist. Never replace this with a spread or controller.snapshot() serialization. */
 export function toPublicSnapshot(session: PlanSession, actions: Partial<PublicSnapshotActions> = {}, activity?: PublicActivity): PublicSnapshot {
   return Object.freeze({
     protocolVersion: PROTOCOL_VERSION,
+    id: session.id,
     stateVersion: session.stateVersion,
     documentRevision: session.documentRevision,
     status: session.status,
@@ -72,7 +76,8 @@ export function toPublicSnapshot(session: PlanSession, actions: Partial<PublicSn
     promptPreview: boundedSummary(session.source.prompt),
     document: session.document ? publicDocument(session.document) : null,
     annotations: Object.freeze(session.annotations.map((annotation) => publicAnnotation(annotation, session))),
-    actions: Object.freeze({ canRetryStaging: actions.canRetryStaging === true }),
+    ...(session.grill ? { grill: publicGrill(session.grill) } : {}),
+    actions: Object.freeze({ canRetryGeneration: actions.canRetryGeneration === true, canRetryStaging: actions.canRetryStaging === true }),
     ...(activity ? { activity: publicActivity(activity) } : {}),
     ...(session.clarifications?.pending ? { clarification: publicClarification(session.clarifications.pending) } : {}),
     ...(session.generationJob ? { job: Object.freeze({ operation: session.generationJob.operation, baseDocumentRevision: session.generationJob.baseDocumentRevision, startedAt: session.generationJob.startedAt }) } : {}),
@@ -89,12 +94,14 @@ export function parseStateIfMatch(value: string | undefined): number | null {
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
-export type RequestKind = "annotation-create" | "annotation-patch" | "revision" | "accept" | "cancel" | "reopen" | "clarification-answers";
+export type RequestKind = "annotation-create" | "annotation-patch" | "generation-retry" | "grill" | "revision" | "accept" | "cancel" | "reopen" | "clarification-answers";
 export type ParseProtocolResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly code: string; readonly message: string };
 
 export function parseMutation(kind: "annotation-create", value: unknown): ParseProtocolResult<AnnotationCreateRequest>;
 export function parseMutation(kind: "annotation-patch", value: unknown): ParseProtocolResult<AnnotationPatchRequest>;
 export function parseMutation(kind: "revision", value: unknown): ParseProtocolResult<RevisionRequest>;
+export function parseMutation(kind: "generation-retry", value: unknown): ParseProtocolResult<GenerationRetryRequest>;
+export function parseMutation(kind: "grill", value: unknown): ParseProtocolResult<GrillRequest>;
 export function parseMutation(kind: "accept", value: unknown): ParseProtocolResult<AcceptRequest>;
 export function parseMutation(kind: "cancel", value: unknown): ParseProtocolResult<CancelRequest>;
 export function parseMutation(kind: "reopen", value: unknown): ParseProtocolResult<ReopenRequest>;
@@ -148,7 +155,7 @@ export function parseMutation(kind: RequestKind, value: unknown): ParseProtocolR
     if (new Set(answers.map((entry) => entry.questionId)).size !== answers.length) return invalid("invalid-answers", "Clarification question IDs must be unique.");
     return valid({ requestId: value.requestId, clarificationId: value.clarificationId, answers });
   }
-  if (!keys(value, ["requestId"])) return invalid("invalid-request", "The reopen request is invalid.");
+  if (!keys(value, ["requestId"])) return invalid("invalid-request", kind === "generation-retry" ? "The generation retry request is invalid." : kind === "grill" ? "The Grill request is invalid." : "The reopen request is invalid.");
   return valid({ requestId: value.requestId });
 }
 
@@ -179,6 +186,9 @@ function publicActivity(activity: PublicActivity): PublicActivity {
     timeline: Object.freeze(activity.timeline.slice(-12).map((entry) => Object.freeze({ phase: entry.phase, at: entry.at }))),
   });
 }
+function publicGrill(grill: NonNullable<PlanSession["grill"]>): NonNullable<PlanSession["grill"]> {
+  return Object.freeze({ basedOnDocumentRevision: grill.basedOnDocumentRevision, annotationIds: Object.freeze({ ...grill.annotationIds }), generatedAt: grill.generatedAt, decisionTree: Object.freeze({ ...(grill.decisionTree.rootNodeId === undefined ? {} : { rootNodeId: grill.decisionTree.rootNodeId }), nodes: Object.freeze(grill.decisionTree.nodes.map((node) => Object.freeze({ id: node.id, question: node.question, annotationKeys: Object.freeze([...node.annotationKeys]), options: Object.freeze(node.options.map((option) => Object.freeze({ id: option.id, label: option.label, ...(option.nextNodeId === undefined ? {} : { nextNodeId: option.nextNodeId }), ...(option.decision === undefined ? {} : { decision: option.decision }) }))) }))) }) });
+}
 function publicDocument(document: PlanDocument): PublicPlanDocument {
   return Object.freeze({ id: document.id, title: publicElement(document.title), elements: Object.freeze(document.elements.map(publicElement)) });
 }
@@ -188,7 +198,7 @@ function publicElement(element: PlanElement): PublicPlanElement {
 function publicAnnotation(annotation: Annotation, session: PlanSession): PublicAnnotation {
   const locked = session.generationJob?.selectedAnnotationIds.includes(annotation.id) === true || session.clarifications?.pending?.selectedAnnotationIds.includes(annotation.id) === true;
   return Object.freeze({
-    id: annotation.id, target: cloneTarget(annotation.target), targetSummary: annotationTargetSummary(annotation, session),
+    id: annotation.id, author: annotation.author ?? "user", target: cloneTarget(annotation.target), targetSummary: annotationTargetSummary(annotation, session),
     body: annotation.body, status: annotation.status, locked,
     createdAgainstRevision: annotation.createdAgainstRevision, createdAt: annotation.createdAt, updatedAt: annotation.updatedAt,
   });

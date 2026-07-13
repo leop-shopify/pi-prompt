@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { PlanController, PlanControllerResult } from "./controller.js";
 import { renderPlanMarkdown } from "./classification.js";
 import { PLAN_LIMITS } from "./schema.js";
-import { MAX_WRITER_RESULT_BYTES } from "./session-files.js";
+import { MAX_GRILL_RESULT_BYTES, MAX_WRITER_RESULT_BYTES } from "./session-files.js";
 import type { WriterSubmissionKind } from "./generator.js";
 import { EventLedger } from "./event-ledger.js";
 import { readStrictJsonBody, rejectUnexpectedBody, validateRequestHead, type RequestFailure } from "./http-request.js";
@@ -16,6 +16,9 @@ import {
   type MutationRequest, type PublicActivity, type PublicSnapshot, type RequestKind,
 } from "./protocol.js";
 import { ReplayLedger } from "./replay-ledger.js";
+import type { SpecController } from "../spec/controller.js";
+import { SPEC_LIMITS } from "../spec/schema.js";
+import { parseSpecIfMatch, parseSpecMutation, specMutationFingerprint, specStateEtag, toPublicSpecSnapshot, type SpecMutation, type SpecRequestKind } from "../spec/protocol.js";
 
 export const PLAN_SERVER_IDLE_MS = 30 * 60 * 1_000;
 export const PLAN_SERVER_HOST = "127.0.0.1";
@@ -42,6 +45,10 @@ export interface PlanHttpHostOptions {
   readonly capabilityFactory?: () => string;
   readonly activity?: () => PublicActivity | undefined;
   readonly planRoot?: string;
+  /** Optional independent sidecar. No Spec result is ever routed through the Plan controller. */
+  readonly specController?: SpecController;
+  /** Lazily creates the sidecar after the current Plan has a Grill artifact. */
+  readonly createSpecController?: () => Promise<SpecController | null>;
 }
 export interface PlanHttpHost {
   readonly port: number; readonly origin: string; readonly launchUrl: string;
@@ -72,6 +79,7 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
   }));
   const assets = new Map(assetEntries);
   const events = new EventLedger(256, longPollMs);
+  const specEvents = new EventLedger(256, longPollMs);
   const replay = new ReplayLedger<ResponseRecord>({
     capacity: 512,
     maximumInFlight: 64,
@@ -89,6 +97,33 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
   let mutationTail: Promise<void> = Promise.resolve();
   let host = "";
   let origin = "";
+  let writerEndpoint = "";
+  let activeSpecController = options.specController ?? null;
+  let ownsSpecController = false;
+  let specCreation: Promise<SpecController | null> | null = null;
+  let unsubscribeSpec: () => void = () => undefined;
+
+  const subscribeSpec = (controller: SpecController): void => {
+    unsubscribeSpec();
+    unsubscribeSpec = controller.subscribe((event) => {
+      if (closing) return;
+      specEvents.publish({ kind: event.kind, status: event.status, stateVersion: event.stateVersion, documentRevision: event.specRevision, ...(event.errorCode ? { errorCode: event.errorCode } : {}) });
+    });
+  };
+  if (activeSpecController) subscribeSpec(activeSpecController);
+  const ensureSpecController = async (): Promise<SpecController | null> => {
+    if (closing) return null;
+    if (activeSpecController) return activeSpecController;
+    if (!options.createSpecController) return null;
+    if (!specCreation) specCreation = options.createSpecController().then(async (controller) => {
+      if (!controller) return null;
+      if (closing) { await controller.close().catch(() => undefined); return null; }
+      const configured = controller.configureWriterEndpoint(writerEndpoint);
+      if (!configured.ok) { await controller.close().catch(() => undefined); return null; }
+      activeSpecController = controller; ownsSpecController = true; subscribeSpec(controller); return controller;
+    }).finally(() => { specCreation = null; });
+    return specCreation;
+  };
 
   const resetIdle = (): void => {
     if (idleTimer) clearTimeout(idleTimer);
@@ -109,17 +144,20 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
   const close = (): Promise<void> => {
     if (closePromise) return closePromise;
     closing = true;
-    unsubscribe();
-    events.close();
+    unsubscribe(); unsubscribeSpec();
+    events.close(); specEvents.close();
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-    closePromise = new Promise<void>((resolve) => {
+    const serverClose = new Promise<void>((resolve) => {
       let fallback: NodeJS.Timeout | null = null;
-      server.close(() => { if (fallback) clearTimeout(fallback); closed = true; replay.clear(); resolve(); });
+      server.close(() => { if (fallback) clearTimeout(fallback); resolve(); });
       server.closeIdleConnections?.();
       // Let already-dispatched replay-shared and queued-closing responses flush before the bounded fallback.
       fallback = setTimeout(() => { for (const socket of sockets) socket.destroy(); }, 250);
       fallback.unref();
     });
+    const activeSpecClose = ownsSpecController && activeSpecController ? activeSpecController.close().catch(() => undefined) : Promise.resolve();
+    const pendingSpecClose = specCreation?.catch(() => undefined) ?? Promise.resolve();
+    closePromise = Promise.all([serverClose, activeSpecClose, pendingSpecClose]).then(() => { closed = true; replay.clear(); });
     return closePromise;
   };
   const scheduleClose = (disposition: NonNullable<ResponseRecord["closeAfter"]>): void => {
@@ -143,9 +181,9 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
       catch { send(response, { status: 500, body: errorBody("internal-error", "The request could not be completed.") }); }
       return;
     }
-    // Mutations already accepted by the HTTP stack still enter replay/serialization: exact duplicates
-    // share their terminal response, while distinct queued work observes closing inside dispatch.
-    if (closing && !mutation) { send(response, { status: 503, body: errorBody("closing", "The review listener is closing.") }); return; }
+    // Plan mutation duplicates already accepted by the HTTP stack retain their replay-shared
+    // terminal response; Spec mutations enforce their stricter shutdown fence in routeSpec.
+    if (closing && !mutation) { send(response, closingRecord()); return; }
     if (activeRequests > maximumConnections * 2) { send(response, { status: 429, body: errorBody("too-many-requests", "Too many requests are active.") }); return; }
     const head = validateRequestHead(request, { host, origin, capability }, mutation);
     if (!head.ok) { sendFailure(response, head); return; }
@@ -176,11 +214,15 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
   if (!address || typeof address === "string" || address.address !== PLAN_SERVER_HOST) { await close(); throw new Error("loopback-bind-failed"); }
   host = `${PLAN_SERVER_HOST}:${address.port}`;
   origin = `http://${host}`;
-  const writerEndpoint = `${origin}${WRITER_SUBMISSION_PATH}`;
+  writerEndpoint = `${origin}${WRITER_SUBMISSION_PATH}`;
   let configured: PlanControllerResult;
   try { configured = options.controller.configureWriterEndpoint(writerEndpoint); }
   catch { await close(); throw new Error("writer-endpoint-configuration-failed"); }
   if (!configured.ok) { await close(); throw new Error(configured.error.code); }
+  if (activeSpecController) {
+    const specConfigured = activeSpecController.configureWriterEndpoint(writerEndpoint);
+    if (!specConfigured.ok) { await close(); throw new Error(specConfigured.error.code); }
+  }
   resetIdle();
 
   async function handleWriterSubmission(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -189,14 +231,25 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
     if (request.method !== "POST") { methodNotAllowed(response, ["POST"]); return; }
     if (head.value.searchParams.size !== 0) { send(response, { status: 400, body: errorBody("invalid-request", "The writer submission URL is invalid.") }); return; }
     const resultHeader = request.headers["x-pi-prompt-result"];
-    const kind: WriterSubmissionKind | null = resultHeader === "plan" || resultHeader === "clarification" ? resultHeader : null;
+    const kind: WriterSubmissionKind | "spec" | null = resultHeader === "plan" || resultHeader === "clarification" || resultHeader === "grill" || resultHeader === "spec" ? resultHeader : null;
     if (!kind) { send(response, { status: 422, body: errorBody("unsupported-result", "The writer result type is unsupported.") }); return; }
-    const expectedType = kind === "plan" ? "text/markdown" : "application/json";
+    const expectedType = kind === "plan" || kind === "spec" ? "text/markdown" : "application/json";
     if (request.headers["content-type"] !== expectedType) { send(response, { status: 415, body: errorBody("unsupported-media-type", "The writer result Content-Type is unsupported.") }); return; }
-    const maximum = kind === "plan" ? PLAN_LIMITS.committedMarkdownBytes : MAX_WRITER_RESULT_BYTES;
+    const maximum = kind === "plan" ? PLAN_LIMITS.committedMarkdownBytes : kind === "spec" ? SPEC_LIMITS.markdownBytes : kind === "grill" ? MAX_GRILL_RESULT_BYTES : MAX_WRITER_RESULT_BYTES;
     const body = await readWriterBody(request, maximum);
     if (!body.ok) { sendFailure(response, body); return; }
-    const submitted = await options.controller.submitWriterResult({ attemptId: head.value.attemptId, kind, body: body.value });
+    if (closing) { send(response, closingRecord()); return; }
+    if (kind === "spec" && !activeSpecController) {
+      send(response, { status: 401, body: errorBody("writer-submission-stale", "No active Spec writer accepts this result.") });
+      return;
+    }
+    const specController = activeSpecController;
+    if (closing) { send(response, closingRecord()); return; }
+    const specState = specController?.snapshot();
+    const submitted = kind === "spec" && specController && specState?.generationJob
+      ? await specController.submitWriterResult({ planSessionId: specState.planSessionId, jobId: specState.generationJob.jobId, operation: specState.generationJob.operation, baseSpecRevision: specState.generationJob.baseSpecRevision, attemptId: head.value.attemptId, kind: "spec", body: body.value })
+      : kind === "spec" ? { ok: false as const, error: { code: "writer-submission-stale", message: "No active Spec writer accepts this result." } }
+      : await options.controller.submitWriterResult({ attemptId: head.value.attemptId, kind, body: body.value });
     if (!submitted.ok) {
       const unauthorized = submitted.error.code === "writer-submission-stale" || submitted.error.code === "writer-attempt-rejected";
       send(response, { status: unauthorized ? 401 : 422, body: errorBody(submitted.error.code, submitted.error.message) });
@@ -247,6 +300,7 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
       if (result.kind === "future") { send(response, { status: 400, body: { error: { code: "future-sequence", message: "The event sequence is ahead of the server." }, currentSequence: result.currentSequence } }); return; }
       send(response, { status: 200, body: result }); return;
     }
+    if (pathname.startsWith("/api/v1/spec")) { await routeSpec(request, response, pathname, searchParams); return; }
     const annotationMatch = /^\/api\/v1\/annotations\/([^/]+)$/.exec(pathname);
     const definition = mutationDefinition(pathname, annotationMatch);
     if (!definition) { send(response, { status: 404, body: errorBody("not-found", "The requested resource was not found.") }); return; }
@@ -281,6 +335,70 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
     if (result.closeAfter) scheduleClose(result.closeAfter);
   }
 
+  async function routeSpec(request: IncomingMessage, response: ServerResponse, pathname: string, searchParams: URLSearchParams): Promise<void> {
+    if (closing) { send(response, closingRecord()); return; }
+    const controller = await ensureSpecController();
+    if (closing) { send(response, closingRecord()); return; }
+    if (!controller) { send(response, { status: 404, body: errorBody("spec-unavailable", "The Spec sidecar is unavailable until the current Plan has completed Grill.") }); return; }
+    const method = request.method ?? "";
+    if (pathname === "/api/v1/spec/snapshot") {
+      if (method !== "GET") { methodNotAllowed(response, ["GET"]); return; }
+      if ([...searchParams].length || rejectUnexpectedBody(request)) { send(response, { status: 400, body: errorBody("invalid-request", "The Spec snapshot request is invalid.") }); return; }
+      const snapshot = toPublicSpecSnapshot(controller.snapshot(), controller.acceptedStagingPending()); send(response, { status: 200, body: { snapshot }, headers: { ETag: specStateEtag(snapshot.stateVersion) } }); return;
+    }
+    if (pathname === "/api/v1/spec/markdown") {
+      if (method !== "GET") { methodNotAllowed(response, ["GET"]); return; }
+      if ([...searchParams].length || rejectUnexpectedBody(request)) { send(response, { status: 400, body: errorBody("invalid-request", "The Spec Markdown request is invalid.") }); return; }
+      const markdown = controller.snapshot().markdown; if (markdown === null) { send(response, { status: 404, body: errorBody("spec-unavailable", "No committed Spec is available.") }); return; }
+      send(response, { status: 200, body: markdown, headers: { "Content-Type": "text/markdown; charset=utf-8", ETag: specStateEtag(controller.snapshot().stateVersion) } }); return;
+    }
+    if (pathname === "/api/v1/spec/events") {
+      if (method !== "GET") { methodNotAllowed(response, ["GET"]); return; }
+      if (rejectUnexpectedBody(request)) { send(response, { status: 400, body: errorBody("invalid-request", "The Spec event request is invalid.") }); return; }
+      const values = searchParams.getAll("after"); if (values.length !== 1 || [...searchParams.keys()].some((key) => key !== "after") || !/^(0|[1-9]\d*)$/u.test(values[0] ?? "")) { send(response, { status: 400, body: errorBody("invalid-sequence", "The Spec event sequence is invalid.") }); return; }
+      const after = Number(values[0]); if (!Number.isSafeInteger(after)) { send(response, { status: 400, body: errorBody("invalid-sequence", "The Spec event sequence is invalid.") }); return; }
+      const abort = new AbortController(); response.once("close", () => { if (!response.writableFinished) abort.abort(); }); const result = await specEvents.wait(after, longPollMs, abort.signal); send(response, result.kind === "future" ? { status: 400, body: { error: { code: "future-sequence", message: "The Spec event sequence is ahead of the server." }, currentSequence: result.currentSequence } } : { status: 200, body: result }); return;
+    }
+    const commentMatch = /^\/api\/v1\/spec\/comments\/([^/]+)$/u.exec(pathname);
+    const statusMatch = /^\/api\/v1\/spec\/comments\/([^/]+)\/status$/u.exec(pathname);
+    const definition: { readonly method: "POST" | "PATCH"; readonly kind: SpecRequestKind } | null = pathname === "/api/v1/spec/generations" ? { method: "POST", kind: "generate" }
+      : pathname === "/api/v1/spec/fresh-generations" ? { method: "POST", kind: "fresh-generation" }
+      : pathname === "/api/v1/spec/comments" ? { method: "POST", kind: "comment-create" }
+      : commentMatch ? { method: "PATCH", kind: "comment-edit" }
+      : statusMatch ? { method: "PATCH", kind: "comment-status" }
+      : pathname === "/api/v1/spec/revisions" ? { method: "POST", kind: "revision" }
+      : pathname === "/api/v1/spec/accept" ? { method: "POST", kind: "accept" }
+      : pathname === "/api/v1/spec/cancel" ? { method: "POST", kind: "cancel" } : null;
+    if (!definition) { send(response, { status: 404, body: errorBody("not-found", "The Spec resource was not found.") }); return; }
+    if (method !== definition.method) { methodNotAllowed(response, [definition.method]); return; }
+    if ([...searchParams].length) { send(response, { status: 400, body: errorBody("invalid-request", "Spec mutation URLs do not accept query parameters.") }); return; }
+    const expected = parseSpecIfMatch(typeof request.headers["if-match"] === "string" ? request.headers["if-match"] : undefined); if (request.headers["if-match"] === undefined) { send(response, { status: 428, body: errorBody("precondition-required", "If-Match is required.") }); return; } if (expected === null) { send(response, { status: 400, body: errorBody("invalid-precondition", "If-Match must be one exact strong Spec ETag.") }); return; }
+    const parsedBody = await readStrictJsonBody(request); if (!parsedBody.ok) { sendFailure(response, parsedBody); return; } const parsed = parseSpecMutation(definition.kind, parsedBody.value); if (!parsed.ok) { send(response, { status: 422, body: errorBody(parsed.code, parsed.message) }); return; }
+    if (definition.kind === "accept" && "stateVersion" in parsed.value && parsed.value.stateVersion !== expected) { send(response, specConflict()); return; }
+    let commentId: string | undefined; const idMatch = commentMatch ?? statusMatch; if (idMatch) { try { commentId = decodeURIComponent(idMatch[1]!); } catch { send(response, { status: 400, body: errorBody("invalid-comment-id", "Spec comment ID is invalid.") }); return; } if (!/^[!-~]{1,64}$/u.test(commentId)) { send(response, { status: 400, body: errorBody("invalid-comment-id", "Spec comment ID is invalid.") }); return; } }
+    if (closing) { send(response, closingRecord()); return; }
+    const fingerprint = specMutationFingerprint(definition.kind, expected, parsed.value); const decision = replay.run(parsed.value.requestId, fingerprint, () => serialize(() => dispatchSpec(definition.kind, expected, parsed.value, commentId)));
+    if (decision.kind === "conflict") { send(response, { status: 409, body: errorBody("request-id-conflict", "The request ID was already used for different input.") }); return; } if (decision.kind === "overloaded") { send(response, { status: 503, body: errorBody("replay-overloaded", "Too many Spec mutations are awaiting completion.") }); return; } const result = await decision.result; send(response, closing ? closingRecord() : result);
+  }
+
+  async function dispatchSpec(kind: SpecRequestKind, expected: number, body: SpecMutation, commentId?: string): Promise<ResponseRecord> {
+    if (closing) return closingRecord();
+    const controller = activeSpecController!; const state = controller.snapshot(); if (state.stateVersion !== expected) return specConflict(); let result: PlanControllerResult<unknown>;
+    if (kind === "generate" || kind === "fresh-generation") { const started = kind === "fresh-generation" ? await controller.generateFresh({ expectedStateVersion: expected }) : await controller.generate({ expectedStateVersion: expected }); if (closing) return closingRecord(); if (!started.ok) return specFailure(started); const dispatched = controller.dispatchGeneration(started.value.jobId); if (!dispatched.ok) return specFailure(dispatched); return specSnapshot(202, { job: { id: started.value.jobId, status: "generating" } }); }
+    if (kind === "comment-create" && "start" in body && "end" in body && "body" in body) result = await controller.addComment({ expectedStateVersion: expected, start: body.start, end: body.end, body: body.body });
+    else if (kind === "comment-edit" && commentId && "body" in body) result = await controller.editComment({ expectedStateVersion: expected, commentId, body: body.body });
+    else if (kind === "comment-status" && commentId && "status" in body) result = await controller.transitionComment({ expectedStateVersion: expected, commentId, status: body.status });
+    else if (kind === "revision" && "selectedCommentIds" in body) { const started = await controller.revise({ expectedStateVersion: expected, selectedCommentIds: body.selectedCommentIds, ...(body.instruction ? { instruction: body.instruction } : {}) }); if (closing) return closingRecord(); if (!started.ok) return specFailure(started); const dispatched = controller.dispatchGeneration(started.value.jobId); if (!dispatched.ok) return specFailure(dispatched); return specSnapshot(202, { job: { id: started.value.jobId, status: "revising" } }); }
+    else if (kind === "accept" && "specRevision" in body && "confirmed" in body) result = await controller.accept({ expectedStateVersion: expected, specRevision: body.specRevision, confirmed: body.confirmed });
+    else if (kind === "cancel" && "disposition" in body) result = body.disposition === "pause" ? await controller.pause({ expectedStateVersion: expected }) : await controller.cancel({ expectedStateVersion: expected });
+    else return { status: 422, body: errorBody("invalid-request", "Spec mutation is invalid.") };
+    if (closing) return closingRecord();
+    return result.ok ? specSnapshot(200, { ok: true }) : specFailure(result);
+  }
+  function specSnapshot(status: number, body: Record<string, unknown>): ResponseRecord { const controller = activeSpecController!; const snapshot = toPublicSpecSnapshot(controller.snapshot(), controller.acceptedStagingPending()); return { status, body: { ...body, snapshot }, headers: { ETag: specStateEtag(snapshot.stateVersion) } }; }
+  function specConflict(): ResponseRecord { const controller = activeSpecController!; const snapshot = toPublicSpecSnapshot(controller.snapshot(), controller.acceptedStagingPending()); return { status: 409, body: { error: { code: "state-conflict", message: "The Spec changed. Refresh and retry." }, current: { stateVersion: snapshot.stateVersion, specRevision: snapshot.specRevision }, snapshot }, headers: { ETag: specStateEtag(snapshot.stateVersion) } }; }
+  function specFailure(result: { readonly ok: false; readonly error: { readonly code: string; readonly message: string } }): ResponseRecord { if (result.error.code === "state-conflict") return specConflict(); return { status: result.error.code === "persistence-failed" || result.error.code === "controller-closed" ? 503 : ["job-active", "terminal-state"].includes(result.error.code) ? 409 : 422, body: errorBody(result.error.code, result.error.message) }; }
+
   async function dispatch(kind: RequestKind, expected: number, body: MutationRequest, annotationId?: string): Promise<ResponseRecord> {
     if (closing) return { status: 503, body: errorBody("closing", "The review listener is closing.") };
     const state = options.controller.snapshot();
@@ -297,6 +415,19 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
       const dispatched = options.controller.dispatchGeneration(started.value.jobId);
       if (!dispatched.ok) return controllerFailure(dispatched);
       return withSnapshot(202, { job: { id: started.value.jobId, status: "revising" } });
+    } else if (kind === "grill") {
+      if (!["ready", "error"].includes(state.status) || state.document === null || state.generationJob) return { status: 409, body: errorBody("grill-unavailable", "Grill cannot start from the current state.") };
+      const started = await options.controller.grill({ expectedStateVersion: expected });
+      if (!started.ok) return controllerFailure(started);
+      const dispatched = options.controller.dispatchGeneration(started.value.jobId); if (!dispatched.ok) return controllerFailure(dispatched);
+      return withSnapshot(202, { job: { id: started.value.jobId, status: "grilling" } });
+    } else if (kind === "generation-retry") {
+      if (state.status !== "error" || state.document !== null || state.generationJob) return { status: 409, body: errorBody("retry-unavailable", "Initial plan generation cannot be retried from the current state.") };
+      const started = await options.controller.generate({ expectedStateVersion: expected });
+      if (!started.ok) return controllerFailure(started);
+      const dispatched = options.controller.dispatchGeneration(started.value.jobId);
+      if (!dispatched.ok) return controllerFailure(dispatched);
+      return withSnapshot(202, { job: { id: started.value.jobId, status: "generating" } });
     } else if (kind === "clarification-answers" && "clarificationId" in body && "answers" in body) {
       if (state.status !== "awaiting-clarification" || state.clarifications?.pending?.id !== body.clarificationId) return conflictRecord();
       const started = await options.controller.answerClarification({ expectedStateVersion: expected, clarificationId: body.clarificationId, answers: body.answers });
@@ -322,7 +453,10 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
 
   function currentSnapshot(): PublicSnapshot | null {
     const state = options.controller.snapshot();
-    return state ? toPublicSnapshot(state, { canRetryStaging: options.controller.acceptedStagingPending() }, options.activity?.()) : null;
+    return state ? toPublicSnapshot(state, {
+      canRetryGeneration: state.status === "error" && state.document === null && state.generationJob === undefined,
+      canRetryStaging: options.controller.acceptedStagingPending(),
+    }, options.activity?.()) : null;
   }
   function withSnapshot(status: number, body: Record<string, unknown>): ResponseRecord { const snapshot = currentSnapshot(); return snapshot ? { status, body: { ...body, snapshot }, headers: { ETag: stateEtag(snapshot.stateVersion) } } : { status: 503, body: errorBody("state-unavailable", "Plan state is unavailable.") }; }
   function snapshotResponse(snapshot: PublicSnapshot): ResponseRecord { return { status: 200, body: { snapshot }, headers: { ETag: stateEtag(snapshot.stateVersion) } }; }
@@ -387,6 +521,8 @@ function requestFailure(status: number, code: string, message: string): RequestF
 function mutationDefinition(pathname: string, annotationMatch: RegExpExecArray | null): { readonly method: "POST" | "PATCH"; readonly kind: RequestKind } | null {
   if (pathname === "/api/v1/annotations") return { method: "POST", kind: "annotation-create" };
   if (annotationMatch) return { method: "PATCH", kind: "annotation-patch" };
+  if (pathname === "/api/v1/generation-retries") return { method: "POST", kind: "generation-retry" };
+  if (pathname === "/api/v1/grill-runs") return { method: "POST", kind: "grill" };
   if (pathname === "/api/v1/revision-requests") return { method: "POST", kind: "revision" };
   if (pathname === "/api/v1/clarification-answers") return { method: "POST", kind: "clarification-answers" };
   if (pathname === "/api/v1/accept") return { method: "POST", kind: "accept" };
@@ -405,6 +541,7 @@ function send(response: ServerResponse, record: ResponseRecord, finished?: () =>
   response.end(payload, finished);
 }
 function errorBody(code: string, message: string): object { return { error: { code, message } }; }
+function closingRecord(): ResponseRecord { return { status: 503, body: errorBody("closing", "The review listener is closing.") }; }
 function responseRecordBytes(record: ResponseRecord): number {
   const body = record.body === undefined ? Buffer.alloc(0) : Buffer.isBuffer(record.body)
     ? record.body : Buffer.from(typeof record.body === "string" ? record.body : JSON.stringify(record.body), "utf8");

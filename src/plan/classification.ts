@@ -31,14 +31,14 @@ export function normalizeExecutionInput(
   let promptText = input;
 
   while (true) {
-    const match = promptText.match(/^\s*\/(goal|loop|create-goal)(?=$|\s)/);
+    const match = promptText.match(/^\s*\/(goal|loop)(?=$|\s)/);
     if (!match) break;
     typed.push(match[1] as Exclude<ExecutionKind["kind"], "normal">);
     promptText = promptText.slice(match[0].length);
   }
 
   const typedKinds = [...new Set(typed)];
-  if (typedKinds.length > 1) return classificationFailure("mixed-execution", "Typed /goal, /loop, and /create-goal prefixes conflict.");
+  if (typedKinds.length > 1) return classificationFailure("mixed-execution", "Typed /goal and /loop prefixes conflict.");
   const typedKind = typedKinds[0];
   if (typedKind && selectedKind !== "normal" && typedKind !== selectedKind) {
     return classificationFailure("selected-execution-conflict", `Selected ${selectedKind} execution conflicts with typed /${typedKind}.`);
@@ -88,7 +88,7 @@ function labelForKind(kind: PlanElement["kind"]): string {
 function stripAllLeadingExecutionPrefixes(value: string): string {
   let result = value;
   while (true) {
-    const match = result.match(/^\s*\/(?:goal|loop|create-goal)(?=$|\s)/);
+    const match = result.match(/^\s*\/(?:goal|loop)(?=$|\s)/);
     if (!match) return result;
     result = result.slice(match[0].length);
   }

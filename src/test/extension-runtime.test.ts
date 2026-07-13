@@ -14,23 +14,29 @@ function ready(): PlanSession { return { ...empty(), stateVersion: 3, documentRe
 function context(): ExtensionContext { return { cwd: "/repo", mode: "tui", isIdle: () => true, ui: { notify: vi.fn(), confirm: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn(), setEditorText: vi.fn() }, sessionManager: { getBranch: () => [] } } as unknown as ExtensionContext; }
 function controllerHarness() {
   let state = empty(); let finish!: (value: any) => void;
+  const listeners = new Set<(event: any) => void>();
   const completion = new Promise<any>((resolve) => { finish = resolve; });
   const controller = {
     snapshot: vi.fn(() => state),
+    subscribe: vi.fn((listener: (event: any) => void) => { listeners.add(listener); return () => listeners.delete(listener); }),
     configureWriterEndpoint: vi.fn(() => ({ ok: true, value: undefined })),
     generate: vi.fn(async () => { state = empty("generating"); return { ok: true, value: { jobId: "job", completion } }; }),
     dispatchGeneration: vi.fn(() => ({ ok: true, value: undefined })),
     pause: vi.fn(async () => { state = { ...state, stateVersion: state.stateVersion + 1, status: "paused", generationJob: undefined } as PlanSession; return { ok: true, value: undefined }; }),
     verifySkills: vi.fn(async () => ({ ok: true, value: undefined })), resumeReview: vi.fn(async () => ({ ok: true, value: undefined })),
     acceptedStagingPending: vi.fn(() => false), accept: vi.fn(), close: vi.fn(async () => undefined),
-    setReady: () => { state = ready(); }, finish,
+    setReady: () => { state = ready(); },
+    cancelPlan: () => { state = { ...state, stateVersion: state.stateVersion + 1, status: "cancelled", generationJob: undefined } as PlanSession; for (const listener of listeners) listener({ kind: "cancelled", sessionId: state.id, status: "cancelled", stateVersion: state.stateVersion, documentRevision: state.documentRevision }); },
+    setCancelled: () => { state = { ...state, status: "cancelled", generationJob: undefined } as PlanSession; },
+    finish,
   };
   return controller as unknown as PlanController & typeof controller;
 }
 function runtimeFor(controller: PlanController, review: any) {
   const create = vi.fn(async () => ({ ok: true as const, value: { controller, loadedSkills: { references: [], contexts: [] } } }));
   const recover = vi.fn(async () => ({ ok: true as const, value: { controller, state: controller.snapshot(), warnings: [], reservedIds: [] } }));
-  return { runtime: createPromptExtensionRuntime({ controllers: { create, recover } as unknown as ControllerStackFactory, review, editor: { open: vi.fn() } }), create, recover };
+  const planDrafts = { upsert: vi.fn(async () => undefined), remove: vi.fn(async () => undefined) };
+  return { runtime: createPromptExtensionRuntime({ controllers: { create, recover } as unknown as ControllerStackFactory, review, editor: { open: vi.fn() }, planDrafts }), create, recover, planDrafts };
 }
 
 describe("extension runtime", () => {
@@ -44,6 +50,30 @@ describe("extension runtime", () => {
     expect(order).toEqual(["durable", "endpoint", "browser", "dispatch"]);
     expect(controller.configureWriterEndpoint).toHaveBeenCalledBefore(controller.dispatchGeneration);
     expect(controller.snapshot()?.status).toBe("paused");
+  });
+
+  it("auto-saves one deterministic restart draft and removes it only after cancellation", async () => {
+    const controller = controllerHarness(); const review = { start: vi.fn(), ready: vi.fn(), close: vi.fn() };
+    const { runtime, planDrafts } = runtimeFor(controller, review);
+    await runtime.generate(context(), submission);
+    expect(planDrafts.upsert).toHaveBeenCalledOnce();
+    expect(planDrafts.upsert).toHaveBeenCalledWith("session", "Build it");
+    expect(planDrafts.remove).not.toHaveBeenCalled();
+    controller.cancelPlan();
+    await vi.waitFor(() => expect(planDrafts.remove).toHaveBeenCalledWith("session"));
+  });
+
+  it("keeps the restart draft on lifecycle close and removes a stale draft for recovered cancellation", async () => {
+    const active = controllerHarness(); const review = { start: vi.fn(), ready: vi.fn(), close: vi.fn() };
+    const generated = runtimeFor(active, review);
+    await generated.runtime.generate(context(), submission); await generated.runtime.beforeTree();
+    expect(generated.planDrafts.remove).not.toHaveBeenCalled();
+
+    const cancelled = controllerHarness(); cancelled.setCancelled();
+    const recovered = runtimeFor(cancelled, review);
+    await recovered.runtime.resume(context());
+    expect(recovered.planDrafts.remove).toHaveBeenCalledWith("session");
+    expect(recovered.planDrafts.upsert).not.toHaveBeenCalled();
   });
 
   it("pauses safely and never dispatches when the private review host cannot start", async () => {
@@ -60,6 +90,46 @@ describe("extension runtime", () => {
     controller.setReady(); controller.finish({ ok: true, value: undefined });
     await vi.waitFor(() => expect(review.ready).toHaveBeenCalledWith(expect.objectContaining({ controller, state: expect.objectContaining({ status: "ready" }) })));
     expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-prompt-plan", undefined);
+  });
+
+  it("normalizes a recovered active Grill job before presenting its materialized artifacts for review", async () => {
+    const artifact = { basedOnDocumentRevision: 1, annotationIds: { concern: "grill-note" }, decisionTree: { rootNodeId: "root", nodes: [{ id: "root", question: "Proceed?", annotationKeys: ["concern"], options: [] }] }, generatedAt: "2026-07-11T00:00:00.000Z" };
+    let state = { ...ready(), status: "grilling" as const, stateVersion: 8,
+      annotations: [{ id: "grill-note", author: "grill" as const, target: { kind: "element" as const, elementId: "execution" }, targetSnapshot: { documentRevision: 1, target: { kind: "element" as const, elementId: "execution" }, elementKind: "execution" as const, text: "Normal" }, body: "Confirm the normal path.", status: "open" as const, history: [], createdAgainstRevision: 1, createdAt: "2026-07-11T00:00:00.000Z", updatedAt: "2026-07-11T00:00:00.000Z" }], grill: artifact,
+      generationJob: { jobId: "phantom-grill", operation: "grill" as const, baseDocumentRevision: 1, selectedAnnotationIds: [], startedAt: "2026-07-11T00:01:00.000Z" } } as PlanSession;
+    const controller = {
+      snapshot: vi.fn(() => state), close: vi.fn(async () => undefined), acceptedStagingPending: vi.fn(() => false),
+      pause: vi.fn(async ({ expectedStateVersion }: { expectedStateVersion: number }) => {
+        expect(expectedStateVersion).toBe(8);
+        state = { ...state, stateVersion: 9, status: "paused", generationJob: undefined } as PlanSession;
+        return { ok: true, value: undefined };
+      }),
+      verifySkills: vi.fn(async ({ expectedStateVersion }: { expectedStateVersion: number }) => {
+        expect(expectedStateVersion).toBe(9);
+        return { ok: true, value: undefined };
+      }),
+      resumeReview: vi.fn(async ({ expectedStateVersion }: { expectedStateVersion: number }) => {
+        expect(expectedStateVersion).toBe(9);
+        state = { ...state, stateVersion: 10, status: "ready" } as PlanSession;
+        return { ok: true, value: undefined };
+      }),
+    } as unknown as PlanController;
+    const review = { start: vi.fn(), ready: vi.fn(), close: vi.fn() }; const { runtime } = runtimeFor(controller, review);
+    await runtime.resume(context());
+    expect((controller as any).pause).toHaveBeenCalledWith({ expectedStateVersion: 8 });
+    expect((controller as any).resumeReview).toHaveBeenCalledWith({ expectedStateVersion: 9 });
+    expect(state).toMatchObject({ status: "ready", generationJob: undefined, grill: artifact });
+    expect(review.ready).toHaveBeenCalledWith(expect.objectContaining({ controller, state: expect.objectContaining({ status: "ready", generationJob: undefined, grill: artifact }) }));
+    expect(review.start).not.toHaveBeenCalled();
+  });
+
+  it("leaves an already-ready recovered plan reviewable without interruption", async () => {
+    const controller = controllerHarness(); controller.setReady();
+    const review = { start: vi.fn(), ready: vi.fn(), close: vi.fn() }; const { runtime } = runtimeFor(controller, review);
+    await runtime.resume(context());
+    expect(controller.pause).not.toHaveBeenCalled();
+    expect(controller.resumeReview).not.toHaveBeenCalled();
+    expect(review.ready).toHaveBeenCalledWith(expect.objectContaining({ controller, state: expect.objectContaining({ status: "ready" }) }));
   });
 
   it("resumes an interrupted answered clarification continuation from its persisted origin", async () => {

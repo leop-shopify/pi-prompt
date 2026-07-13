@@ -25,8 +25,9 @@ describe("plan branch locators", () => {
     expect(scan.locators.map((entry) => entry.stateVersion)).toEqual([2, 1]); expect(scan.invalidEntries).toBe(0);
   });
 
-  it("accepts awaiting-clarification locators for durable recovery", async () => {
+  it("accepts active sidecar and clarification locators for durable recovery", async () => {
     const base = await root();
+    expect(validatePlanBranchLocator({ ...locator(base), status: "grilling" }, base)).toMatchObject({ status: "grilling" });
     expect(validatePlanBranchLocator({ ...locator(base), status: "awaiting-clarification" }, base)).toMatchObject({ status: "awaiting-clarification" });
   });
 

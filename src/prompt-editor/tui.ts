@@ -201,17 +201,15 @@ function renderExecutionChoices(theme: Theme, width: number, selected: string, f
   return truncateToWidth(EXECUTION_KIND_ORDER.map((kind) => {
     const label = kind === "normal" ? "Normal"
       : kind === "goal" ? "Goal (/goal)"
-      : kind === "loop" ? "Loop (/loop)"
-      : "Create Goal (/create-goal)";
+      : "Loop (/loop)";
     const text = kind === selected ? `[${label}]` : ` ${label} `;
     return kind === selected ? theme.fg(focused ? "accent" : "muted", theme.bold(text)) : theme.fg("dim", text);
   }).join(theme.fg("dim", " ")), width, "…", false);
 }
 function executionHelp(kind: (typeof EXECUTION_KIND_ORDER)[number]): string {
-  if (kind === "goal") return "The ready plan remains persisted; final acceptance will stage one /goal prefix for human review.";
-  if (kind === "loop") return "The ready plan remains persisted; final acceptance will stage one /loop prefix for human review.";
-  if (kind === "create-goal") return "Stages one /create-goal prefix so pi-codex-goal can create a tracked goal from the accepted reviewed plan.";
-  return "The ready plan remains persisted; final acceptance will stage plain text for human review.";
+  if (kind === "goal") return "Direct adds /goal; accepted Spec uses an authenticated wrapper, then exact Markdown without /goal or /loop prefix.";
+  if (kind === "loop") return "Direct adds /loop; accepted Spec uses an authenticated wrapper, then exact Markdown without /goal or /loop prefix.";
+  return "Direct/no-plan sends use plain text; planned workflows finish by sending the exact accepted Spec.";
 }
 function renderSkillValue(theme: Theme, width: number, selected: readonly string[], query: string, available: readonly string[], focused: boolean): string {
   const chips = selected.length > 0 ? selected.map((skill) => theme.fg("accent", `@${skill}`)).join(" ") : focused ? "" : theme.fg("dim", "none");

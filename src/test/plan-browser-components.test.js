@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { renderClarification, renderPlan } from "../plan/browser/components.js";
+import { renderClarification, renderPlan, renderSpec } from "../plan/browser/components.js";
 import { selectionTarget } from "../plan/browser/range.js";
+import { projectMarkdownPlan } from "../plan/markdown-projection.js";
 
 class TestNode {
   static TEXT_NODE = 3;
@@ -53,6 +54,8 @@ class TestDocument {
 let documentFixture;
 let captureFocus;
 let restoreFocus;
+let createRebuildTransitionTracker;
+let isPlanRebuilding;
 function installDocument() {
   documentFixture = new TestDocument();
   Object.assign(globalThis, {
@@ -68,16 +71,16 @@ function fieldSnapshot(status = "ready") {
     { id: "same-b", body: "overlap", status: "open", locked: false, target: { kind: "range", elementId: "step", selector: { field: "body", start: 1, end: 2, exact: "😀" } } },
     { id: "later", body: "later", status: "open", locked: false, target: { kind: "range", elementId: "step", selector: { field: "body", start: 2, end: 3, exact: "B" } } },
   ];
-  return { status, planMarkdown: "# Plan", clarification: null, annotations, document: { id: "doc", title: { id: "title", kind: "title", body: "Plan", children: [] }, elements: [{ id: "step", kind: "step", title: "Task", body: "A😀BC", children: [] }] } };
+  return { status, documentRevision: 1, planMarkdown: "# Plan\n\n> arbitrary quote\n\n## Task\n- [ ] literal <tag>\n\nA😀BC\n```", clarification: null, annotations, document: { id: "doc", title: { id: "title", kind: "title", body: "Plan", children: [] }, elements: [{ id: "step", kind: "step", title: "Task", body: "A😀BC", children: [] }] } };
 }
 function clarificationSnapshot(planDocument = null) {
-  return { status: "awaiting-clarification", planMarkdown: planDocument ? "# Plan" : null, annotations: [], document: planDocument, clarification: { id: "batch", questions: [{ id: "question", prompt: "Choose?", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] }] } };
+  return { status: "awaiting-clarification", planMarkdown: planDocument ? "# Plan\n\n## Task\nA😀BC" : null, annotations: [], document: planDocument, clarification: { id: "batch", questions: [{ id: "question", prompt: "Choose?", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] }] } };
 }
-function planBodyField(tree) { return tree.querySelectorAll("[data-plan-element-id]").find((node) => node.dataset.planElementId === "step").querySelector('[data-plan-field="body"]'); }
+function planSurface(tree) { return tree.querySelector('[data-comment-surface="plan"]') ?? tree.querySelector('[data-comment-surface="grill"]'); }
 
 beforeAll(async () => {
   installDocument();
-  ({ captureFocus, restoreFocus } = await import("../plan/browser/app.js"));
+  ({ captureFocus, restoreFocus, createRebuildTransitionTracker, isPlanRebuilding } = await import("../plan/browser/app.js"));
 });
 
 describe("clarification redraw focus", () => {
@@ -107,20 +110,98 @@ describe("clarification redraw focus", () => {
 });
 
 describe("canonical annotation selectors", () => {
-  it.each([2, 3])("excludes multiple overlapping badge glyphs from a Unicode selection starting at child boundary %s", (startOffset) => {
-    installDocument(); const tree = document.createElement("div"); document.body.append(tree); renderPlan(fieldSnapshot(), tree, () => {}, () => {}, false);
-    const field = planBodyField(tree); const finalText = field.childNodes.at(-1);
-    const result = selectionTarget({ rangeCount: 1, isCollapsed: false, getRangeAt: () => ({ startContainer: field, startOffset, endContainer: finalText, endOffset: 1 }) });
-    expect(result).toMatchObject({ ok: true, target: { selector: { exact: "BC", start: 2, end: 4 } } });
-    expect(field.textContent).toContain("◆◆");
-    expect(field.querySelectorAll(".annotation-badge")[0].attributes.get("aria-label")).toContain("note:");
+  it("renders fetched arbitrary Markdown exactly while excluding compact badges from selection offsets", () => {
+    installDocument(); const tree = document.createElement("div"); document.body.append(tree); const snapshot = fieldSnapshot(); renderPlan(snapshot, tree, () => {}, () => {}, false);
+    const surface = planSurface(tree); const finalText = surface.childNodes.at(-1); const markedB = surface.childNodes.find((node) => node instanceof TestElement && node.textContent === "B");
+    const result = selectionTarget({ rangeCount: 1, isCollapsed: false, getRangeAt: () => ({ startContainer: markedB.childNodes[0], startOffset: 0, endContainer: finalText, endOffset: 1 }) });
+    expect(result).toMatchObject({ ok: true, target: { elementId: "step", selector: { exact: "BC", start: 2, end: 4 } } });
+    expect(surface.textContent.replaceAll("•", "")).toBe(snapshot.planMarkdown);
+    const badge = surface.querySelectorAll(".annotation-badge")[0]; expect(badge.textContent).toBe("•"); expect(badge.attributes.get("aria-label")).toContain("Your comment:");
   });
 
-  it("measures text after a later badge without counting its visible gold glyph", () => {
+  it("maps an opaque compatibility projection onto exact Markdown code points", () => {
+    installDocument(); const tree = document.createElement("div"); document.body.append(tree);
+    const markdown = "\0\r\ncafe\u0301"; const planDocument = projectMarkdownPlan(markdown, 2);
+    renderPlan({ status: "ready", documentRevision: 2, planMarkdown: markdown, annotations: [], document: planDocument }, tree, () => {}, () => {}, false);
+    const surface = planSurface(tree); const field = surface.planProjection.find((entry) => entry.end > entry.start); const text = surface.childNodes[0];
+    expect(surface.textContent).toBe(markdown);
+    expect(field).toEqual({ start: 0, end: [...markdown].length, elementId: planDocument.elements[0].id, field: "body" });
+    expect(selectionTarget({ rangeCount: 1, isCollapsed: false, getRangeAt: () => ({ startContainer: text, startOffset: 1, endContainer: text, endOffset: 3 }) }))
+      .toMatchObject({ ok: true, target: { kind: "range", elementId: planDocument.elements[0].id, selector: { start: 1, end: 3, exact: "\r\n" } } });
+  });
+
+  it("counts a leading BOM without drifting Plan controller field offsets", () => {
+    installDocument(); const tree = document.createElement("div"); document.body.append(tree);
+    const markdown = "\uFEFF# Plan\n\n## Task\nA😀BC"; const planDocument = { id: "doc", title: { id: "title", kind: "title", body: "Plan", children: [] }, elements: [{ id: "step", kind: "step", title: "Task", body: "A😀BC", children: [] }] };
+    renderPlan({ status: "ready", documentRevision: 1, planMarkdown: markdown, annotations: [], document: planDocument }, tree, () => {}, () => {}, false);
+    const surface = planSurface(tree); const text = surface.childNodes[0]; const start = markdown.indexOf("B");
+    expect(surface.textContent.codePointAt(0)).toBe(0xfeff);
+    expect(selectionTarget({ rangeCount: 1, isCollapsed: false, getRangeAt: () => ({ startContainer: text, startOffset: start, endContainer: text, endOffset: start + 1 }) }))
+      .toMatchObject({ ok: true, target: { kind: "range", elementId: "step", selector: { start: 2, end: 3, exact: "B" } } });
+  });
+
+  it("accepts Markdown syntax outside semantic fields with a best-effort element target", () => {
     installDocument(); const tree = document.createElement("div"); document.body.append(tree); renderPlan(fieldSnapshot(), tree, () => {}, () => {}, false);
-    const field = planBodyField(tree); const finalText = field.childNodes.at(-1);
-    expect(selectionTarget({ rangeCount: 1, isCollapsed: false, getRangeAt: () => ({ startContainer: field, startOffset: field.childNodes.length - 1, endContainer: finalText, endOffset: 1 }) }))
-      .toMatchObject({ ok: true, target: { selector: { exact: "C", start: 3, end: 4 } } });
+    const surface = planSurface(tree); const text = surface.childNodes[0];
+    expect(selectionTarget({ rangeCount: 1, isCollapsed: false, getRangeAt: () => ({ startContainer: text, startOffset: 0, endContainer: text, endOffset: 2 }) }))
+      .toEqual({ ok: true, target: { kind: "element", elementId: "title" }, exact: "# " });
+  });
+});
+
+describe("staged author rendering", () => {
+  it("filters Grill authors from Plan and labels both provenance classes in Grill", () => {
+    installDocument(); const tree = document.createElement("div"); document.body.append(tree); const base = fieldSnapshot();
+    const snapshot = { ...base, grill: { basedOnDocumentRevision: 1 }, documentRevision: 1, annotations: [
+      { ...base.annotations[0], id: "user-note", author: "user", body: "user body" },
+      { ...base.annotations[1], id: "grill-note", author: "grill", body: "generated body" },
+    ] };
+    renderPlan(snapshot, tree, () => {}, () => {}, false, "plan"); expect(tree.querySelectorAll("button")).toHaveLength(1); expect(tree.querySelectorAll("button")[0].attributes.get("aria-label")).not.toContain("Grill critique");
+    renderPlan(snapshot, tree, () => {}, () => {}, false, "grill"); const buttons = tree.querySelectorAll("button");
+    expect(buttons.map((button) => button.className)).toEqual(expect.arrayContaining([expect.stringContaining("author-user"), expect.stringContaining("author-grill")]));
+    expect(buttons.map((button) => button.attributes.get("aria-label"))).toEqual(expect.arrayContaining([expect.stringContaining("Your comment:"), expect.stringContaining("Grill critique:")]));
+  });
+
+  it("renders open generated critiques as named checked controls without making their body editable", () => {
+    installDocument(); const tree = document.createElement("div"); document.body.append(tree); const base = fieldSnapshot(); const toggled = []; const opened = [];
+    const generated = { ...base.annotations[0], id: "grill-selectable", author: "grill", body: "Preserve auth boundaries", status: "open" };
+    renderPlan({ ...base, annotations: [generated] }, tree, () => {}, (item) => opened.push(item.id), false, "grill", [generated.id], (id) => toggled.push(id));
+    const badge = tree.querySelector("button");
+    expect(badge.attributes.get("role")).toBe("checkbox"); expect(badge.attributes.get("aria-checked")).toBe("true"); expect(badge.textContent).toBe("✓"); expect(badge.className).toContain("is-selected");
+    expect(badge.attributes.get("aria-label")).toContain("Grill critique: Preserve auth boundaries"); expect(badge.attributes.get("aria-label")).toContain("Generated text is read-only"); expect(badge.attributes.get("aria-label")).toContain("Selected for Plan revision");
+    badge.dispatchEvent({ type: "click" }); expect(toggled).toEqual([generated.id]); expect(opened).toEqual([generated.id]);
+  });
+
+  it("does not offer selection semantics for dismissed generated critiques", () => {
+    installDocument(); const tree = document.createElement("div"); document.body.append(tree); const base = fieldSnapshot(); const generated = { ...base.annotations[0], id: "grill-dismissed", author: "grill", status: "dismissed" };
+    renderPlan({ ...base, annotations: [generated] }, tree, () => {}, () => {}, false, "grill", [generated.id], () => { throw new Error("dismissed critique must not toggle"); });
+    const badge = tree.querySelector("button"); expect(badge.attributes.has("aria-checked")).toBe(false); expect(badge.textContent).toBe("•"); badge.dispatchEvent({ type: "click" });
+  });
+
+  it("renders an independent Spec surface with compact comment provenance and no Plan target", () => {
+    installDocument(); const tree = document.createElement("div"); document.body.append(tree); renderSpec({ specRevision: 2, markdown: "# Spec 😀\nExact body", job: null, comments: [{ id: "spec-comment", body: "tighten", status: "open", locked: false, target: { start: 2, end: 8 } }] }, tree, () => {}, false);
+    const surface = tree.querySelector('[data-comment-surface="spec"]'); expect(surface).not.toBeNull(); expect(surface.textContent).toContain("•"); expect(surface.querySelector("button").attributes.get("aria-label")).toContain("Your comment:"); expect(surface.dataset.planElementId).toBeUndefined();
+  });
+
+  it("measures a Spec emoji selection in Unicode code points", () => {
+    installDocument(); const tree = document.createElement("div"); document.body.append(tree); renderSpec({ specRevision: 1, markdown: "# 😀 Spec", comments: [] }, tree, () => {}, false);
+    const surface = tree.querySelector('[data-comment-surface="spec"]'); const text = surface.childNodes[0]; const selected = selectionTarget({ rangeCount: 1, isCollapsed: false, getRangeAt: () => ({ startContainer: text, startOffset: 2, endContainer: text, endOffset: 4 }) }, "spec");
+    expect(selected).toEqual({ ok: true, target: { start: 2, end: 3 }, exact: "😀" });
+  });
+
+  it("counts a leading BOM in Spec controller offsets", () => {
+    installDocument(); const tree = document.createElement("div"); document.body.append(tree); const markdown = "\uFEFF# 😀 Spec"; renderSpec({ specRevision: 1, markdown, comments: [] }, tree, () => {}, false);
+    const surface = tree.querySelector('[data-comment-surface="spec"]'); const text = surface.childNodes[0]; const start = markdown.indexOf("Spec");
+    expect(surface.textContent.codePointAt(0)).toBe(0xfeff);
+    expect(selectionTarget({ rangeCount: 1, isCollapsed: false, getRangeAt: () => ({ startContainer: text, startOffset: start, endContainer: text, endOffset: start + 4 }) }, "spec"))
+      .toEqual({ ok: true, target: { start: 5, end: 9 }, exact: "Spec" });
+  });
+});
+
+describe("Plan rebuild transitions", () => {
+  it("recognizes both revision job shapes and scrolls only once per rebuild transition", () => {
+    const entered = createRebuildTransitionTracker(); const ready = { status: "ready", job: null }; const revising = { status: "revising", job: { operation: "revision" } };
+    expect(isPlanRebuilding(revising)).toBe(true); expect(isPlanRebuilding({ status: "ready", job: { operation: "revision" } })).toBe(true);
+    expect([entered(ready), entered(revising), entered(revising), entered(ready), entered(revising)]).toEqual([false, true, false, false, true]);
   });
 });
 

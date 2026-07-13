@@ -5,6 +5,7 @@ import { isSafePlanSessionId } from "./locator.js";
 /** Writer HTTP body limits. These files are ergonomic local drafts only and are never trusted as submissions. */
 export const MAX_PLAN_FILE_BYTES = 512 * 1024;
 export const MAX_WRITER_RESULT_BYTES = 64 * 1024;
+export const MAX_GRILL_RESULT_BYTES = 256 * 1024;
 
 export function defaultPlanRoot(): string {
   return join(homedir(), ".pi", "agent", "pi-prompt", "plans");
@@ -31,7 +32,16 @@ export function clarificationsFilePath(rootDir: string, sessionId: string): stri
   return join(planSessionDirectory(rootDir, sessionId), "clarifications.json");
 }
 
+export function grillFilePath(rootDir: string, sessionId: string): string {
+  return join(planSessionDirectory(rootDir, sessionId), "grill.json");
+}
+
 /** Local writer draft path; canonical clarification state is repository-owned clarifications.json. */
 export function writerQuestionsFilePath(rootDir: string, sessionId: string): string {
   return join(planSessionDirectory(rootDir, sessionId), "questions.json");
+}
+
+/** Local writer draft path; canonical Grill state is repository-owned grill.json. */
+export function writerGrillFilePath(rootDir: string, sessionId: string): string {
+  return join(planSessionDirectory(rootDir, sessionId), "grill-result.json");
 }

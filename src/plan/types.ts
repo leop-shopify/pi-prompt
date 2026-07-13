@@ -8,9 +8,8 @@ export type GenerationMode =
 export type ExecutionKind =
   | { readonly kind: "normal" }
   | { readonly kind: "goal" }
-  | { readonly kind: "loop" }
-  | { readonly kind: "create-goal" };
-export type PlanSessionStatus = "generating" | "ready" | "revising" | "awaiting-clarification" | "accepted" | "paused" | "cancelled" | "error" | "needs-input";
+  | { readonly kind: "loop" };
+export type PlanSessionStatus = "generating" | "ready" | "revising" | "grilling" | "awaiting-clarification" | "accepted" | "paused" | "cancelled" | "error" | "needs-input";
 
 /** Private generation input. It must never be copied into a browser snapshot. */
 export interface SkillReference {
@@ -22,13 +21,13 @@ export interface SkillReference {
 export interface PlanSource { readonly prompt: string; readonly cwd: string; readonly skills: readonly SkillReference[] }
 export interface SafeError { readonly code: string; readonly message: string }
 
-export type PlanOperation = "initial" | "revision";
+export type PlanOperation = "initial" | "revision" | "grill";
 export interface ClarificationOption { readonly id: string; readonly label: string }
 export interface ClarificationQuestion { readonly id: string; readonly prompt: string; readonly options: readonly ClarificationOption[] }
 export type ClarificationAnswer = { readonly kind: "option"; readonly optionId: string } | { readonly kind: "custom"; readonly text: string };
 export interface ClarificationAnswerEntry { readonly questionId: string; readonly answer: ClarificationAnswer }
 export interface ClarificationOrigin {
-  readonly operation: PlanOperation;
+  readonly operation: Exclude<PlanOperation, "grill">;
   readonly baseDocumentRevision: number;
   readonly selectedAnnotationIds: readonly string[];
   readonly instruction?: string;
@@ -100,7 +99,32 @@ export interface RevisionPlanResultDraft {
   readonly document: ModelRevisionPlanDocumentDraft;
   readonly addressedAnnotationIds: readonly string[];
 }
+export interface RevisionMarkdownResultDraft { readonly kind: "revision-markdown"; readonly markdown: string }
 export interface ClarificationResultDraft { readonly kind: "clarification"; readonly questions: readonly ClarificationQuestion[] }
+export interface GrillRangeTargetDraft {
+  readonly kind: "range";
+  readonly elementId: string;
+  readonly field: "title" | "body";
+  readonly start: number;
+  readonly end: number;
+}
+export type GrillAnnotationTargetDraft = AnnotationTarget | GrillRangeTargetDraft;
+export interface GrillAnnotationDraft { readonly target: GrillAnnotationTargetDraft; readonly body: string }
+export interface GrillDecisionOptionDraft { readonly id: string; readonly label: string; readonly nextNodeId?: string; readonly decision?: string }
+export interface GrillDecisionNodeDraft { readonly id: string; readonly question: string; readonly annotationKeys: readonly string[]; readonly options: readonly GrillDecisionOptionDraft[] }
+export interface GrillDecisionTreeDraft { readonly rootNodeId?: string; readonly nodes: readonly GrillDecisionNodeDraft[] }
+export interface GrillResultDraft {
+  readonly kind: "grill";
+  readonly basedOnDocumentRevision: number;
+  readonly annotations: Readonly<Record<string, GrillAnnotationDraft>>;
+  readonly decisionTree: GrillDecisionTreeDraft;
+}
+export interface GrillArtifact {
+  readonly basedOnDocumentRevision: number;
+  readonly annotationIds: Readonly<Record<string, string>>;
+  readonly decisionTree: GrillDecisionTreeDraft;
+  readonly generatedAt: string;
+}
 export interface TextSelector {
   readonly field: "title" | "body";
   readonly start: number;
@@ -127,6 +151,7 @@ export interface AnnotationHistoryEntry {
 }
 export interface Annotation {
   readonly id: string;
+  readonly author?: "user" | "grill";
   readonly target: AnnotationTarget;
   readonly targetSnapshot: AnnotationTargetSnapshot;
   readonly body: string;
@@ -151,6 +176,8 @@ interface PlanSessionBase {
   readonly committedMarkdown?: string;
   /** Private clarification history. Browser projections expose only the current pending questions. */
   readonly clarifications?: ClarificationTranscript;
+  /** Generated critique sidecar for the exact current document revision. */
+  readonly grill?: GrillArtifact;
   readonly lastError?: SafeError;
 }
 export interface EmptyPlanSession extends PlanSessionBase {

@@ -29,7 +29,7 @@ export interface PlanBranchEntry {
 }
 
 const STATUSES: readonly PlanSessionStatus[] = [
-  "generating", "ready", "revising", "awaiting-clarification", "accepted", "paused", "cancelled", "error", "needs-input",
+  "generating", "ready", "revising", "grilling", "awaiting-clarification", "accepted", "paused", "cancelled", "error", "needs-input",
 ];
 const LOCATOR_KEYS = [
   "schemaVersion", "sessionId", "artifactPath", "status", "stateVersion", "documentRevision", "stateSha256", "committedAt",

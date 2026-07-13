@@ -46,7 +46,7 @@ export function registerPromptExtension(pi: ExtensionAPI, options: RegisterPromp
 
   runtime = options.runtime ?? createPromptExtensionRuntime({
     controllers: createControllerStackFactory(pi, bridge),
-    review: options.review ?? defaultBrowserPlanReviewPort(pi, open),
+    review: options.review ?? defaultBrowserPlanReviewPort(pi, bridge, open),
     editor: { open },
   });
 

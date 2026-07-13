@@ -5,14 +5,19 @@ import type {
 } from "./generator.js";
 import type { AppendPlanBranchLocator } from "./locator.js";
 import {
-  allocateInitialPlanDocument, collectPlanElementIds, createAnnotation, reconcileRevision, transitionAnnotationStatus,
+  allocateInitialPlanDocument, collectPlanElementIds, createAnnotation, transitionAnnotationStatus,
   type PlanIdFactory,
 } from "./reconcile.js";
+import { projectMarkdownPlan } from "./markdown-projection.js";
 import type { CommitAcceptedPlanInput, CommitPlanInput, CommittedPlanState, PlanAuditKind } from "./repository.js";
-import { PLAN_LIMITS, normalizePlanText, validateClarificationAnswers, validatePlanSession } from "./schema.js";
+import {
+  PLAN_LIMITS, isMarkdownPlanProjection, normalizePlanText, validateClarificationAnswers, validatePlanAnnotations,
+  validatePlanSession,
+} from "./schema.js";
 import type {
-  AnnotationStatus, AnnotationTarget, ClarificationAnswerEntry, ClarificationOrigin, ExecutionKind, GenerationMode,
-  PendingClarification, PlanSession, SafeError, SkillReference, ValidationIssue, ValidationResult,
+  Annotation, AnnotationStatus, AnnotationTarget, ClarificationAnswerEntry, ClarificationOrigin, ExecutionKind, GenerationMode,
+  GrillAnnotationTargetDraft,
+  PendingClarification, PlanDocument, PlanElement, PlanSession, SafeError, SkillReference, ValidationIssue, ValidationResult,
 } from "./types.js";
 
 export interface PlanControllerRepository {
@@ -55,6 +60,7 @@ export interface CreatePlanInput {
   readonly mode: GenerationMode;
 }
 export interface RevisionInput { readonly expectedStateVersion: number; readonly selectedAnnotationIds: readonly string[]; readonly instruction?: string }
+export interface GrillInput { readonly expectedStateVersion: number }
 export interface ClarificationAnswerInput { readonly expectedStateVersion: number; readonly clarificationId: string; readonly answers: readonly ClarificationAnswerEntry[] }
 export interface VersionedInput { readonly expectedStateVersion: number }
 export interface WriterHttpSubmission { readonly attemptId: string; readonly kind: WriterSubmissionKind; readonly body: Buffer }
@@ -84,8 +90,8 @@ export class PlanController {
     if (state?.generationJob) this.#reserved.add(state.generationJob.jobId);
     if (state?.document) for (const id of collectPlanElementIds(state.document)) this.#reserved.add(id);
     for (const annotation of state?.annotations ?? []) this.#reserved.add(annotation.id);
-    for (const round of state?.clarifications?.history ?? []) { this.#reserved.add(round.id); for (const question of round.questions) { this.#reserved.add(question.id); for (const option of question.options) this.#reserved.add(option.id); } }
-    const pending = state?.clarifications?.pending; if (pending) { this.#reserved.add(pending.id); for (const question of pending.questions) { this.#reserved.add(question.id); for (const option of question.options) this.#reserved.add(option.id); } }
+    for (const round of state?.clarifications?.history ?? []) this.#reserved.add(round.id);
+    const pending = state?.clarifications?.pending; if (pending) this.#reserved.add(pending.id);
   }
 
   static async create(options: PlanControllerOptions, input: CreatePlanInput): Promise<PlanControllerResult<PlanController>> {
@@ -121,6 +127,9 @@ export class PlanController {
   }
   async revise(input: RevisionInput): Promise<PlanControllerResult<PlanJobHandle>> {
     return this.#startJob("revision", input.expectedStateVersion, input.selectedAnnotationIds, input.instruction);
+  }
+  async grill(input: GrillInput): Promise<PlanControllerResult<PlanJobHandle>> {
+    return this.#startJob("grill", input.expectedStateVersion, []);
   }
   async resumeClarification(input: VersionedInput): Promise<PlanControllerResult<PlanJobHandle>> {
     const origin = this.#state?.clarifications?.origin;
@@ -175,18 +184,27 @@ export class PlanController {
       const state = this.#mutableState(input.expectedStateVersion); if (!state.ok) return state;
       if (state.value.status === "awaiting-clarification") return failure("clarification-read-only", "Annotations are read-only while clarification answers are pending.");
       if (!state.value.document) return failure("plan-not-ready", "A materialized plan is required.");
-      const made = createAnnotation(state.value.document, state.value.documentRevision, input.target, input.body, { idFactory: this.#options.idFactory, reservedIds: this.#reserved, now: this.#now() });
+      const projection = isMarkdownPlanProjection(state.value.document, state.value.documentRevision)
+        && projectionMarkdown(state.value.document) === state.value.committedMarkdown;
+      const projectionId = projection ? this.#allocateId() : undefined; if (projectionId && !projectionId.ok) return projectionId;
+      const made = projection
+        ? createProjectionAnnotation(state.value.document, state.value.documentRevision, input.target, input.body, projectionId!.value, this.#now())
+        : createAnnotation(state.value.document, state.value.documentRevision, input.target, input.body, { idFactory: this.#options.idFactory, reservedIds: this.#reserved, now: this.#now() });
       if (!made.ok) return validationFailure(made.issues);
-      const next = { ...state.value, stateVersion: state.value.stateVersion + 1, annotations: [...state.value.annotations, made.value] } as PlanSession;
+      const annotation = { ...made.value, author: "user" as const };
+      const next = { ...state.value, stateVersion: state.value.stateVersion + 1, annotations: [...state.value.annotations, annotation] } as PlanSession;
       const committed = await this.#commit(next, state.value, "state-changed"); if (committed.ok) this.#reserved.add(made.value.id); return committed;
     });
   }
 
   async updateAnnotationBody(input: VersionedInput & { readonly annotationId: string; readonly body: string }): Promise<PlanControllerResult> {
-    return this.#updateAnnotation(input, (annotation) => success({ ...annotation, body: normalizePlanText(input.body), updatedAt: this.#now() }));
+    return this.#updateAnnotation(input, (annotation) => annotation.author === "grill"
+      ? failure("generated-annotation-immutable", "Generated Grill annotation bodies are immutable.")
+      : success({ ...annotation, body: normalizePlanText(input.body), updatedAt: this.#now() }));
   }
   async transitionAnnotation(input: VersionedInput & { readonly annotationId: string; readonly status: AnnotationStatus }): Promise<PlanControllerResult> {
     return this.#updateAnnotation(input, (annotation) => {
+      if (annotation.author === "grill" && !((annotation.status === "open" && input.status === "dismissed") || (annotation.status === "dismissed" && input.status === "open"))) return failure("generated-annotation-immutable", "Generated Grill annotations may only transition between open and dismissed.");
       const changed = transitionAnnotationStatus(annotation, input.status, { actor: "user", now: this.#now() });
       return changed.ok ? success(changed.value) : validationFailure(changed.issues);
     });
@@ -296,7 +314,7 @@ export class PlanController {
     const runtime = this.#active;
     const stopped = await this.#enqueue(async () => {
       const state = this.#state;
-      if (state && (state.status === "generating" || state.status === "revising" || state.status === "awaiting-clarification")) {
+      if (state && (state.status === "generating" || state.status === "revising" || state.status === "grilling" || state.status === "awaiting-clarification")) {
         const next = { ...state, stateVersion: state.stateVersion + 1, status: "paused", generationJob: undefined } as PlanSession;
         return this.#commit(next, state, "paused");
       }
@@ -309,7 +327,7 @@ export class PlanController {
     finally { try { await this.#options.repository.close(); } finally { this.#listeners.clear(); this.#closed = true; } }
   }
 
-  async #startJob(operation: "initial" | "revision", expected: number, selectedIds: readonly string[], instruction?: string): Promise<PlanControllerResult<PlanJobHandle>> {
+  async #startJob(operation: "initial" | "revision" | "grill", expected: number, selectedIds: readonly string[], instruction?: string): Promise<PlanControllerResult<PlanJobHandle>> {
     const resumable = this.#state?.clarifications?.origin && !this.#state.clarifications.pending ? this.#state.clarifications.origin : undefined;
     const effectiveOperation = resumable?.operation ?? operation;
     const effectiveSelectedIds = resumable?.selectedAnnotationIds ?? selectedIds;
@@ -321,10 +339,11 @@ export class PlanController {
       if (effectiveOperation !== operation) return failure("clarification-conflict", "The resumable clarification operation does not match this request.");
       if (operation === "initial" && (current.value.document || !["paused", "error"].includes(current.value.status))) return failure("invalid-status", "Initial generation requires an empty paused or error session.");
       if (operation === "revision" && (!current.value.document || !["ready", "error"].includes(current.value.status))) return failure("invalid-status", "Revision requires a materialized ready or error session.");
+      if (operation === "grill" && (!current.value.document || !["ready", "error"].includes(current.value.status))) return failure("invalid-status", "Grill requires a materialized ready or safely failed session.");
       if (new Set(effectiveSelectedIds).size !== effectiveSelectedIds.length || effectiveSelectedIds.some((id) => !current.value.annotations.some((annotation) => annotation.id === id))) return failure("invalid-annotations", "Selected annotation IDs must be unique and current.");
       const allocated = this.#allocateId(); if (!allocated.ok) return allocated;
       const runtime = { id: allocated.value, abort: new AbortController() };
-      const status = operation === "initial" ? "generating" : "revising";
+      const status = operation === "initial" ? "generating" : operation === "revision" ? "revising" : "grilling";
       const baseDocumentRevision = resumable?.baseDocumentRevision ?? current.value.documentRevision;
       const next = { ...current.value, stateVersion: current.value.stateVersion + 1, status, generationJob: { jobId: runtime.id, operation, baseDocumentRevision, selectedAnnotationIds: [...effectiveSelectedIds], ...(canonicalInstruction === undefined ? {} : { instruction: canonicalInstruction }), startedAt: this.#now() }, lastError: undefined } as PlanSession;
       const committed = await this.#commit(next, current.value, "state-changed");
@@ -368,16 +387,35 @@ export class PlanController {
       return this.#commit(next, state, "state-changed");
     }
     const outcome = result.outcome;
+    if (job.operation === "grill") {
+      if (outcome.kind !== "grill" || !state.document || outcome.basedOnDocumentRevision !== state.documentRevision) return this.#commitGenerationError(state, "invalid-grill-result", "The Grill critique could not be applied safely.");
+      const reserved = new Set(this.#reserved); const generated = []; const annotationIds: Record<string, string> = Object.create(null) as Record<string, string>;
+      const projection = isMarkdownPlanProjection(state.document, state.documentRevision) && projectionMarkdown(state.document) === state.committedMarkdown;
+      for (const [key, draft] of Object.entries(outcome.annotations)) {
+        const target = canonicalGrillTarget(state.document, draft.target); if (!target.ok) return this.#commitGenerationError(state, "invalid-grill-anchor", "A Grill annotation did not match the current plan.");
+        const projectionId = projection ? this.#allocateId(reserved) : undefined;
+        if (projectionId && !projectionId.ok) return this.#commitGenerationError(state, "invalid-grill-anchor", "A Grill annotation ID could not be allocated safely.");
+        const made = projection
+          ? createProjectionAnnotation(state.document, state.documentRevision, target.value, draft.body, projectionId!.value, this.#now())
+          : createAnnotation(state.document, state.documentRevision, target.value, draft.body, { idFactory: this.#options.idFactory, reservedIds: reserved, now: this.#now() });
+        if (!made.ok) return this.#commitGenerationError(state, "invalid-grill-anchor", "A Grill annotation did not match the current plan.");
+        reserved.add(made.value.id); annotationIds[key] = made.value.id; generated.push({ ...made.value, author: "grill" as const });
+      }
+      const artifact = { basedOnDocumentRevision: state.documentRevision, annotationIds: Object.fromEntries(Object.entries(annotationIds)), decisionTree: outcome.decisionTree, generatedAt: this.#now() };
+      const next = { ...state, stateVersion: state.stateVersion + 1, status: "ready", generationJob: undefined, annotations: [...state.annotations.filter((annotation) => annotation.author !== "grill"), ...generated], grill: artifact, lastError: undefined } as PlanSession;
+      const committed = await this.#commit(next, state, "state-changed"); if (committed.ok) for (const annotation of generated) this.#reserved.add(annotation.id); return committed;
+    }
+    if (outcome.kind === "grill") return this.#commitGenerationError(state);
     if (outcome.kind === "clarification") {
       const history = state.clarifications?.history ?? [];
-      if (history.length >= PLAN_LIMITS.clarificationRounds || clarificationIds(outcome.questions).some((id) => this.#reserved.has(id))) return this.#commitGenerationError(state, "invalid-clarification", "The generated clarification batch was invalid.");
+      if (history.length >= PLAN_LIMITS.clarificationRounds) return this.#commitGenerationError(state, "clarification-limit-reached", "The clarification limit was reached. Retry generation to continue with the answers already provided.");
       const clarificationId = this.#allocateId(); if (!clarificationId.ok) return clarificationId;
       const origin: ClarificationOrigin = { operation: job.operation, baseDocumentRevision: job.baseDocumentRevision, selectedAnnotationIds: [...job.selectedAnnotationIds], ...(job.instruction === undefined ? {} : { instruction: job.instruction }) };
       const pending: PendingClarification = { id: clarificationId.value, questions: outcome.questions, ...origin };
       const next = { ...state, stateVersion: state.stateVersion + 1, status: "awaiting-clarification", generationJob: undefined,
         clarifications: { history, origin, pending }, lastError: undefined } as PlanSession;
       const committed = await this.#commit(next, state, "state-changed");
-      if (committed.ok) { this.#reserved.add(clarificationId.value); for (const id of clarificationIds(outcome.questions)) this.#reserved.add(id); }
+      if (committed.ok) this.#reserved.add(clarificationId.value);
       return committed;
     }
     if (job.operation === "initial") {
@@ -388,18 +426,17 @@ export class PlanController {
       const next = { ...state, stateVersion: state.stateVersion + 1, documentRevision: 1, document: allocated.value, committedMarkdown: markdown, annotations: [], status: "ready", generationJob: undefined, clarifications: { history: state.clarifications?.history ?? [] }, lastError: undefined } as PlanSession;
       const committed = await this.#commit(next, state, "revision-committed"); if (committed.ok) for (const id of collectPlanElementIds(allocated.value)) this.#reserved.add(id); return committed;
     }
-    if (outcome.kind !== "revision" || !state.document) return this.#commitGenerationError(state);
-    const reconciled = reconcileRevision({ previousDocument: state.document, previousRevision: state.documentRevision, annotations: state.annotations, result: outcome, selectedAnnotationIds: job.selectedAnnotationIds, idFactory: this.#options.idFactory, reservedIds: this.#reserved, now: this.#now() });
-    if (!reconciled.ok) return this.#commitGenerationError(state);
-    if (sameDocumentContent(reconciled.value.document, state.document)) {
-      return this.#commitGenerationError(state, "no-op-revision", "The generated revision did not change the plan.");
-    }
-    const markdown = outcome.markdown ?? renderPlanMarkdown(reconciled.value.document);
-    const next = { ...state, stateVersion: state.stateVersion + 1, documentRevision: reconciled.value.documentRevision, document: reconciled.value.document, committedMarkdown: markdown, annotations: reconciled.value.annotations, status: "ready", generationJob: undefined, clarifications: { history: state.clarifications?.history ?? [] }, lastError: undefined } as PlanSession;
-    const committed = await this.#commit(next, state, "revision-committed"); if (committed.ok) for (const id of collectPlanElementIds(reconciled.value.document)) this.#reserved.add(id); return committed;
+    if (outcome.kind !== "revision-markdown" || !state.document) return this.#commitGenerationError(state);
+    const document = projectMarkdownPlan(outcome.markdown, state.documentRevision + 1);
+    const annotations = orphanRevisionAnnotations(state.annotations, job.selectedAnnotationIds, document.id, this.#now());
+    if (!annotations.ok) return this.#commitGenerationError(state);
+    const next = { ...state, stateVersion: state.stateVersion + 1, documentRevision: state.documentRevision + 1, document, committedMarkdown: outcome.markdown, annotations: annotations.value, grill: undefined, status: "ready", generationJob: undefined, clarifications: { history: state.clarifications?.history ?? [] }, lastError: undefined } as PlanSession;
+    const committed = await this.#commit(next, state, "revision-committed");
+    if (committed.ok) for (const id of collectPlanElementIds(document)) this.#reserved.add(id);
+    return committed;
   }
 
-  async #commitGenerationError(state: PlanSession, code = "invalid-generation-result", message = "The generated plan was invalid."): Promise<PlanControllerResult> {
+  async #commitGenerationError(state: PlanSession, code = "invalid-generation-result", message = "The planner output could not be applied safely. Retry generation."): Promise<PlanControllerResult> {
     const next = { ...state, stateVersion: state.stateVersion + 1, status: "error", generationJob: undefined, lastError: { code, message } } as PlanSession;
     return this.#commit(next, state, "state-changed");
   }
@@ -459,24 +496,75 @@ export class PlanController {
     if ((this.#closing && !duringClose) || this.#closed) return Promise.resolve(failure("controller-closed", "The plan controller is closed.") as T);
     const run = this.#tail.then(work, work); this.#tail = run.then(() => undefined, () => undefined); return run;
   }
-  #allocateId(): PlanControllerResult<string> {
-    for (let attempt = 0; attempt < 8; attempt += 1) { let id: string; try { id = this.#options.idFactory(); } catch { break; } if (/^[!-~]{1,64}$/.test(id) && !this.#reserved.has(id)) return success(id); }
+  #allocateId(additional: ReadonlySet<string> = new Set()): PlanControllerResult<string> {
+    for (let attempt = 0; attempt < 8; attempt += 1) { let id: string; try { id = this.#options.idFactory(); } catch { break; } if (/^[!-~]{1,64}$/.test(id) && !this.#reserved.has(id) && !additional.has(id)) return success(id); }
     return failure("id-allocation-failed", "A unique plan ID could not be allocated.");
   }
   #now(): string { const raw = this.#options.clock(); return raw instanceof Date ? raw.toISOString() : raw; }
 }
 
-function originOf(value: ClarificationOrigin): ClarificationOrigin { return { operation: value.operation, baseDocumentRevision: value.baseDocumentRevision, selectedAnnotationIds: [...value.selectedAnnotationIds], ...(value.instruction === undefined ? {} : { instruction: value.instruction }) }; }
-function clarificationIds(questions: readonly { readonly id: string; readonly options: readonly { readonly id: string }[] }[]): string[] { return questions.flatMap((question) => [question.id, ...question.options.map((option) => option.id)]); }
-function sameDocumentContent(left: NonNullable<PlanSession["document"]>, right: NonNullable<PlanSession["document"]>): boolean {
-  const content = (document: NonNullable<PlanSession["document"]>): unknown => {
-    const element = (value: NonNullable<PlanSession["document"]>["title"]): unknown => ({
-      kind: value.kind, ...(value.title === undefined ? {} : { title: value.title }), body: value.body, children: value.children.map(element),
-    });
-    return { title: element(document.title), elements: document.elements.map(element) };
-  };
-  return JSON.stringify(content(left)) === JSON.stringify(content(right));
+function orphanRevisionAnnotations(
+  annotations: readonly Annotation[], selectedAnnotationIds: readonly string[], documentId: string, now: string,
+): ValidationResult<readonly Annotation[]> {
+  const selected = new Set(selectedAnnotationIds); const survivors: Annotation[] = [];
+  for (const annotation of annotations) {
+    if (selected.has(annotation.id) || annotation.author === "grill") continue;
+    const retargeted = annotation.target.kind === "root"
+      ? { ...annotation, target: { kind: "root" as const, elementId: documentId }, targetSnapshot: { ...annotation.targetSnapshot, target: { kind: "root" as const, elementId: documentId } } }
+      : annotation;
+    if (retargeted.status === "orphaned") { survivors.push(retargeted); continue; }
+    const orphaned = transitionAnnotationStatus(retargeted, "orphaned", { actor: "system", now });
+    if (!orphaned.ok) return orphaned;
+    survivors.push(orphaned.value);
+  }
+  return { ok: true, value: survivors };
 }
+
+function canonicalGrillTarget(document: PlanDocument, target: GrillAnnotationTargetDraft): ValidationResult<AnnotationTarget> {
+  if (target.kind !== "range" || "selector" in target) return { ok: true, value: target };
+  if (!/^[!-~]{1,64}$/u.test(target.elementId)) return invalidAnnotation("$.target.elementId", "invalid-id", "Annotation target ID is invalid.");
+  const element = findPlanElement(document, target.elementId); if (!element) return invalidAnnotation("$.target.elementId", "unknown-target", "Annotation target does not exist in the current document.");
+  if (target.field !== "title" && target.field !== "body") return invalidAnnotation("$.target.field", "invalid-field", "Selected field is invalid.");
+  const text = target.field === "body" ? element.body : element.title; if (text === undefined) return invalidAnnotation("$.target.field", "missing-field", "Selected field does not exist on the target element.");
+  const points = [...text];
+  if (!Number.isSafeInteger(target.start) || !Number.isSafeInteger(target.end) || target.start < 0 || target.end <= target.start || target.end > points.length) return invalidAnnotation("$.target", "invalid-range", "Range target must be a nonempty in-bounds Unicode code-point range.");
+  return { ok: true, value: { kind: "range", elementId: target.elementId, selector: {
+    field: target.field, start: target.start, end: target.end, exact: points.slice(target.start, target.end).join(""),
+    prefix: points.slice(Math.max(0, target.start - 32), target.start).join(""), suffix: points.slice(target.end, target.end + 32).join(""),
+  } } };
+}
+
+function createProjectionAnnotation(
+  document: PlanDocument, documentRevision: number, target: AnnotationTarget, body: string, id: string, now: string,
+): ValidationResult<Annotation> {
+  let snapshot: Annotation["targetSnapshot"];
+  if (target.kind === "root") {
+    if (target.elementId !== document.id) return invalidAnnotation("$.target.elementId", "unknown-target", "Root target must equal the current document ID.");
+    snapshot = { documentRevision, target: { kind: "root", elementId: target.elementId }, elementKind: "root", text: "" };
+  } else {
+    const element = findPlanElement(document, target.elementId);
+    if (!element) return invalidAnnotation("$.target.elementId", "unknown-target", "Annotation target does not exist in the current document.");
+    if (target.kind === "element") snapshot = { documentRevision, target: { kind: "element", elementId: target.elementId }, elementKind: element.kind, text: elementText(element) };
+    else {
+      const text = target.selector.field === "body" ? element.body : element.title;
+      if (text === undefined) return invalidAnnotation("$.target.selector.field", "missing-field", "Selected field does not exist on the target element.");
+      const selector = { ...target.selector };
+      snapshot = { documentRevision, target: { kind: "range", elementId: target.elementId, selector }, elementKind: element.kind, text };
+    }
+  }
+  const annotation: Annotation = { id, target: snapshot.target, targetSnapshot: snapshot, body: normalizePlanText(body), status: "open", history: [], createdAgainstRevision: documentRevision, createdAt: now, updatedAt: now };
+  const validated = validatePlanAnnotations([annotation], document, documentRevision);
+  return validated.ok ? { ok: true, value: validated.value[0] ?? annotation } : validated;
+}
+function findPlanElement(document: PlanDocument, id: string): PlanElement | undefined {
+  const visit = (element: PlanElement): PlanElement | undefined => element.id === id ? element : element.children.map(visit).find(Boolean);
+  return visit(document.title) ?? document.elements.map(visit).find(Boolean);
+}
+function elementText(element: PlanElement): string { return `${element.title === undefined ? "" : `${element.title}\n`}${element.body}`; }
+function projectionMarkdown(document: PlanDocument): string { const execution = document.elements[0]; return execution ? [execution.body, ...execution.children.map((child) => child.body)].join("") : ""; }
+function invalidAnnotation<T = never>(path: string, code: string, message: string): ValidationResult<T> { return { ok: false, issues: [{ path, code, message }] }; }
+
+function originOf(value: ClarificationOrigin): ClarificationOrigin { return { operation: value.operation, baseDocumentRevision: value.baseDocumentRevision, selectedAnnotationIds: [...value.selectedAnnotationIds], ...(value.instruction === undefined ? {} : { instruction: value.instruction }) }; }
 function skillBlock(context: PrivateSkillContent, baseDir: string): string {
   return `<skill name="${escapeXml(context.name)}" baseDir="${escapeXml(baseDir)}">\n${context.body}\n</skill>`;
 }

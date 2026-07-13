@@ -15,6 +15,8 @@ interface DraftsFile {
 }
 
 const MAX_DRAFTS = 50;
+export const PLAN_DRAFT_TAG = "(plan-draft)";
+const PLAN_DRAFT_ID_PREFIX = "plan-";
 
 function draftsPath(): string {
   return join(getAgentDir(), "extensions", "pi-prompt-drafts.json");
@@ -63,7 +65,7 @@ export async function saveDraft(text: string, existingId?: string): Promise<Draf
     updatedAt: now,
   };
   file.drafts.unshift(draft);
-  if (file.drafts.length > MAX_DRAFTS) file.drafts.length = MAX_DRAFTS;
+  file.drafts = retainedDrafts(file.drafts);
   await writeDraftsFile(file);
   return draft;
 }
@@ -72,6 +74,39 @@ export async function deleteDraft(id: string): Promise<void> {
   const file = await readDraftsFile();
   file.drafts = file.drafts.filter((d) => d.id !== id);
   await writeDraftsFile(file);
+}
+
+export async function savePlanDraft(sessionId: string, prompt: string): Promise<Draft> {
+  const file = await readDraftsFile();
+  const id = planDraftId(sessionId);
+  const now = Date.now();
+  const text = `${PLAN_DRAFT_TAG} ${prompt}`;
+  const found = file.drafts.find((draft) => draft.id === id);
+  if (found) {
+    found.text = text;
+    found.updatedAt = now;
+    await writeDraftsFile(file);
+    return found;
+  }
+  const draft = { id, text, createdAt: now, updatedAt: now };
+  file.drafts.unshift(draft);
+  file.drafts = retainedDrafts(file.drafts);
+  await writeDraftsFile(file);
+  return draft;
+}
+
+export function deletePlanDraft(sessionId: string): Promise<void> {
+  return deleteDraft(planDraftId(sessionId));
+}
+
+function planDraftId(sessionId: string): string {
+  return `${PLAN_DRAFT_ID_PREFIX}${sessionId}`;
+}
+
+function retainedDrafts(drafts: Draft[]): Draft[] {
+  const planDrafts = drafts.filter((draft) => draft.id.startsWith(PLAN_DRAFT_ID_PREFIX));
+  const ordinaryDrafts = drafts.filter((draft) => !draft.id.startsWith(PLAN_DRAFT_ID_PREFIX)).slice(0, MAX_DRAFTS);
+  return [...planDrafts, ...ordinaryDrafts].sort((left, right) => right.updatedAt - left.updatedAt);
 }
 
 /** Build a one-line preview label from a draft's text for list display. */

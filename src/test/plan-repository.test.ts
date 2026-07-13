@@ -46,13 +46,37 @@ describe("private plan repository", () => {
     expect(locators).toHaveLength(1);
   });
 
-  it("projects and recovers exact committed Markdown plus private clarification state while ignoring writer results", async () => {
+  it("projects and recovers exact BOM-prefixed committed Markdown plus private clarification state while ignoring writer results", async () => {
     const base = await root(); const repo = createPlanRepository({ rootDir: base, clock: () => NOW }); const locators: PlanBranchLocator[] = [];
-    const exact = "# Plan\r\n\r\n## Execution\r\nNormal\r\n"; const value = session({ committedMarkdown: exact, clarifications: { history: [] } });
+    const exact = "\uFEFF# Plan\r\n\r\n## Execution\r\nNormal\r\n"; const value = session({ committedMarkdown: exact, clarifications: { history: [] } });
     await repo.commit({ session: value, previous: null, eventKind: "created", appendLocator: (locator) => locators.unshift(locator) }); const artifact = join(base, value.id);
     expect(await readFile(join(artifact, "plan.md"), "utf8")).toBe(exact); expect(await readFile(join(artifact, "clarifications.json"), "utf8")).toBe(canonical({ history: [] }));
     await writeFile(join(artifact, "plan.md"), "tampered"); await writeFile(join(artifact, "clarifications.json"), "tampered");
     const recovered = await repo.recover(locators); expect(recovered.state?.committedMarkdown).toBe(exact); expect(await readFile(join(artifact, "plan.md"), "utf8")).toBe(exact); expect(await readFile(join(artifact, "clarifications.json"), "utf8")).toBe(canonical({ history: [] }));
+  });
+
+  it("projects, recovers, and removes the stable Grill sidecar", async () => {
+    const base = await root(); const repo = createPlanRepository({ rootDir: base, clock: () => NOW }); const locators: PlanBranchLocator[] = [];
+    const annotation = { id: "generated", author: "grill" as const, target: { kind: "root" as const, elementId: "doc" }, targetSnapshot: { documentRevision: 1, target: { kind: "root" as const, elementId: "doc" }, elementKind: "root" as const, text: "" }, body: "Challenge this.", status: "open" as const, history: [], createdAgainstRevision: 1, createdAt: NOW, updatedAt: NOW };
+    const grill = { basedOnDocumentRevision: 1, annotationIds: { risk: "generated" }, decisionTree: { rootNodeId: "root", nodes: [{ id: "root", question: "Proceed?", annotationKeys: ["risk"], options: [{ id: "yes", label: "Yes", decision: "Proceed." }, { id: "no", label: "No", decision: "Wait." }] }] }, generatedAt: NOW };
+    const first = session({ annotations: [annotation], grill }); await repo.commit({ session: first, previous: null, eventKind: "created", appendLocator: (locator) => locators.unshift(locator) });
+    const path = join(base, first.id, "grill.json"); expect(await readFile(path, "utf8")).toBe(canonical(grill)); await writeFile(path, "tampered"); await repo.recover(locators); expect(await readFile(path, "utf8")).toBe(canonical(grill));
+    const second = session({ stateVersion: 2, annotations: [], grill: undefined }); await repo.commit({ session: second, previous: first, eventKind: "state-changed", appendLocator: () => undefined });
+    await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("commits and recovers an explicit identical-document revision with exact authoritative Markdown", async () => {
+    const base = await root(); const repo = createPlanRepository({ rootDir: base, clock: () => NOW }); const locators: PlanBranchLocator[] = [];
+    const first = session({ committedMarkdown: "first\r\n" });
+    await repo.commit({ session: first, previous: null, eventKind: "created", appendLocator: (locator) => locators.unshift(locator) });
+    const exact = "Unicode café 🧪\r\nplain revision without headings\r\n";
+    const second = session({ stateVersion: 2, documentRevision: 2, document: first.document!, committedMarkdown: exact });
+    await repo.commit({ session: second, previous: first, eventKind: "revision-committed", appendLocator: (locator) => locators.unshift(locator) });
+    expect(await readFile(join(base, second.id, "plan.md"), "utf8")).toBe(exact);
+    await writeFile(join(base, second.id, "plan.md"), "tampered");
+    const recovered = await repo.recover(locators);
+    expect(recovered.state).toMatchObject({ stateVersion: 2, documentRevision: 2, committedMarkdown: exact });
+    expect(await readFile(join(base, second.id, "plan.md"), "utf8")).toBe(exact);
   });
 
   it("keeps the document revision for annotation-only state and preserves old revision bytes", async () => {

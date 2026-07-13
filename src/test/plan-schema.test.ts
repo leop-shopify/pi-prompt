@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
-  PLAN_LIMITS, validateInitialPlanResult, validatePlanSession, validateRevisionPlanResult,
+  PLAN_LIMITS, isMarkdownPlanProjection, validateGrillResult, validateInitialPlanResult, validatePlanSession, validateRevisionPlanResult,
 } from "../plan/schema.js";
+import { projectMarkdownPlan } from "../plan/markdown-projection.js";
 import type { Annotation, PlanElement, PlanSession } from "../plan/types.js";
+import { liveGrillResultFixture } from "./fixtures/grill-result-shorthand.js";
 
 const NOW = "2026-07-10T12:00:00.000Z";
 const sessionId = "ps_session01";
@@ -52,10 +54,18 @@ describe("canonical plan validation", () => {
     expectInvalid({ ...input, lastError: { ...input.lastError, retryable: true } }, "invalid-structure");
   });
 
-  it("persists create-goal as an exclusive execution kind", () => {
-    const result = validatePlanSession({ ...validSession(), execution: { kind: "create-goal" } });
-    expect(result.ok).toBe(true);
-    if (result.ok) expect(result.value.execution).toEqual({ kind: "create-goal" });
+  it("specializes only a versioned projection linked byte-for-byte to committed Markdown", () => {
+    const markdown = "\0\r\ncafe\u0301"; const document = projectMarkdownPlan(markdown, 2);
+    const linked = { ...validSession(), documentRevision: 2, document, committedMarkdown: markdown } as PlanSession;
+    const result = validatePlanSession(linked); expect(result.ok).toBe(true); if (!result.ok) return;
+    expect(isMarkdownPlanProjection(result.value.document, 2)).toBe(true);
+    expect(result.value.document && [result.value.document.elements[0]!.body, ...result.value.document.elements[0]!.children.map((child) => child.body)].join("")).toBe(markdown);
+    expectInvalid({ ...linked, committedMarkdown: `${markdown}changed` }, "projection-markdown");
+    expectInvalid({ ...linked, documentRevision: 3 }, "projection-revision");
+  });
+
+  it("rejects removed and unknown execution kinds", () => {
+    expectInvalid({ ...validSession(), execution: { kind: "create-goal" } }, "invalid-structure");
     expectInvalid({ ...validSession(), execution: { kind: "create-goalie" } }, "invalid-structure");
   });
 
@@ -87,6 +97,8 @@ describe("canonical plan validation", () => {
     expectInvalid({ ...waiting, clarifications: { ...waiting.clarifications, origin: { ...waiting.clarifications.origin, baseDocumentRevision: 0 } } }, "origin-mismatch");
     const answered = { id: "answered", questions: [question], answers: [{ questionId: question.id, answer: { kind: "option" as const, optionId: "missing" } }], answeredAt: NOW };
     expectInvalid({ ...validSession(), clarifications: { history: [answered] } }, "unknown-option");
+    const repeatedQuestionRounds = ["round-a", "round-b"].map((id) => ({ id, questions: [question], answers: [{ questionId: question.id, answer: { kind: "option" as const, optionId: "option-1" } }], answeredAt: NOW }));
+    expect(validatePlanSession({ ...validSession(), clarifications: { history: repeatedQuestionRounds } }).ok).toBe(true);
     const rounds = Array.from({ length: PLAN_LIMITS.clarificationRounds }, (_, index) => ({ id: `round-${index}`, questions: [{ id: `question-${index}`, prompt: "Prompt?", options: [{ id: `a-${index}`, label: "A" }, { id: `b-${index}`, label: "B" }] }], answers: [{ questionId: `question-${index}`, answer: { kind: "custom" as const, text: "Answer" } }], answeredAt: NOW }));
     expect(validatePlanSession({ ...validSession(), clarifications: { history: rounds } }).ok).toBe(true);
     expectInvalid({ ...waiting, clarifications: { ...waiting.clarifications, history: rounds } }, "too-many-rounds");
@@ -174,6 +186,49 @@ describe("canonical plan validation", () => {
     const maxHistory = Array.from({ length: PLAN_LIMITS.history }, (_, index) => ({ from: index % 2 === 0 ? "open" as const : "addressed" as const, to: index % 2 === 0 ? "addressed" as const : "open" as const, at: NOW }));
     expect(validatePlanSession(withAnnotations(validSession(), [rangeAnnotation({ status: "open", history: maxHistory })])).ok).toBe(true);
     expectInvalid(withAnnotations(validSession(), [rangeAnnotation({ status: "addressed", history: [...maxHistory, { from: "open", to: "addressed", at: NOW }] })]), "invalid-structure");
+  });
+});
+
+describe("Grill result schema", () => {
+  const grill = { kind: "grill", basedOnDocumentRevision: 1, annotations: { risk: { target: { kind: "element", elementId: stepId }, body: "This assumption is unproven." } }, decisionTree: { rootNodeId: "root", nodes: [{ id: "root", question: "Which tradeoff?", annotationKeys: ["risk"], options: [{ id: "ship", label: "Ship now", decision: "Accept the risk." }, { id: "wait", label: "Wait", decision: "Gather evidence first." }] }] } };
+  it("requires every local annotation key exactly once in a strict decision tree", () => {
+    expect(validateGrillResult(grill).ok).toBe(true);
+    expect(validateGrillResult({ ...grill, extra: true }).ok).toBe(false);
+    expect(validateGrillResult({ ...grill, decisionTree: { ...grill.decisionTree, nodes: [{ ...grill.decisionTree.nodes[0], annotationKeys: ["missing"], options: [{ id: "bad", label: "Bad", nextNodeId: "missing" }, { id: "done", label: "Done", decision: "Done" }] }] } }).ok).toBe(false);
+    expect(validateGrillResult({ ...grill, annotations: { ...grill.annotations, second: { target: { kind: "root", elementId: documentId }, body: "Challenge this too." } } }).ok).toBe(false);
+    expect(validateGrillResult({ ...grill, decisionTree: { nodes: [] } }).ok).toBe(false);
+    expect(validateGrillResult({ ...grill, decisionTree: { ...grill.decisionTree, nodes: [{ ...grill.decisionTree.nodes[0], annotationKeys: ["risk", "risk"] }] } }).ok).toBe(false);
+  });
+  it("accepts the live four-annotation shorthand shape and infers its sole root", () => {
+    const result = validateGrillResult(liveGrillResultFixture(1, stepId, "body"));
+    expect(result.ok).toBe(true); if (!result.ok) return;
+    expect(Object.keys(result.value.annotations)).toHaveLength(4);
+    expect(result.value.annotations.scope?.target).toEqual({ kind: "range", elementId: stepId, field: "body", start: 0, end: 1 });
+    expect(result.value.decisionTree.rootNodeId).toBe("decision-root");
+  });
+
+  it("rejects ambiguous roots and rootless cycles with specific issues", () => {
+    const node = grill.decisionTree.nodes[0]!;
+    const ambiguous = validateGrillResult({ ...grill, annotations: { risk: grill.annotations.risk, second: { target: { kind: "root", elementId: documentId }, body: "Second." } }, decisionTree: { nodes: [node, { ...node, id: "other", annotationKeys: ["second"] }] } });
+    expect(ambiguous.ok).toBe(false); if (!ambiguous.ok) expect(ambiguous.issues.some((entry) => entry.code === "ambiguous-root")).toBe(true);
+    const cycle = validateGrillResult({ ...grill, annotations: { risk: grill.annotations.risk, second: { target: { kind: "root", elementId: documentId }, body: "Second." } }, decisionTree: { nodes: [
+      { ...node, annotationKeys: ["risk"], options: [{ id: "to-other", label: "Other", nextNodeId: "other" }, { id: "stop-a", label: "Stop", decision: "Stop." }] },
+      { ...node, id: "other", annotationKeys: ["second"], options: [{ id: "to-root", label: "Root", nextNodeId: "root" }, { id: "stop-b", label: "Stop", decision: "Stop." }] },
+    ] } });
+    expect(cycle.ok).toBe(false); if (!cycle.ok) {
+      expect(cycle.issues.some((entry) => entry.code === "no-root")).toBe(true);
+      expect(cycle.issues.some((entry) => entry.code === "decision-cycle")).toBe(true);
+    }
+  });
+
+  it("preserves opaque Grill selector code points until contextual anchor validation", () => {
+    const exact = "\0\r\ne\u0301"; const result = validateGrillResult({ ...grill, annotations: { risk: { ...grill.annotations.risk, target: { kind: "range", elementId: stepId, selector: { field: "body", start: 0, end: [...exact].length, exact } } } } });
+    expect(result.ok).toBe(true); if (result.ok) expect(result.value.annotations.risk?.target).toMatchObject({ selector: { exact } });
+  });
+
+  it("accepts a true no-findings result only with an empty decision tree", () => {
+    expect(validateGrillResult({ kind: "grill", basedOnDocumentRevision: 1, annotations: {}, decisionTree: { nodes: [] } }).ok).toBe(true);
+    expect(validateGrillResult({ kind: "grill", basedOnDocumentRevision: 1, annotations: {}, decisionTree: { rootNodeId: "root", nodes: [] } }).ok).toBe(false);
   });
 });
 

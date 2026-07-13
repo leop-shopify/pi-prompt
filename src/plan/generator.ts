@@ -1,8 +1,8 @@
 import { parseStrictJsonObject } from "./raw-json.js";
-import { PLAN_LIMITS, validateClarificationQuestions, validateInitialPlanResult, validatePlanSession, validateRevisionPlanResult } from "./schema.js";
+import { PLAN_LIMITS, validateClarificationQuestions, validateGrillResult, validateInitialPlanResult, validatePlanSession } from "./schema.js";
 import type {
-  ClarificationQuestion, ClarificationResultDraft, InitialPlanResultDraft, ModelPlanDocumentDraft,
-  ModelRevisionPlanDocumentDraft, PlanOperation, PlanSession, RevisionPlanResultDraft, SafeError, ValidationResult,
+  ClarificationQuestion, ClarificationResultDraft, GrillResultDraft, InitialPlanResultDraft, ModelPlanDocumentDraft,
+  ModelRevisionPlanDocumentDraft, PlanOperation, PlanSession, RevisionMarkdownResultDraft, SafeError, ValidationResult,
 } from "./types.js";
 
 export type { PlanOperation } from "./types.js";
@@ -22,14 +22,15 @@ export interface PlanGeneratorInput {
 
 export type PlanGeneratorOutcome =
   | (InitialPlanResultDraft & { readonly markdown?: string })
-  | (RevisionPlanResultDraft & { readonly markdown?: string })
+  | RevisionMarkdownResultDraft
+  | GrillResultDraft
   | ClarificationResultDraft;
 export type PlanGeneratorResult =
   | { readonly ok: true; readonly outcome: PlanGeneratorOutcome }
   | { readonly ok: false; readonly error: SafeError };
 
 export type PlanDispatchResult = { readonly ok: true; readonly value: undefined } | { readonly ok: false; readonly error: SafeError };
-export type WriterSubmissionKind = "plan" | "clarification";
+export type WriterSubmissionKind = "plan" | "clarification" | "grill";
 export interface WriterSubmissionInput {
   readonly sessionId: string;
   readonly jobId: string;
@@ -55,7 +56,7 @@ export function validateGeneratorInput(input: PlanGeneratorInput): ValidationRes
     || job.baseDocumentRevision !== session.value.documentRevision
     || !sameStrings(job.selectedAnnotationIds, input.selectedAnnotationIds)
     || job.instruction !== input.instruction) return invalid("invalid-generator-input", "The plan generation correlation is invalid.");
-  if (input.operation === "revision" && !session.value.document) return invalid("invalid-generator-input", "Revision generation requires a current plan.");
+  if ((input.operation === "revision" || input.operation === "grill") && !session.value.document) return invalid("invalid-generator-input", "Revision and Grill generation require a current plan.");
   return session;
 }
 
@@ -72,10 +73,32 @@ export function parseGeneratorReport(
 export function validateGeneratorSubmission(
   input: unknown, operation: PlanOperation, session: PlanSession, skills: readonly PrivateSkillContent[],
 ): PlanGeneratorResult {
-  const parsed = operation === "initial" ? validateInitialPlanResult(input) : validateRevisionPlanResult(input);
+  if (operation === "revision") {
+    if (!isRevisionMarkdownResult(input)) return failed("invalid-generation-result", "A revision submission must contain exactly kind revision-markdown and the exact Markdown bytes decoded as text.");
+    return validateRevisionMarkdownPrivacy(input.markdown, session, skills);
+  }
+  if (operation === "grill") return failed("invalid-generation-result", "Grill submissions require the Grill result validator.");
+  const parsed = validateInitialPlanResult(input);
   if (!parsed.ok) return failed("invalid-generation-result", `The submitted plan is invalid: ${formatIssues(parsed.issues)}`);
   if (!hasImplementationTasks(parsed.value.document)) return failed("missing-implementation-tasks", "The submitted plan omitted valid Implementation Tasks.");
   if (containsPrivateValue(parsed.value, privateValues(session, skills))) return failed("private-output-exposure", "The submitted plan contained private skill data and was rejected.");
+  return { ok: true, outcome: parsed.value };
+}
+
+export function validateRevisionMarkdownPrivacy(
+  markdown: string, session: PlanSession, skills: readonly PrivateSkillContent[],
+): PlanGeneratorResult {
+  if (containsPrivateValue(markdown, privateValues(session, skills))) return failed("private-output-exposure", "The submitted plan contained private skill data and was rejected.");
+  return { ok: true, outcome: { kind: "revision-markdown", markdown } };
+}
+
+export function validateGrillSubmission(
+  input: unknown, session: PlanSession, skills: readonly PrivateSkillContent[],
+): PlanGeneratorResult {
+  const parsed = validateGrillResult(input);
+  if (!parsed.ok) return failed("invalid-grill", `The Grill submission is invalid: ${formatIssues(parsed.issues)}`);
+  if (!session.document || parsed.value.basedOnDocumentRevision !== session.documentRevision) return failed("stale-grill", "The Grill submission does not match the current plan revision.");
+  if (containsPrivateValue(parsed.value, privateValues(session, skills))) return failed("private-output-exposure", "The Grill submission contained private skill data and was rejected.");
   return { ok: true, outcome: parsed.value };
 }
 
@@ -97,15 +120,20 @@ export function clarificationOutcome(questions: readonly ClarificationQuestion[]
 
 export function operationContract(operation: PlanOperation): string {
   const element = '{"kind":"title","body":"Plan title","children":[]}';
+  if (operation === "grill") return [
+    "Submit exactly this JSON shape (replace example values): {\"kind\":\"grill\",\"basedOnDocumentRevision\":1,\"annotations\":{\"risk\":{\"target\":{\"kind\":\"range\",\"elementId\":\"anchor-id\",\"field\":\"body\",\"start\":0,\"end\":4},\"body\":\"State the concern.\"}},\"decisionTree\":{\"nodes\":[{\"id\":\"root\",\"question\":\"Proceed?\",\"annotationKeys\":[\"risk\"],\"options\":[{\"id\":\"yes\",\"label\":\"Yes\",\"decision\":\"Proceed.\"},{\"id\":\"no\",\"label\":\"No\",\"decision\":\"Revise.\"}]}]}}",
+    "Range targets may use that flat field/start/end shorthand or the canonical selector form. Do not copy exact/prefix/suffix text already present in the Plan; the controller derives it from Unicode code-point offsets.",
+    "Omit rootNodeId only when the nextNodeId edges have exactly one zero-indegree root. Every annotation key appears exactly once; options contain exactly one nextNodeId or decision; nodes are reachable and acyclic. No findings is annotations {} with decisionTree {nodes:[]}.",
+    "Use only IDs from the supplied anchor map. Do not modify the plan document.",
+  ].join("\n");
   if (operation === "initial") return [
     `Submit exactly {"kind":"plan","document":{"title":${element},"elements":[]}} with the elements populated.`,
     "document.title is a complete title element object, never a string.",
     "Every element is {kind,title?,body,children}; omit all server IDs in an initial result.",
   ].join("\n");
   return [
-    `Submit exactly {"kind":"revision","document":{"title":${element},"elements":[]},"addressedAnnotationIds":[]} with the elements populated.`,
-    "document.title is a complete title element object, never a string.",
-    "Use retainedId only for IDs present in the supplied canonical plan. addressedAnnotationIds must be selected feedback IDs.",
+    "Submit the complete revised plan as Markdown.",
+    "The exact decoded Markdown is authoritative; do not submit a structured document, retained IDs, or addressed annotation IDs.",
   ].join("\n");
 }
 
@@ -114,6 +142,13 @@ export const IMPLEMENTATION_TASK_CONTRACT = [
   "Every direct task step needs a nonblank title and body lines beginning `Scope:`, `Test first:`, `Implement:`, `Verify:`, and `Done when:`.",
   `Use only these element kinds and remain within controller limits (maximum ${PLAN_LIMITS.elements} elements, depth ${PLAN_LIMITS.depth}).`,
 ].join("\n");
+
+function isRevisionMarkdownResult(input: unknown): input is RevisionMarkdownResultDraft {
+  return Boolean(input && typeof input === "object" && !Array.isArray(input)
+    && Object.keys(input).length === 2
+    && (input as { readonly kind?: unknown }).kind === "revision-markdown"
+    && typeof (input as { readonly markdown?: unknown }).markdown === "string");
+}
 
 function hasImplementationTasks(document: ModelPlanDocumentDraft | ModelRevisionPlanDocumentDraft): boolean {
   let section: ModelPlanDocumentDraft["title"] | ModelRevisionPlanDocumentDraft["title"] | undefined;

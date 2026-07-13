@@ -27,10 +27,9 @@ describe("prompt editor state", () => {
 
   it("keeps exclusive execution separate from skills", () => {
     const state = createPromptEditorState({ execution: { kind: "goal" }, selectedSkills: ["test-expert"] });
-    expect(EXECUTION_KIND_ORDER).toEqual(["normal", "create-goal", "goal", "loop"]);
+    expect(EXECUTION_KIND_ORDER).toEqual(["normal", "goal", "loop"]);
     expect(cycleExecutionKind(state.execution, 1)).toEqual({ kind: "loop" });
-    expect(cycleExecutionKind({ kind: "normal" }, 1)).toEqual({ kind: "create-goal" });
-    expect(cycleExecutionKind({ kind: "create-goal" }, 1)).toEqual({ kind: "goal" });
+    expect(cycleExecutionKind({ kind: "normal" }, 1)).toEqual({ kind: "goal" });
     expect(cycleExecutionKind({ kind: "loop" }, 1)).toEqual({ kind: "normal" });
     expect(state.selectedSkills).toEqual(["test-expert"]);
     expect(state.selectedSkills).not.toContain("/goal");

@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { EXECUTION_LEADERSHIP_BOOTSTRAP, normalizeExecutionInput } from "../plan/classification.js";
+import { normalizeExecutionInput } from "../plan/classification.js";
 import type { ExecutionKind, ValidationResult } from "../plan/types.js";
 
 export interface DirectSendInput {
@@ -20,9 +20,7 @@ export function buildDirectSendMessage(input: DirectSendInput): ValidationResult
   if (!normalized.ok) return normalized;
   const prompt = normalized.value.promptText.trim();
   const skillBlocks = (input.skillBlocks ?? []).map((block) => block.trim()).filter(Boolean);
-  const blocks = normalized.value.execution.kind === "create-goal"
-    ? [EXECUTION_LEADERSHIP_BOOTSTRAP, ...skillBlocks]
-    : skillBlocks;
+  const blocks = skillBlocks;
   const slash = normalized.value.execution.kind === "normal" ? splitLeadingSlashCommand(prompt) : null;
   const promptBody = slash?.rest ?? prompt;
   const body = blocks.length === 0 ? promptBody : [blocks.join("\n\n"), "", "User prompt:", promptBody].join("\n");
@@ -59,7 +57,7 @@ function splitLeadingSlashCommand(value: string): { readonly command: string; re
 function stripControlledPrefixes(value: string): string {
   let output = value;
   while (true) {
-    const match = output.match(/^\s*\/(?:goal|loop|create-goal)(?=$|\s)/);
+    const match = output.match(/^\s*\/(?:goal|loop)(?=$|\s)/);
     if (!match) return output.trimStart();
     output = output.slice(match[0].length);
   }

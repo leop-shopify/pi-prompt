@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { listDrafts, saveDraft } from "../drafts.js";
+import { deletePlanDraft, listDrafts, PLAN_DRAFT_TAG, saveDraft, savePlanDraft } from "../drafts.js";
 import { applyPromptTemplateVariables, extractPromptTemplateVariables } from "../prompt-templates.js";
 import { normalizeEditorSource, preloadPromptFile } from "../prompt-editor/sources.js";
 
@@ -29,6 +29,17 @@ describe("prompt editor sources", () => {
     await expect(listDrafts()).resolves.toEqual([draft]);
   });
 
+  it("upserts and removes a stable tagged plan restart draft", async () => {
+    process.env.PI_CODING_AGENT_DIR = await tempDir("pi-prompt-agent-plan-");
+    const first = await savePlanDraft("session-1", "Build it");
+    const updated = await savePlanDraft("session-1", "Build it better");
+    expect(updated.id).toBe(first.id);
+    expect(updated.text).toBe(`${PLAN_DRAFT_TAG} Build it better`);
+    await expect(listDrafts()).resolves.toEqual([updated]);
+    await deletePlanDraft("session-1");
+    await expect(listDrafts()).resolves.toEqual([]);
+  });
+
   it("preserves template variables", () => {
     const source = "Build {{ feature }} in {{repo}} then verify {{ feature }}";
     expect(extractPromptTemplateVariables(source)).toEqual(["feature", "repo"]);
@@ -39,14 +50,11 @@ describe("prompt editor sources", () => {
     expect(normalizeEditorSource("/goal\nBuild it", { kind: "goal" })).toEqual({
       ok: true, value: { promptText: "Build it", execution: { kind: "goal" } },
     });
-    expect(normalizeEditorSource("/create-goal /create-goal Build it", { kind: "create-goal" })).toEqual({
-      ok: true, value: { promptText: "Build it", execution: { kind: "create-goal" } },
-    });
     expect(normalizeEditorSource("/create-goalie Build it")).toEqual({
       ok: true, value: { promptText: "/create-goalie Build it", execution: { kind: "normal" } },
     });
     expect(normalizeEditorSource("/loop /goal Build it", { kind: "loop" })).toMatchObject({ ok: false });
-    expect(normalizeEditorSource("/create-goal /goal Build it", { kind: "create-goal" })).toMatchObject({ ok: false });
+    expect(normalizeEditorSource("/create-goal Build it")).toEqual({ ok: true, value: { promptText: "/create-goal Build it", execution: { kind: "normal" } } });
     expect(normalizeEditorSource("/goal Build it", { kind: "loop" })).toMatchObject({ ok: false });
   });
 });

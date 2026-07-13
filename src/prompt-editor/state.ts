@@ -8,7 +8,7 @@ export const PROMPT_FIELD_FOCUS_ORDER: readonly PromptFieldFocus[] = Object.free
 ]);
 export type PromptPlanningMode = "no-plan" | GenerationMode;
 export const PROMPT_PLANNING_MODE_ORDER: readonly PromptPlanningMode[] = Object.freeze(["no-plan", ...GENERATION_MODE_ORDER]);
-export const EXECUTION_KIND_ORDER: readonly ExecutionKind["kind"][] = Object.freeze(["normal", "create-goal", "goal", "loop"]);
+export const EXECUTION_KIND_ORDER: readonly ExecutionKind["kind"][] = Object.freeze(["normal", "goal", "loop"]);
 
 export interface PromptEditorState {
   focus: PromptFieldFocus;

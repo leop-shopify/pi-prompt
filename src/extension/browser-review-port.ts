@@ -1,7 +1,16 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
 import { createBrowserLauncher, type BrowserLauncher } from "../plan/browser-launcher.js";
 import { startPlanHttpHost, type PlanHttpHost } from "../plan/http-server.js";
 import type { PlanController } from "../plan/controller.js";
+import { defaultPlanRepositoryRoot } from "../plan/repository.js";
+import { SpecController } from "../spec/controller.js";
+import { SPEC_LOCATOR_CUSTOM_TYPE, scanSpecBranchLocators } from "../spec/locator.js";
+import { createSpecRepository } from "../spec/repository.js";
+import { captureSpecSource } from "../spec/source.js";
+import type { SpecBranchLocator } from "../spec/types.js";
+import { safeRuntimeId } from "./pi-adapters.js";
+import type { CurrentAgentPlanBridge } from "./current-agent-bridge.js";
 import type { PromptEditorInitialState } from "../prompt-editor/types.js";
 import type { PlanReadyInput, PlanReviewPort } from "./runtime.js";
 import { clearPlanProgress, showPlanProgress } from "./progress.js";
@@ -10,6 +19,7 @@ import { livePlanActivity } from "./live-activity.js";
 export interface BrowserReviewPortOptions {
   readonly launcher: BrowserLauncher;
   readonly reopen: (ctx: ExtensionContext, initial: PromptEditorInitialState) => void | Promise<void>;
+  readonly createSpecController?: (controller: PlanController, ctx: ExtensionContext) => Promise<SpecController | null>;
 }
 
 export function createBrowserPlanReviewPort(options: BrowserReviewPortOptions): PlanReviewPort {
@@ -28,6 +38,7 @@ export function createBrowserPlanReviewPort(options: BrowserReviewPortOptions): 
     const host = await startPlanHttpHost({
       controller: input.controller,
       activity: () => livePlanActivity(input.controller),
+      ...(options.createSpecController ? { createSpecController: () => options.createSpecController!(input.controller, input.ctx) } : {}),
       reopenInPi: async () => {
         if (epoch !== ownedEpoch) return;
         active = null; activeController = null;
@@ -87,8 +98,30 @@ export function createBrowserPlanReviewPort(options: BrowserReviewPortOptions): 
 }
 
 export function defaultBrowserPlanReviewPort(
-  pi: Pick<ExtensionAPI, "exec">,
+  pi: Pick<ExtensionAPI, "exec" | "appendEntry" | "sendUserMessage">,
+  bridge: CurrentAgentPlanBridge,
   reopen: (ctx: ExtensionContext, initial: PromptEditorInitialState) => void | Promise<void>,
 ): PlanReviewPort {
-  return createBrowserPlanReviewPort({ launcher: createBrowserLauncher(pi), reopen });
+  return createBrowserPlanReviewPort({ launcher: createBrowserLauncher(pi), reopen, createSpecController: async (planController, ctx) => {
+    const plan = planController.snapshot(); if (!plan) return null;
+    const root = defaultPlanRepositoryRoot(); const captured = captureSpecSource(plan, join(root, plan.id)); if (!captured.ok) return null;
+    const repository = createSpecRepository({ rootDir: root }); const generator = bridge.createSpecGenerator(ctx.isIdle.bind(ctx));
+    const options = {
+      repository, generator,
+      appendLocator: (locator: SpecBranchLocator) => pi.appendEntry(SPEC_LOCATOR_CUSTOM_TYPE, locator),
+      source: { fresh: async () => {
+        const current = planController.snapshot(); const value = current ? captureSpecSource(current, join(root, current.id)) : { ok: false as const, issues: [{ code: "plan-unavailable", message: "The current Plan is unavailable." }] };
+        return value.ok ? { ok: true as const, value: value.value } : { ok: false as const, error: { code: value.issues[0]?.code ?? "source-unavailable", message: value.issues[0]?.message ?? "Spec source is unavailable." } };
+      } },
+      idFactory: safeRuntimeId, clock: () => new Date(),
+      stager: { stage: (value: string) => { if (ctx.isIdle()) pi.sendUserMessage(value); else pi.sendUserMessage(value, { deliverAs: "followUp" }); } },
+    };
+    try {
+      const entries = ctx.sessionManager.getBranch().map((entry) => ({ type: entry.type, ...(entry.type === "custom" ? { customType: entry.customType, data: entry.data } : {}) }));
+      const locators = scanSpecBranchLocators(entries, root).locators.filter((locator) => locator.planSessionId === plan.id); const recovered = await repository.recover(locators);
+      const result = recovered.state ? await SpecController.fromRecovered(options, recovered.state, []) : await SpecController.create(options, captured.value);
+      if (result.ok) return result.value;
+    } catch { /* close the isolated resources below */ }
+    await generator.close(); await repository.close(); return null;
+  } });
 }

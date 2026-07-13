@@ -40,6 +40,7 @@ function fakeController(initial = readyState(), behavior: { stageFailures?: numb
     updateAnnotationBody: vi.fn(async ({ annotationId, body }: any) => state.status === "awaiting-clarification" ? { ok: false as const, error: { code: "clarification-read-only", message: "Annotations are read-only while clarification answers are pending." } } : commit({ annotations: state.annotations.map((entry) => entry.id === annotationId ? { ...entry, body } : entry) })),
     transitionAnnotation: vi.fn(async ({ annotationId, status }: any) => state.status === "awaiting-clarification" ? { ok: false as const, error: { code: "clarification-read-only", message: "Annotations are read-only while clarification answers are pending." } } : commit({ annotations: state.annotations.map((entry) => entry.id === annotationId ? { ...entry, status } : entry) })),
     revise: vi.fn(async ({ selectedAnnotationIds }: any) => { const id = `job-${++job}`; commit({ status: "revising", generationJob: { jobId: id, operation: "revision", baseDocumentRevision: state.documentRevision, selectedAnnotationIds, startedAt: "2026-07-10T00:00:00.000Z" } }); return { ok: true as const, value: { jobId: id, completion: new Promise(() => undefined) } }; }),
+    grill: vi.fn(async () => { const id = `job-${++job}`; commit({ status: "grilling", generationJob: { jobId: id, operation: "grill", baseDocumentRevision: state.documentRevision, selectedAnnotationIds: [], startedAt: "2026-07-10T00:00:00.000Z" } }); return { ok: true as const, value: { jobId: id, completion: new Promise(() => undefined) } }; }),
     generate: vi.fn(async () => { const id = `job-${++job}`; commit({ status: "generating" }); return { ok: true as const, value: { jobId: id, completion: new Promise(() => undefined) } }; }),
     answerClarification: vi.fn(async () => { const id = `job-${++job}`; const operation = state.clarifications?.pending?.operation ?? "initial"; commit({ status: operation === "initial" ? "generating" : "revising", clarifications: { history: state.clarifications?.history ?? [], origin: state.clarifications?.origin }, generationJob: { jobId: id, operation, baseDocumentRevision: state.documentRevision, selectedAnnotationIds: [], startedAt: "2026-07-10T00:00:00.000Z" } }); return { ok: true as const, value: { jobId: id, completion: new Promise(() => undefined) } }; }),
     dispatchGeneration: vi.fn(() => ({ ok: true as const, value: undefined })),
@@ -58,12 +59,22 @@ function auth(host: Awaited<ReturnType<typeof startPlanHttpHost>>, mutation = fa
   const token = new URL(host.launchUrl).hash.slice("#capability=".length);
   return { Authorization: `Bearer ${token}`, "X-Pi-Prompt-Origin": host.origin, ...(mutation ? { Origin: host.origin, "Content-Type": "application/json", ...(etag ? { "If-Match": etag } : {}) } : {}) };
 }
-function writerHeaders(attemptId: string, result: "plan" | "clarification", contentType = result === "plan" ? "text/markdown" : "application/json") {
+function writerHeaders(attemptId: string, result: "plan" | "clarification" | "grill", contentType = result === "plan" ? "text/markdown" : "application/json") {
   return { Authorization: `Bearer ${attemptId}`, "Content-Type": contentType, "X-Pi-Prompt-Result": result };
 }
 async function json(response: Response) { return response.json() as Promise<any>; }
 
 describe("secure plan HTTP host", () => {
+  it("starts a correlated Grill run and accepts strict-JSON writer bytes", async () => {
+    const fake = fakeController(); const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn() });
+    try {
+      const run = await fetch(`${host.origin}/api/v1/grill-runs`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body: JSON.stringify({ requestId: "request-id-grill-001" }) });
+      expect(run.status).toBe(202); expect(fake.raw.grill).toHaveBeenCalledWith({ expectedStateVersion: 3 }); expect(await json(run)).toMatchObject({ job: { status: "grilling" } });
+      const bytes = Buffer.from('{"kind":"grill"}'); const upload = await fetch(`${host.origin}/api/v1/writer-results`, { method: "POST", headers: writerHeaders("attempt_identity_0001", "grill"), body: bytes });
+      expect(upload.status).toBe(202); expect(fake.writerSubmissions[0]).toMatchObject({ kind: "grill", body: bytes });
+    } finally { await host.close(); }
+  });
+
   it("serves only the constant shell/allowlisted assets with security headers and no private plan data", async () => {
     const fake = fakeController(); const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn() });
     try {
@@ -78,17 +89,18 @@ describe("secure plan HTTP host", () => {
     } finally { await host.close(); }
   });
 
-  it("serves the canonical session plan.md through the authenticated plan endpoint", async () => {
-    const planRoot = await mkdtemp(join(tmpdir(), "pi-prompt-http-plan-"));
+  it("serves the exact canonical session plan.md, including a leading BOM, through the authenticated plan endpoint", async () => {
+    const planRoot = await mkdtemp(join(tmpdir(), "pi-prompt-http-plan-")); const markdown = "\uFEFF# Saved plan\n\n## Execution\nNormal\n";
     await mkdir(join(planRoot, "session"), { recursive: true });
-    await writeFile(join(planRoot, "session", "plan.md"), "# Saved plan\n\n## Execution\nNormal\n", { mode: 0o600 });
-    const fake = fakeController(readyState({ committedMarkdown: "# Saved plan\n\n## Execution\nNormal\n" }));
+    await writeFile(join(planRoot, "session", "plan.md"), markdown, { mode: 0o600 });
+    const fake = fakeController(readyState({ committedMarkdown: markdown }));
     const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn(), planRoot });
     try {
       expect((await fetch(`${host.origin}/api/v1/plan`)).status).toBe(401);
       const response = await fetch(`${host.origin}/api/v1/plan`, { headers: auth(host) });
       expect(response.status).toBe(200); expect(response.headers.get("content-type")).toContain("text/markdown");
-      expect(await response.text()).toBe("# Saved plan\n\n## Execution\nNormal\n");
+      const decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await response.arrayBuffer());
+      expect(decoded).toBe(markdown); expect(decoded.codePointAt(0)).toBe(0xfeff);
     } finally { await host.close(); }
   });
 
@@ -199,6 +211,23 @@ describe("secure plan HTTP host", () => {
       const events = await fetch(`${host.origin}/api/v1/events?after=0`, { headers: auth(host) }); const eventBody = await json(events); expect(eventBody.events.map((event: any) => event.stateVersion)).toEqual([4, 5, 6]);
       expect(JSON.stringify(eventBody)).not.toContain("instruction");
       const future = await fetch(`${host.origin}/api/v1/events?after=999`, { headers: auth(host) }); expect(future.status).toBe(400);
+    } finally { await host.close(); }
+  });
+
+  it("retries an invalid initial generation through a replay-safe browser mutation", async () => {
+    const fake = fakeController(readyState({ status: "error", documentRevision: 0, document: null, lastError: { code: "invalid-generation-result", message: "The planner output could not be applied safely. Retry generation." } }));
+    const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn() });
+    try {
+      const before = await json(await fetch(`${host.origin}/api/v1/snapshot`, { headers: auth(host) }));
+      expect(before.snapshot.actions).toMatchObject({ canRetryGeneration: true });
+      const body = JSON.stringify({ requestId: "request-retry-generation-01" });
+      const retry = await fetch(`${host.origin}/api/v1/generation-retries`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body });
+      expect(retry.status).toBe(202);
+      expect(await json(retry)).toMatchObject({ job: { status: "generating" }, snapshot: { status: "generating", stateVersion: 4, actions: { canRetryGeneration: false } } });
+      expect(fake.raw.generate).toHaveBeenCalledWith({ expectedStateVersion: 3 });
+      expect(fake.raw.dispatchGeneration).toHaveBeenCalledWith("job-1");
+      const replay = await fetch(`${host.origin}/api/v1/generation-retries`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body });
+      expect(replay.status).toBe(202); expect(fake.raw.generate).toHaveBeenCalledTimes(1);
     } finally { await host.close(); }
   });
 

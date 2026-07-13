@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { deletePlanDraft, savePlanDraft } from "../drafts.js";
 import type { PlanController, PlanControllerResult } from "../plan/controller.js";
 import { scanPlanBranchLocators, type PlanBranchEntry } from "../plan/locator.js";
 import { defaultPlanRepositoryRoot } from "../plan/repository.js";
@@ -23,10 +24,16 @@ export interface PlanReviewPort {
 }
 export interface RuntimeEditorPort { open(ctx: ExtensionContext, initial: PromptEditorInitialState): void | Promise<void> }
 
+export interface PlanDraftLifecyclePort {
+  upsert(sessionId: string, prompt: string): Promise<unknown>;
+  remove(sessionId: string): Promise<unknown>;
+}
+
 export interface PromptExtensionRuntimeOptions {
   readonly controllers: ControllerStackFactory;
   readonly review: PlanReviewPort;
   readonly editor: RuntimeEditorPort;
+  readonly planDrafts?: PlanDraftLifecyclePort;
 }
 
 export interface PromptExtensionRuntime {
@@ -55,6 +62,8 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
   let cachedLocatorCount = 0;
   let shutdownComplete = false;
   let replacementTail: Promise<void> = Promise.resolve();
+  let stopDraftSubscription: (() => void) | null = null;
+  const planDrafts = options.planDrafts ?? { upsert: savePlanDraft, remove: deletePlanDraft };
 
   const nextEpoch = (): number => {
     runtimeEpoch += 1;
@@ -86,6 +95,7 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
       } catch {
         return false;
       }
+      stopDraftSubscription?.(); stopDraftSubscription = null;
       if (active === controller && activeEpoch === controllerEpoch) active = null;
       return true;
     })();
@@ -102,6 +112,26 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
     message: string, type: "info" | "warning" | "error",
   ): void => {
     if (owns(controller, epoch)) notifySafe(ctx, message, type);
+  };
+
+  const trackPlanDraft = async (ctx: ExtensionContext, controller: PlanController, state: PlanSession): Promise<void> => {
+    stopDraftSubscription?.(); stopDraftSubscription = null;
+    const sessionId = state.id;
+    if (state.status === "cancelled") {
+      try { await planDrafts.remove(sessionId); }
+      catch { notifySafe(ctx, "The cancelled plan draft could not be removed.", "warning"); }
+      return;
+    }
+    if (typeof controller.subscribe === "function") {
+      const unsubscribe = controller.subscribe((event) => {
+        if (event.sessionId !== sessionId || event.kind !== "cancelled" || event.status !== "cancelled") return;
+        if (stopDraftSubscription === unsubscribe) { stopDraftSubscription = null; unsubscribe(); }
+        void planDrafts.remove(sessionId).catch(() => notifySafe(ctx, "The cancelled plan draft could not be removed.", "warning"));
+      });
+      stopDraftSubscription = unsubscribe;
+    }
+    try { await planDrafts.upsert(sessionId, state.source.prompt); }
+    catch { notifySafe(ctx, "The plan started, but its restart draft could not be saved.", "warning"); }
   };
 
   const presentIfReady = async (ctx: ExtensionContext, controller: PlanController, epoch: number): Promise<boolean> => {
@@ -197,6 +227,8 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
         if (!created.ok) { notifySafe(ctx, created.error.message, "error"); return null; }
         active = created.value.controller;
         activeEpoch = epoch;
+        const state = active.snapshot();
+        if (state) await trackPlanDraft(ctx, active, state);
         return active;
       });
       if (!controller || !owns(controller, epoch)) { clearPlanProgress(ctx); return; }
@@ -227,6 +259,8 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
         if (!controller) { notifySafe(ctx, "No saved plan is available on this branch.", "info"); return null; }
         active = controller;
         activeEpoch = epoch;
+        const state = controller.snapshot();
+        if (state) await trackPlanDraft(ctx, controller, state);
         return { controller, warnings: result.value.warnings };
       });
       if (!recovered || !owns(recovered.controller, epoch)) return;
@@ -236,7 +270,7 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
       }
       let state = controller.snapshot();
       if (!state) { notifyOwned(ctx, controller, epoch, "The saved plan state is unavailable.", "error"); return; }
-      if (state.status === "generating" || state.status === "revising") {
+      if (state.status === "generating" || state.status === "revising" || state.status === "grilling") {
         const paused = await controller.pause({ expectedStateVersion: state.stateVersion });
         if (!owns(controller, epoch)) return;
         if (!paused.ok) { notifyOwned(ctx, controller, epoch, paused.error.message, "error"); return; }

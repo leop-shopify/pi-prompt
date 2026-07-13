@@ -21,12 +21,13 @@ describe("browser protocol", () => {
       timeline: [{ phase: "capability-detected", at: "2026-07-10T00:00:00.000Z" }, { phase: "waiting-report", at: "2026-07-10T00:01:00.000Z" }],
       privateReport: "REPORT SECRET", toolName: "spawn_agent", nonce: "NONCE SECRET",
     } as never);
+    expect(snapshot.id).toBe("session");
     expect(snapshot.document?.title.body).toBe("<img src=x onerror=alert(1)>");
-    expect(snapshot.annotations[0]).toMatchObject({ body: "literal <script>hostile()</script>", locked: true, targetSummary: { label: "Execution" } });
+    expect(snapshot.annotations[0]).toMatchObject({ author: "user", body: "literal <script>hostile()</script>", locked: true, targetSummary: { label: "Execution" } });
     expect(snapshot.job).toEqual({ operation: "revision", baseDocumentRevision: 2, startedAt: "2026-07-10T00:00:00.000Z" });
     expect(snapshot.originalPrompt).toBe(privateState.source.prompt);
     expect(snapshot.promptPreview).toBe(privateState.source.prompt);
-    expect(snapshot.actions).toEqual({ canRetryStaging: false });
+    expect(snapshot.actions).toEqual({ canRetryGeneration: false, canRetryStaging: false });
     expect(snapshot.activity).toEqual({
       phase: "waiting-report", headline: "Waiting for the primary report", summary: "One primary planner is working independently.",
       startedAt: "2026-07-10T00:00:00.000Z", updatedAt: "2026-07-10T00:01:00.000Z", budgetMinutes: 10, overBudget: true,
@@ -82,6 +83,10 @@ describe("browser protocol", () => {
     expect(parseMutation("annotation-create", { requestId: id, target: { kind: "element", elementId: "execution" }, body: "note", cwd: "/secret" }).ok).toBe(false);
     expect(parseMutation("annotation-patch", { requestId: id, update: { status: "addressed" } })).toMatchObject({ ok: false, code: "invalid-status" });
     expect(parseMutation("annotation-patch", { requestId: id, update: { status: "orphaned" } })).toMatchObject({ ok: false, code: "invalid-status" });
+    expect(parseMutation("generation-retry", { requestId: id })).toEqual({ ok: true, value: { requestId: id } });
+    expect(parseMutation("generation-retry", { requestId: id, prompt: "secret" }).ok).toBe(false);
+    expect(parseMutation("grill", { requestId: id })).toEqual({ ok: true, value: { requestId: id } });
+    expect(parseMutation("grill", { requestId: id, instruction: "secret" }).ok).toBe(false);
     expect(parseMutation("accept", { requestId: id, stateVersion: 9, documentRevision: 2, confirmed: false }).ok).toBe(false);
     expect(parseMutation("clarification-answers", { requestId: id, clarificationId: "round", answers: [{ questionId: "q", answer: { kind: "option", optionId: "a" } }] }).ok).toBe(true);
     expect(parseMutation("clarification-answers", { requestId: id, clarificationId: "round", answers: [{ questionId: "q", answer: { kind: "custom", text: "   " } }] })).toMatchObject({ ok: false, code: "invalid-answers" });
