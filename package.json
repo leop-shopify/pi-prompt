@@ -4,7 +4,7 @@
   "private": true,
   "packageManager": "pnpm@10.28.0",
   "type": "module",
-  "description": "A better input interface for Pi, with optional prompt, planning, Grill, and Spec supersets.",
+  "description": "A better input interface for Pi, with optional prompt, planning, Adversarial Review, and Spec supersets.",
   "author": "Leonardo Pereira",
   "license": "MIT",
   "repository": {

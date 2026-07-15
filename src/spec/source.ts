@@ -8,7 +8,7 @@ export function sha256Json(value: unknown): string { return sha256Text(canonical
 
 export function captureSpecSource(plan: PlanSession, planArtifactPath: string): ValidationResult<CapturedSpecSource> {
   if (plan.status !== "ready" || !plan.document || !plan.committedMarkdown) return invalid("plan-not-ready", "Spec generation requires a ready durable Plan with exact Markdown.");
-  if (!plan.grill || plan.grill.basedOnDocumentRevision !== plan.documentRevision) return invalid("grill-unavailable", "Spec generation requires the current Plan Grill artifact.");
+  if (!plan.grill || plan.grill.basedOnDocumentRevision !== plan.documentRevision) return invalid("grill-unavailable", "Spec generation requires the current Plan Adversarial Review artifact.");
   const artifactPath = resolve(planArtifactPath);
   const reference: SpecSourceReference = {
     planSessionId: plan.id,
@@ -34,7 +34,7 @@ export function verifyFreshSpecSource(captured: CapturedSpecSource, current: Pla
   if (!next.ok) return next;
   return sameSpecSource(captured.reference, next.value.reference)
     ? { ok: true, value: captured }
-    : invalid("stale-spec-source", "The Plan, annotations, or Grill source changed. Capture a fresh Spec source.");
+    : invalid("stale-spec-source", "The Plan, annotations, or Adversarial Review source changed. Capture a fresh Spec source.");
 }
 
 export function sameSpecSource(left: SpecSourceReference | undefined, right: SpecSourceReference): boolean {

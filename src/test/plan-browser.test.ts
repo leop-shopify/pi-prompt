@@ -33,11 +33,15 @@ describe("browser review client", () => {
     expect(sources[0]).toContain("retry-generation-button"); expect(sources[0]).toContain("/api/v1/generation-retries");
     expect(sources[0]).toContain("spec-retry-stage-button"); expect(sources[0]).toContain("Retry Spec revision"); expect(sources[0]).toContain("Revise Plan from comments");
     expect(sources[0]).toContain("Accept & send Spec"); expect(sources[0]).not.toContain("It will not execute until you press Enter");
+    const acceptSpecStart = sources[0].indexOf("const acceptSpec = (retry"); const acceptSpecSource = sources[0].slice(acceptSpecStart, sources[0].indexOf('byId("spec-accept-button")', acceptSpecStart));
+    expect(acceptSpecSource).toMatch(/await mutateSpec\("\/api\/v1\/spec\/accept"[\s\S]*finishReview\(\);[\s\S]*toast\("The exact Spec revision was sent to the agent\."\)/u);
+    expect(acceptSpecSource).not.toMatch(/finishReview\(\);[\s\S]*await mutateSpec/u);
+    expect(sources[0]).toMatch(/const pollPlan = async \(\) => \{ while \(!stopped\)[\s\S]*if \(error\?\.name === "AbortError" \|\| stopped\) return; toast\("Plan live updates paused; retrying\."\)/u);
     expect(sources[0]).not.toContain("activity?.phase");
     expect(sources[0]).not.toContain("progress-model"); expect(sources[0]).not.toContain("raw thinking");
     expect(sources[0]).toContain("activity?.progress?.summary ?? activity?.summary"); expect(sources[0]).toContain("generation needs attention");
-    expect(sources[0]).toContain("snapshot.originalPrompt"); expect(sources[0]).toContain("snapshot.id"); expect(sources[0]).toContain("Grilling the current Plan");
-    expect(sources[0]).toContain("createRebuildTransitionTracker"); expect(sources[0]).toContain('window.scrollTo({ top: 0, behavior: "auto" })'); expect(sources[0]).toContain("plan-rebuild-overlay");
+    expect(sources[0]).toContain("snapshot.originalPrompt"); expect(sources[0]).toContain("snapshot.id"); expect(sources[0]).toContain("Reviewing the current Plan adversarially");
+    expect(sources[0]).toContain("createRebuildTransitionTracker"); expect(sources[0]).toContain("createAgentWorkTransitionTracker"); expect(sources[0]).toContain("agentWorkLabel"); expect(sources[0].match(/enteredAgentWork\(/gu)).toHaveLength(2); expect(sources[0]).toContain('window.scrollTo({ top: 0, behavior: "auto" })'); expect(sources[0]).toContain("agent-work-overlay");
     expect(sources[0]).toContain("progress-detail");
     expect(sources[0]).not.toContain("window.prompt(");
     expect(sources[0]).toContain("selection-composer"); expect(sources[0]).toContain("composerState"); expect(sources[0]).toContain("clarificationDraft");
@@ -47,7 +51,7 @@ describe("browser review client", () => {
     expect(sources[0]).toContain('stage !== "spec" && isAwaitingClarification(snapshot)');
     expect(sources[0]).not.toMatch(/sidebar[^\n]*(message|chat|agent)/i);
     expect(sources[2]).toContain("canRetryGeneration"); expect(sources[2]).toContain("canRetryStaging"); expect(sources[2]).toContain("canGenerateFreshSpec"); expect(sources[2]).toContain("specIsStale(snapshot, specSnapshot)");
-    expect(sources[0]).toContain("canRunGrill(snapshot, specSnapshot)"); expect(sources[0]).toContain('snapshot.grill || snapshot.status === "error" ? "Retry Grill" : "Run Grill"');
+    expect(sources[0]).toContain("canRunGrill(snapshot, specSnapshot)"); expect(sources[0]).toContain('snapshot.grill || snapshot.status === "error" ? "Retry Adversarial Review" : "Run Adversarial Review"');
     expect(sources[4]).toContain("note.locked"); expect(sources[4]).toContain("annotation-badge"); expect(sources[4]).toContain("snapshot.planMarkdown"); expect(sources[4]).toContain("projectPlanAnnotations");
     expect(sources[4]).toContain("target.selector.end"); expect(sources[4]).toContain("[...String(text)]");
     expect(sources[4]).toContain('element("button"'); expect(sources[4]).toContain("annotation-fallback"); expect(sources[4]).toContain('role: "checkbox"'); expect(sources[4]).toContain('"aria-checked"'); expect(sources[4]).toContain("Generated text is read-only");
@@ -63,8 +67,9 @@ describe("browser review client", () => {
     const mainStart = shell.indexOf('<main id="plan-content"'); const mainEnd = shell.indexOf("</main>", mainStart); const detail = shell.indexOf('id="progress-detail"'); const plan = shell.indexOf('id="plan-tree"');
     expect(mainStart).toBeGreaterThan(-1); expect(detail).toBeGreaterThan(mainStart); expect(detail).toBeLessThan(plan); expect(plan).toBeLessThan(mainEnd);
     expect(shell).toContain('id="original-prompt"'); expect(shell).toContain('id="plan-context"'); expect(shell).toContain('id="selection-composer"'); expect(shell).toContain('id="clarification-section"'); expect(shell).toContain('id="retry-generation-button"');
-    expect(shell).toContain('aria-label="Plan workflow stages"'); expect(shell).toContain('id="stage-grill"'); expect(shell).toContain('id="stage-spec"'); expect(shell).toContain('rows="5"');
-    expect(shell).toContain('id="plan-rebuild-overlay"'); expect(shell).toContain('role="status" hidden'); expect(shell).toContain("Rebuilding plan...");
+    expect(shell).toContain('aria-label="Plan workflow stages"'); expect(shell).toContain('id="stage-grill"'); expect(shell).toContain('<strong>Adversarial Review</strong>'); expect(shell).toContain('id="stage-spec"'); expect(shell).toContain('rows="5"');
+    expect(shell).toContain('<button id="selection-cancel" type="button" class="quiet">Close</button>');
+    expect(shell).toContain('id="document-surface"'); expect(shell).toMatch(/id="document-surface"[^\n]*id="plan-tree"[^\n]*id="spec-tree"[^\n]*id="agent-work-overlay"/u); expect(shell).toContain('role="status" aria-live="polite" hidden'); expect(shell).toContain('id="agent-work-label"'); expect(shell).toContain("Agent working…");
     expect(shell).toContain('id="grill-select-all"'); expect(shell).toContain('id="grill-clear-selection"'); expect(shell).toContain('id="grill-revision-instruction"'); expect(shell).toContain('id="address-grill-feedback"'); expect(shell).toContain("Address selected feedback");
     expect(shell).not.toContain('id="annotation-list"'); expect(shell).not.toContain('id="notes-section"');
     expect(shell).not.toContain("<aside"); expect(shell).not.toContain('id="root-comment"'); expect(shell).not.toContain("Drawing index"); expect(shell).not.toContain("Markup rail");
@@ -76,7 +81,7 @@ describe("browser review client", () => {
     expect(toastStyles).toContain("background:var(--surface)"); expect(toastStyles).toContain("color:var(--ink)"); expect(toastStyles).toContain("border:1pxsolidvar(--line-strong)");
     expect(toastStyles).not.toContain("background:var(--ink)"); expect(toastStyles).not.toContain("color:#fff");
     expect(compactCss).toContain("@media(max-width:700px)"); expect(compactCss).toContain("prefers-reduced-motion"); expect(compactCss).toContain("min-height:40px"); expect(compactCss).toContain(".grill-feedback-controls"); expect(compactCss).not.toContain("transition:all");
-    expect(compactCss).toContain(".annotation-badge{position:relative;display:inline-grid;place-items:center;width:16px"); expect(compactCss).toContain("animation:plan-rebuild-spin.8slinearinfinite"); expect(compactCss).toContain(".plan-rebuild-spinner{animation:none");
+    expect(compactCss).toContain(".annotation-badge{position:relative;display:inline-grid;place-items:center;width:16px"); expect(compactCss).toContain(".document-surface{position:relative;isolation:isolate;min-height:180px"); expect(compactCss).toContain(".agent-work-overlay{position:absolute;z-index:8;inset:0;min-height:100%"); expect(compactCss).toContain(".agent-work-status{position:sticky;top:24px"); expect(compactCss).toContain(".agent-work-spinner{width:34px;height:34px"); expect(compactCss).toContain("animation:plan-rebuild-spin.8slinearinfinite"); expect(compactCss).toContain(".agent-work-spinner{animation:none");
   });
 
   it("maps public platform argv without shell interpolation", () => {

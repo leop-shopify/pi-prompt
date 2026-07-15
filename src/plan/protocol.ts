@@ -46,7 +46,7 @@ export interface PublicSnapshot {
   readonly actions: PublicSnapshotActions;
   readonly activity?: PublicActivity;
   readonly clarification?: PublicPendingClarification;
-  readonly job?: { readonly operation: "initial" | "revision" | "grill"; readonly baseDocumentRevision: number; readonly startedAt: string };
+  readonly job?: { readonly id: string; readonly operation: "initial" | "revision" | "grill"; readonly baseDocumentRevision: number; readonly startedAt: string };
   readonly error?: { readonly code: string; readonly message: string };
 }
 export interface PublicEvent { readonly sequence: number; readonly kind: string; readonly status: PlanSession["status"]; readonly stateVersion: number; readonly documentRevision: number; readonly errorCode?: string }
@@ -80,7 +80,7 @@ export function toPublicSnapshot(session: PlanSession, actions: Partial<PublicSn
     actions: Object.freeze({ canRetryGeneration: actions.canRetryGeneration === true, canRetryStaging: actions.canRetryStaging === true }),
     ...(activity ? { activity: publicActivity(activity) } : {}),
     ...(session.clarifications?.pending ? { clarification: publicClarification(session.clarifications.pending) } : {}),
-    ...(session.generationJob ? { job: Object.freeze({ operation: session.generationJob.operation, baseDocumentRevision: session.generationJob.baseDocumentRevision, startedAt: session.generationJob.startedAt }) } : {}),
+    ...(session.generationJob ? { job: Object.freeze({ id: session.generationJob.jobId, operation: session.generationJob.operation, baseDocumentRevision: session.generationJob.baseDocumentRevision, startedAt: session.generationJob.startedAt }) } : {}),
     ...(session.lastError ? { error: Object.freeze({ code: session.lastError.code, message: session.lastError.message }) } : {}),
   });
 }
@@ -155,7 +155,7 @@ export function parseMutation(kind: RequestKind, value: unknown): ParseProtocolR
     if (new Set(answers.map((entry) => entry.questionId)).size !== answers.length) return invalid("invalid-answers", "Clarification question IDs must be unique.");
     return valid({ requestId: value.requestId, clarificationId: value.clarificationId, answers });
   }
-  if (!keys(value, ["requestId"])) return invalid("invalid-request", kind === "generation-retry" ? "The generation retry request is invalid." : kind === "grill" ? "The Grill request is invalid." : "The reopen request is invalid.");
+  if (!keys(value, ["requestId"])) return invalid("invalid-request", kind === "generation-retry" ? "The generation retry request is invalid." : kind === "grill" ? "The Adversarial Review request is invalid." : "The reopen request is invalid.");
   return valid({ requestId: value.requestId });
 }
 

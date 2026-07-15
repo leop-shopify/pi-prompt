@@ -28,21 +28,30 @@ export function createPlanApi(capability, fetchImpl = window.fetch.bind(window))
     if (!response.ok) {
       const error = new Error(data?.error?.message ?? "The request failed."); error.code = data?.error?.code ?? "request-failed"; error.status = response.status; error.snapshot = data?.snapshot; error.kind = kind; throw error;
     }
-    const next = response.headers.get("etag"); if (next) { if (kind === "spec") specEtag = next; else planEtag = next; }
     return { response, data };
   };
   return Object.freeze({
     async snapshot() { return (await request("/api/v1/snapshot", "plan", { headers: headers("plan") })).data.snapshot; },
-    async plan() { const response = await fetchImpl("/api/v1/plan", { cache: "no-store", headers: headers("plan") }); return response.ok ? decodeExactUtf8(response) : null; },
+    async plan() {
+      const response = await fetchImpl("/api/v1/plan", { cache: "no-store", headers: headers("plan") });
+      if (!response.ok) return null;
+      const etag = response.headers.get("etag");
+      return { markdown: await decodeExactUtf8(response), etag, stateVersion: parseResourceStateEtag(etag, "plan") };
+    },
     async pollEvents(after, signal) { return (await request(`/api/v1/events?after=${after}`, "plan", { headers: headers("plan"), signal })).data; },
     async mutate(path, method, body) { return (await request(path, "plan", { method, headers: headers("plan", true), body: JSON.stringify(body) })).data; },
     setVersion(version) { planEtag = `\"pi-plan-state-${version}\"`; },
     async specSnapshot() { const result = await request("/api/v1/spec/snapshot", "spec", { headers: headers("spec") }, true); return result.data?.snapshot ?? null; },
-    async specMarkdown() { const response = await fetchImpl("/api/v1/spec/markdown", { cache: "no-store", headers: headers("spec") }); if (response.status === 404) return null; if (!response.ok) { const error = new Error("The Spec Markdown could not be loaded."); error.kind = "spec"; throw error; } const next = response.headers.get("etag"); if (next) specEtag = next; return decodeExactUtf8(response); },
+    async specMarkdown() { const response = await fetchImpl("/api/v1/spec/markdown", { cache: "no-store", headers: headers("spec") }); if (response.status === 404) return null; if (!response.ok) { const error = new Error("The Spec Markdown could not be loaded."); error.kind = "spec"; throw error; } return decodeExactUtf8(response); },
     async pollSpecEvents(after, signal) { return (await request(`/api/v1/spec/events?after=${after}`, "spec", { headers: headers("spec"), signal })).data; },
     async specMutate(path, method, body) { return (await request(path, "spec", { method, headers: headers("spec", true), body: JSON.stringify(body) })).data; },
     setSpecVersion(version) { specEtag = `\"pi-spec-state-${version}\"`; },
   });
 }
 async function decodeExactUtf8(response) { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await response.arrayBuffer()); }
+function parseResourceStateEtag(value, kind) {
+  const match = (kind === "plan" ? /^"pi-plan-state-(0|[1-9]\d*)"$/ : /^"pi-spec-state-(0|[1-9]\d*)"$/).exec(value ?? "");
+  if (!match) return null;
+  const version = Number(match[1]); return Number.isSafeInteger(version) ? version : null;
+}
 export function requestId() { const bytes = new Uint8Array(18); crypto.getRandomValues(bytes); return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join(""); }

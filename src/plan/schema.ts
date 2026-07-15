@@ -99,7 +99,7 @@ const planDocumentSchema = {
   required: ["id", "title", "elements"], additionalProperties: false,
 } as const;
 const grillDecisionOptionSchema = { type: "object", properties: { id: idSchema, label: stringSchema, nextNodeId: idSchema, decision: stringSchema }, required: ["id", "label"], additionalProperties: false } as const;
-const grillDecisionNodeSchema = { type: "object", properties: { id: idSchema, question: stringSchema, annotationKeys: { type: "array", items: idSchema, minItems: 1, maxItems: PLAN_LIMITS.grillAnnotations }, options: { type: "array", items: grillDecisionOptionSchema, minItems: 2, maxItems: PLAN_LIMITS.grillOptions } }, required: ["id", "question", "annotationKeys", "options"], additionalProperties: false } as const;
+const grillDecisionNodeSchema = { type: "object", properties: { id: idSchema, question: stringSchema, annotationKeys: { type: "array", items: idSchema, minItems: 1, maxItems: PLAN_LIMITS.grillAnnotations }, options: { type: "array", items: grillDecisionOptionSchema, maxItems: PLAN_LIMITS.grillOptions } }, required: ["id", "question", "annotationKeys", "options"], additionalProperties: false } as const;
 const grillDecisionTreeSchema = { type: "object", properties: { rootNodeId: idSchema, nodes: { type: "array", items: grillDecisionNodeSchema, minItems: 0, maxItems: PLAN_LIMITS.grillNodes } }, required: ["nodes"], additionalProperties: false } as const;
 const grillAnnotationDraftSchema = { type: "object", properties: { target: grillTargetSchema, body: stringSchema }, required: ["target", "body"], additionalProperties: false } as const;
 export const GRILL_RESULT_SCHEMA = { type: "object", properties: { kind: { const: "grill" }, basedOnDocumentRevision: { type: "integer", minimum: 1 }, annotations: { type: "object", propertyNames: idSchema, additionalProperties: grillAnnotationDraftSchema, maxProperties: PLAN_LIMITS.grillAnnotations }, decisionTree: grillDecisionTreeSchema }, required: ["kind", "basedOnDocumentRevision", "annotations", "decisionTree"], additionalProperties: false } as const;
@@ -205,7 +205,7 @@ export function validateRevisionPlanResult(input: unknown): ValidationResult<Rev
 }
 export function validateGrillResult(input: unknown): ValidationResult<GrillResultDraft> {
   const sizeIssue = validateJsonSize(input); if (sizeIssue) return failure(sizeIssue);
-  if (utf8Bytes(JSON.stringify(input)) > PLAN_LIMITS.grillResultBytes) return failure(issue("$", "grill-too-large", "Grill result exceeds 256 KiB."));
+  if (utf8Bytes(JSON.stringify(input)) > PLAN_LIMITS.grillResultBytes) return failure(issue("$", "grill-too-large", "Adversarial Review result exceeds 256 KiB."));
   const structural = structuralCheck(GRILL_RESULT_SCHEMA, grillResultValidator, input); if (structural) return failure(structural);
   const value = normalizeGrillResult(input as GrillResultDraft); const issues: ValidationIssue[] = [];
   for (const [key, annotation] of Object.entries(value.annotations)) { validateId(key, `$.annotations.${key}`, issues); validateText(annotation.body, `$.annotations.${key}.body`, PLAN_LIMITS.annotationBodyCodePoints, true, issues); }
@@ -344,12 +344,12 @@ function validateSessionSemantics(session: PlanSession, issues: ValidationIssue[
     if (projection && !linkedProjection) issues.push(issue("$.committedMarkdown", "projection-markdown", "Markdown projection text must exactly match authoritative committed Markdown."));
     validateDocumentSemantics(session.document, "$.document", issues); validateAnnotations(session.annotations, session.document, session.documentRevision, issues);
     if (session.grill) {
-      if (session.grill.basedOnDocumentRevision !== session.documentRevision) issues.push(issue("$.grill.basedOnDocumentRevision", "grill-revision", "Grill artifact must match the current document revision."));
+      if (session.grill.basedOnDocumentRevision !== session.documentRevision) issues.push(issue("$.grill.basedOnDocumentRevision", "grill-revision", "Adversarial Review artifact must match the current document revision."));
       validateTimestamp(session.grill.generatedAt, "$.grill.generatedAt", issues);
       const generated = new Set(session.annotations.filter((annotation) => annotation.author === "grill").map((annotation) => annotation.id)); const mapped = Object.values(session.grill.annotationIds);
-      uniqueStrings(mapped, "$.grill.annotationIds", issues); if (mapped.length !== generated.size || mapped.some((id) => !generated.has(id))) issues.push(issue("$.grill.annotationIds", "grill-annotations", "Grill artifact must reference exactly the generated annotations."));
+      uniqueStrings(mapped, "$.grill.annotationIds", issues); if (mapped.length !== generated.size || mapped.some((id) => !generated.has(id))) issues.push(issue("$.grill.annotationIds", "grill-annotations", "Adversarial Review artifact must reference exactly the generated findings."));
       validateDecisionTree(session.grill.decisionTree, "$.grill.decisionTree", issues, new Set(Object.keys(session.grill.annotationIds)));
-    } else if (session.annotations.some((annotation) => annotation.author === "grill")) issues.push(issue("$.annotations", "missing-grill", "Generated annotations require a Grill artifact."));
+    } else if (session.annotations.some((annotation) => annotation.author === "grill")) issues.push(issue("$.annotations", "missing-grill", "Generated findings require an Adversarial Review artifact."));
     if (!projection && utf8Bytes(JSON.stringify(session.document)) > PLAN_LIMITS.planBytes) issues.push(issue("$.document", "plan-too-large", "Plan exceeds the UTF-8 byte limit."));
   }
   if (session.committedMarkdown !== undefined) {

@@ -39,6 +39,11 @@ export function createBrowserPlanReviewPort(options: BrowserReviewPortOptions): 
       controller: input.controller,
       activity: () => livePlanActivity(input.controller),
       ...(options.createSpecController ? { createSpecController: () => options.createSpecController!(input.controller, input.ctx) } : {}),
+      onTerminalClose: (terminalHost) => {
+        if (epoch !== ownedEpoch || active !== terminalHost || activeController !== input.controller || activeContext !== input.ctx) return;
+        active = null; activeController = null; activeContext = null;
+        clearPlanProgress(input.ctx);
+      },
       reopenInPi: async () => {
         if (epoch !== ownedEpoch) return;
         active = null; activeController = null;

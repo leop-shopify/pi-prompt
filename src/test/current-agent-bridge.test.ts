@@ -18,6 +18,7 @@ const sourceInfo = { path: "/packages/pi-extended-teams/extensions/index.ts", so
 const spawnTool = { name: "spawn_agent", description: "spawn", sourceInfo, parameters: { type: "object", required: ["prompt", "model_slot"], properties: {
   prompt: { type: "string" }, model_slot: { type: "string", enum: ["writing-basic", "writing-hard"] }, name: { type: "string" }, cwd: { type: "string" }, metadata: { type: "object" },
 } } } as ToolInfo;
+const malformedSpawnTool = { ...spawnTool, parameters: { type: "object", properties: { prompt: { type: "string" } } } } as ToolInfo;
 
 function initialSession(prompt = "Build it", id = "session", jobId = "job"): PlanSession {
   return { schemaVersion: 1, id, stateVersion: 2, documentRevision: 0, status: "generating", source: { prompt, cwd: "/repo", skills: [] }, execution: { kind: "normal" }, generation: { mode: "normal" }, document: null, annotations: [], generationJob: { jobId, operation: "initial", baseDocumentRevision: 0, selectedAnnotationIds: [], startedAt: "2026-07-11T00:00:00.000Z" } };
@@ -47,15 +48,20 @@ function initialSpecInput(signal = new AbortController().signal): SpecGeneratorI
   const session = { schemaVersion: 1 as const, planSessionId: "plan-session", stateVersion: 2, specRevision: 0, status: "generating" as const, source: source.reference, markdown: null, comments: [], generationJob: { jobId: "spec-job", operation: "initial" as const, baseSpecRevision: 0, selectedCommentIds: [], source: source.reference, startedAt: "2026-07-12T00:00:00.000Z" } };
   return { session, source, jobId: "spec-job", operation: "initial", selectedCommentIds: [], signal };
 }
-function specSubmission(body: Buffer): SpecWriterSubmission {
-  return { planSessionId: "plan-session", jobId: "spec-job", operation: "initial", baseSpecRevision: 0, attemptId: "attempt_identity_0001", kind: "spec", body };
+function revisionSpecInput(signal = new AbortController().signal): SpecGeneratorInput {
+  const source = capturedSpec();
+  const session = { schemaVersion: 1 as const, planSessionId: "plan-session", stateVersion: 4, specRevision: 1, status: "revising" as const, source: source.reference, markdown: "# Existing Spec\n", comments: [], generationJob: { jobId: "spec-revision-job", operation: "revision" as const, baseSpecRevision: 1, selectedCommentIds: [], source: source.reference, instruction: "Tighten the API section", startedAt: "2026-07-12T00:00:00.000Z" } };
+  return { session, source, jobId: "spec-revision-job", operation: "revision", selectedCommentIds: [], instruction: "Tighten the API section", signal };
 }
-function harness(options: { teams?: boolean; idle?: boolean; attemptFactory?: () => string } = {}) {
+function specSubmission(body: Buffer, overrides: Partial<SpecWriterSubmission> = {}): SpecWriterSubmission {
+  return { planSessionId: "plan-session", jobId: "spec-job", operation: "initial", baseSpecRevision: 0, attemptId: "attempt_identity_0001", kind: "spec", body, ...overrides };
+}
+function harness(options: { teams?: boolean; teamTools?: ToolInfo[]; idle?: boolean; attemptFactory?: () => string } = {}) {
   const handlers = new Map<string, Function>(); const reportHandlers = new Set<(payload: unknown) => void>();
   const activities: CurrentAgentActivityUpdate[] = []; let tool: any; let attempt = 0; let nonce = 0;
   const pi = {
     registerTool: vi.fn((value) => { tool = value; }), sendUserMessage: vi.fn(), sendMessage: vi.fn(), on: vi.fn((name, handler) => handlers.set(name, handler)),
-    getActiveTools: vi.fn(() => options.teams ? ["spawn_agent"] : ["read", "bash"]), getAllTools: vi.fn(() => options.teams ? [spawnTool] : []),
+    getActiveTools: vi.fn(() => options.teams ? ["spawn_agent"] : ["read", "bash"]), getAllTools: vi.fn(() => options.teams ? options.teamTools ?? [spawnTool] : []),
     events: { emit: vi.fn((channel: string, payload: unknown) => { if (channel === TEAMS_REPORT_CHANNEL) for (const handler of [...reportHandlers]) handler(payload); }), on: vi.fn((channel: string, handler: (payload: unknown) => void) => { if (channel === TEAMS_REPORT_CHANNEL) reportHandlers.add(handler); return () => reportHandlers.delete(handler); }) },
   } as unknown as ExtensionAPI;
   const bridge = new CurrentAgentPlanBridge(pi, {
@@ -86,14 +92,21 @@ async function dispatched(teams: boolean, prompt = "Build it") {
   }
   return { ...h, completion, marker, agentContext, mission, spawnInput };
 }
-async function dispatchedSpec() {
-  const h = harness(); const generator = h.bridge.createSpecGenerator(() => true);
+async function dispatchedSpec(
+  options: Parameters<typeof harness>[0] = {}, specInput: SpecGeneratorInput = initialSpecInput(),
+) {
+  const h = harness(options); const generator = h.bridge.createSpecGenerator(() => true);
   expect(generator.configureWriterEndpoint(endpoint)).toMatchObject({ ok: true });
-  const completion = generator.generate(initialSpecInput()); expect(generator.dispatch("spec-job")).toMatchObject({ ok: true });
+  const completion = generator.generate(specInput); expect(generator.dispatch(specInput.jobId)).toMatchObject({ ok: true });
   await vi.waitFor(() => expect(h.pi.sendUserMessage).toHaveBeenCalledOnce());
   const marker = vi.mocked(h.pi.sendUserMessage).mock.calls[0]![0] as string;
-  h.handlers.get("input")!(inputEvent(marker)); const mission = h.handlers.get("before_agent_start")!(before(marker)).message.content as string;
-  return { ...h, generator, completion, marker, mission };
+  h.handlers.get("input")!(inputEvent(marker)); const started = h.handlers.get("before_agent_start")!(before(marker));
+  const agentContext = started.message.content as string;
+  let mission = agentContext; let spawnInput: Record<string, unknown> | undefined;
+  if (options.teams && options.teamTools?.[0] !== malformedSpawnTool) {
+    const call = toolCall(); h.handlers.get("tool_call")!(call); h.handlers.get("tool_result")!(spawnResult()); spawnInput = call.input; mission = String(spawnInput.prompt);
+  }
+  return { ...h, generator, completion, marker, agentContext, mission, spawnInput };
 }
 function correctionMission(h: Awaited<ReturnType<typeof dispatched>>): string {
   const message = vi.mocked(h.pi.sendMessage).mock.calls[0]![0] as Record<string, unknown>;
@@ -108,7 +121,9 @@ describe("current-agent authenticated writer handoff", () => {
     const session = { schemaVersion: 1 as const, planSessionId: "plan-session", stateVersion: 2, specRevision: 0, status: "generating" as const, source: source.reference, markdown: null, comments: [], generationJob: { jobId: "spec-job", operation: "initial" as const, baseSpecRevision: 0, selectedCommentIds: [], source: source.reference, startedAt: "2026-07-12T00:00:00.000Z" } };
     const input: SpecGeneratorInput = { session, source, jobId: "spec-job", operation: "initial", selectedCommentIds: [], signal: new AbortController().signal }; const completion = generator.generate(input); expect(generator.dispatch("spec-job")).toMatchObject({ ok: true });
     await vi.waitFor(() => expect(h.pi.sendUserMessage).toHaveBeenCalledOnce()); const marker = vi.mocked(h.pi.sendUserMessage).mock.calls[0]![0] as string; expect(marker).toBe("pi-prompt Spec creation in progress"); h.handlers.get("input")!(inputEvent(marker)); const started = h.handlers.get("before_agent_start")!(before(marker)); const mission = started.message.content as string;
-    expect(mission).toContain("X-Pi-Prompt-Result: spec"); expect(mission).toContain("grill.json#/decisionTree"); expect(mission).toContain("Do not use the Plan storage schema"); expect(mission).toContain("do not create issue-tracker artifacts");
+    expect(mission).toContain("X-Pi-Prompt-Result: spec"); expect(mission).toContain("grill.json#/decisionTree"); expect(mission).toContain("Do not use the Plan storage schema"); expect(mission).toContain("create issue-tracker artifacts");
+    expect(mission).toContain("shortest unambiguous implementation Spec"); expect(mission).toContain("Do not restate the Plan"); expect(mission).toContain("Use exactly these H2 sections in order: Artifact References, Intended Outcome, Implementation Decisions, Testing Approach, Unresolved Decisions, Out of Scope, Acceptance Criteria");
+    expect(mission).toContain("Do not add User Stories or Further Notes"); expect(mission).toContain("Every Acceptance Criterion must be independently pass/fail, externally observable or contract-verifiable"); expect(mission).toContain("Reject vague criteria such as works correctly");
     expect(mission).toContain("transient writer draft /tmp/pi-prompt-plans/plan-session/spec/spec-result.md");
     expect(mission).toContain("never write the repository-owned canonical Spec /tmp/pi-prompt-plans/plan-session/spec/spec.md");
     expect(mission).toContain("--data-binary '@/tmp/pi-prompt-plans/plan-session/spec/spec-result.md'");
@@ -121,6 +136,81 @@ describe("current-agent authenticated writer handoff", () => {
     const persisted = await completion; expect(persisted).toMatchObject({ ok: true });
     if (persisted.ok) expect(Buffer.from(persisted.markdown, "utf8")).toEqual(body);
     expect(h.pi.sendUserMessage).toHaveBeenCalledOnce(); expect(h.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("delegates initial Spec writing to one canonical helper and keeps the parent waiting for authenticated bytes", async () => {
+    const h = await dispatchedSpec({ teams: true });
+    expect(h.agentContext).toContain("You are orchestration-only");
+    expect(h.agentContext).toContain("Call spawn_agent exactly once now");
+    expect(h.agentContext).toContain("Do not inspect or write the Spec");
+    expect(h.agentContext).not.toContain(endpoint); expect(h.agentContext).not.toContain("attempt_identity");
+    expect(h.spawnInput).toMatchObject({
+      model_slot: "writing-hard", name: "planner-private123", cwd: "/tmp/pi-prompt-plans/plan-session",
+      metadata: { piPromptPlanning: { version: 1, correlation: "correlation-private123" } },
+    });
+    expect(h.mission).toContain("one dedicated Spec writer");
+    expect(h.mission).toContain("Do not call spawn_agent or spawn_swarm_agents");
+    expect(h.mission).toContain("Operation: initial"); expect(h.mission).toContain("X-Pi-Prompt-Result: spec");
+    expect(h.mission).toContain("Authorization: Bearer attempt_identity_0001");
+    expect(h.mission).toContain("report_and_exit with `spec uploaded`");
+
+    const extra = { ...toolCall(), toolCallId: "extra-spawn", input: { prompt: "second" } } as ToolCallEvent;
+    expect(h.handlers.get("tool_call")!(extra)).toMatchObject({ block: true });
+    expect(extra.input).toEqual({ prompt: "second" });
+    const swarm = { type: "tool_call", toolCallId: "swarm", toolName: "spawn_swarm_agents", input: { prompts: ["second"] } } as ToolCallEvent;
+    expect(h.handlers.get("tool_call")!(swarm)).toMatchObject({ block: true });
+
+    let settled = false; void h.completion.then(() => { settled = true; });
+    h.handlers.get("agent_end")!(endEvent); await Promise.resolve(); expect(settled).toBe(false);
+    const body = Buffer.from("# Delegated Spec\r\n\r\n## API\r\nShip exact bytes.\r\n", "utf8");
+    await expect(h.generator.submitWriterResult(specSubmission(body))).resolves.toMatchObject({ ok: true });
+    const result = await h.completion; expect(result).toMatchObject({ ok: true });
+    if (result.ok) expect(Buffer.from(result.markdown, "utf8")).toEqual(body);
+    expect(h.reportHandlers.size).toBe(0);
+    await expect(h.generator.submitWriterResult(specSubmission(body))).resolves.toMatchObject({ ok: false, error: { code: "writer-attempt-rejected" } });
+  });
+
+  it("delegates Spec revision to the same isolated helper contract", async () => {
+    const specInput = revisionSpecInput(); const h = await dispatchedSpec({ teams: true }, specInput);
+    expect(h.marker).toBe("pi-prompt Spec revision in progress");
+    expect(h.agentContext).toContain("You are orchestration-only");
+    expect(h.mission).toContain("Operation: revision");
+    expect(h.mission).toContain("Existing Spec input: /tmp/pi-prompt-plans/plan-session/spec/spec.md");
+    expect(h.mission).toContain("Revision instruction: Tighten the API section");
+    expect(h.mission).toContain("transient writer draft /tmp/pi-prompt-plans/plan-session/spec/spec-result.md");
+    expect(h.spawnInput).toMatchObject({ model_slot: "writing-hard", name: "planner-private123" });
+    h.handlers.get("agent_end")!(endEvent);
+    const body = Buffer.from("# Revised Delegated Spec\n\n## API\nTightened.\n");
+    await expect(h.generator.submitWriterResult(specSubmission(body, { jobId: "spec-revision-job", operation: "revision", baseSpecRevision: 1 }))).resolves.toMatchObject({ ok: true });
+    await expect(h.completion).resolves.toMatchObject({ ok: true, markdown: body.toString("utf8") });
+    expect(h.reportHandlers.size).toBe(0);
+  });
+
+  it("falls back to direct Spec writing when teams capability is absent or malformed", async () => {
+    for (const options of [{}, { teams: true, teamTools: [malformedSpawnTool] }]) {
+      const h = await dispatchedSpec(options);
+      expect(h.agentContext).toContain("Controller-owned Spec writer mission");
+      expect(h.agentContext).toContain("Authorization: Bearer attempt_identity_0001");
+      expect(h.agentContext).not.toContain("You are orchestration-only");
+      expect(h.spawnInput).toBeUndefined(); expect(h.reportHandlers.size).toBe(0);
+      await h.generator.close(); await expect(h.completion).resolves.toMatchObject({ ok: false, error: { code: "generation-cancelled" } });
+    }
+  });
+
+  it("settles a delegated helper report without an accepted upload and closes report observation", async () => {
+    const h = await dispatchedSpec({ teams: true }); let settled = false; void h.completion.then(() => { settled = true; });
+    h.handlers.get("agent_end")!(endEvent); await Promise.resolve(); expect(settled).toBe(false); expect(h.reportHandlers.size).toBe(1);
+    h.pi.events.emit(TEAMS_REPORT_CHANNEL, {
+      teamName: "private", name: "planner-private123", ok: true, report: "spec uploaded",
+      metadata: { piPromptPlanning: { version: 1, correlation: "correlation-private123" } },
+    });
+    await expect(h.completion).resolves.toMatchObject({ ok: false, error: { code: "missing-spec-submission" } });
+    expect(h.reportHandlers.size).toBe(0); expect(h.pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    const followUp = vi.mocked(h.pi.sendUserMessage).mock.calls[1]![0] as string;
+    expect(followUp).toContain("Error code: missing-spec-submission");
+    await expect(h.generator.submitWriterResult(specSubmission(Buffer.from("# Late Spec\n")))).resolves.toMatchObject({ ok: false, error: { code: "writer-attempt-rejected" } });
+    h.pi.events.emit(TEAMS_REPORT_CHANNEL, { teamName: "private", name: "planner-private123", ok: true, report: "late" });
+    expect(h.pi.sendUserMessage).toHaveBeenCalledTimes(2);
   });
 
   it("keeps an invalid Spec upload pending and accepts corrected bytes from the same attempt", async () => {
@@ -170,10 +260,10 @@ describe("current-agent authenticated writer handoff", () => {
     await expect(generator.submitWriterResult({ planSessionId: "plan-session", jobId: "spec-revision-job", operation: "revision", baseSpecRevision: 1, attemptId: "attempt_identity_0001", kind: "spec", body: Buffer.from("# Late Spec\n") })).resolves.toMatchObject({ ok: false, error: { code: "writer-attempt-rejected" } });
   });
 
-  it("does not emit a failure follow-up when an active Spec gate is shut down", async () => {
-    const h = await dispatchedSpec(); await h.generator.close(); h.handlers.get("agent_end")!(endEvent);
+  it.each([false, true])("does not emit a failure follow-up when an active delegated=%s Spec gate is shut down", async (teams) => {
+    const h = await dispatchedSpec(teams ? { teams: true } : {}); await h.generator.close(); h.handlers.get("agent_end")!(endEvent);
     await expect(h.completion).resolves.toMatchObject({ ok: false, error: { code: "generation-cancelled" } });
-    expect(h.pi.sendUserMessage).toHaveBeenCalledOnce(); expect(h.pi.sendMessage).not.toHaveBeenCalled();
+    expect(h.reportHandlers.size).toBe(0); expect(h.pi.sendUserMessage).toHaveBeenCalledOnce(); expect(h.pi.sendMessage).not.toHaveBeenCalled();
   });
 
   it("makes a safe pre-agent Spec terminal failure visible as an extension follow-up", async () => {
@@ -186,19 +276,25 @@ describe("current-agent authenticated writer handoff", () => {
     expect(message).toContain("Error code: attempt-identity-unavailable"); expect(message).toContain("Plan session ID: plan-session");
   });
 
-  it("does not recursively hand off when sending the Spec dispatch message fails", async () => {
-    const h = harness(); const generator = h.bridge.createSpecGenerator(() => true); generator.configureWriterEndpoint(endpoint);
+  it("does not recursively hand off and closes delegation when sending the Spec dispatch message fails", async () => {
+    const h = harness({ teams: true }); const generator = h.bridge.createSpecGenerator(() => true); generator.configureWriterEndpoint(endpoint);
     vi.mocked(h.pi.sendUserMessage).mockImplementation(() => { throw new Error("send failed"); });
     const completion = generator.generate(initialSpecInput()); expect(generator.dispatch("spec-job")).toMatchObject({ ok: true });
     await expect(completion).resolves.toMatchObject({ ok: false, error: { code: "dispatch-failed" } });
-    expect(h.pi.sendUserMessage).toHaveBeenCalledOnce(); expect(h.pi.sendMessage).not.toHaveBeenCalled();
+    expect(h.reportHandlers.size).toBe(0); expect(h.pi.sendUserMessage).toHaveBeenCalledOnce(); expect(h.pi.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("gives Grill writers a public anchor map and accepts a mission-derived target", async () => {
+  it("gives Adversarial Review writers bounded goal-backward gates and a public anchor map", async () => {
     const h = harness(); h.generator.configureWriterEndpoint(endpoint); const completion = h.generator.generate(grillInput()); h.generator.dispatch("job");
     await vi.waitFor(() => expect(h.pi.sendUserMessage).toHaveBeenCalledTimes(1)); const marker = vi.mocked(h.pi.sendUserMessage).mock.calls[0]![0] as string;
-    expect(marker).toBe("pi-prompt plan Grill critique in progress"); h.handlers.get("input")!(inputEvent(marker)); const started = h.handlers.get("before_agent_start")!(before(marker)); const mission = started.message.content as string;
-    expect(mission).toContain("grill-result.json"); expect(mission).toContain("X-Pi-Prompt-Result: grill"); expect(mission).toContain("Unicode code points"); expect(mission).toContain('{"kind":"range","elementId":"anchor-id","field":"body","start":0,"end":4}'); expect(mission).toContain("Do not copy quoted exact/prefix/suffix"); expect(mission).not.toContain("PRIVATE SOURCE PROMPT"); expect(mission).not.toContain("PRIVATE SKILL BODY");
+    expect(marker).toBe("pi-prompt plan Adversarial Review in progress"); h.handlers.get("input")!(inputEvent(marker)); const started = h.handlers.get("before_agent_start")!(before(marker)); const mission = started.message.content as string;
+    expect(mission).toContain("Controller-owned Adversarial Review mission"); expect(mission).toContain("at most eight material, evidence-backed findings");
+    expect(mission).toContain("observable truths"); expect(mission).toContain("substantive planned artifacts or actions"); expect(mission).toContain("critical wiring"); expect(mission).toContain("tasks are atomic, complete");
+    expect(mission).toContain("silent scope reduction or expansion"); expect(mission).toContain("failure, rollback, operability, or test coverage"); expect(mission).toContain("conflicts with decisions or context");
+    expect(mission).toContain("risk-, ambiguity-, missing-decision-, contradiction-, test-gap-, adr-candidate-, or glossary-"); expect(mission).toContain("Do not add a classification field or any other result field");
+    expect(mission).toContain("options array may be empty or contain a single option"); expect(mission).toContain("never fabricate alternatives to satisfy a cardinality"); expect(mission).toContain('"options":[]');
+    expect(mission).toContain("not adoption of Open GSD's planning system"); expect(mission).toContain("Do not create or require .planning directories"); expect(mission).toContain("must_haves"); expect(mission).toContain("GSD report format"); expect(mission).toContain("Do not reveal chain-of-thought");
+    expect(mission).toContain("grill-result.json"); expect(mission).toContain("X-Pi-Prompt-Result: grill"); expect(mission).toContain('"kind":"grill"'); expect(mission).toContain("adding no fields"); expect(mission).toContain("Unicode code points"); expect(mission).toContain('{"kind":"range","elementId":"anchor-id","field":"body","start":0,"end":4}'); expect(mission).toContain("Do not copy quoted exact/prefix/suffix"); expect(mission).not.toContain("PRIVATE SOURCE PROMPT"); expect(mission).not.toContain("PRIVATE SKILL BODY");
     const anchorJson = mission.match(/Canonical public anchor map \(the complete current document projection, including revision chunks\):\n([^\n]+)/)?.[1];
     expect(anchorJson).toBeDefined(); const anchorMap = JSON.parse(anchorJson!) as {
       documentRevision: number;
@@ -217,7 +313,7 @@ describe("current-agent authenticated writer handoff", () => {
     expect(h.pi.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("settles exhausted invalid Grill submissions with their specific validation error", async () => {
+  it("settles exhausted invalid Adversarial Review submissions with their specific validation error", async () => {
     const h = harness(); h.generator.configureWriterEndpoint(endpoint); const completion = h.generator.generate(grillInput()); h.generator.dispatch("job");
     await vi.waitFor(() => expect(h.pi.sendUserMessage).toHaveBeenCalledOnce()); const marker = vi.mocked(h.pi.sendUserMessage).mock.calls[0]![0] as string;
     h.handlers.get("input")!(inputEvent(marker)); h.handlers.get("before_agent_start")!(before(marker));

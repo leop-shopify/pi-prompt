@@ -1,5 +1,5 @@
 import type {
-  ExtensionAPI, ToolCallEvent, ToolInfo, ToolResultEvent,
+  ExtensionAPI, ToolCallEvent, ToolCallEventResult, ToolInfo, ToolResultEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { PlanningModelSlot } from "../plan/modes.js";
 
@@ -34,6 +34,7 @@ export interface TeamsPlanningAdapterOptions {
   readonly onProgress: (status: string, updatedAt: number) => void;
   readonly onModel?: (model: PlanningModelInfo) => void;
   readonly now?: () => number;
+  readonly strictSingleSpawn?: boolean;
 }
 
 /** Detects the supported teams tool by active state, schema, and Pi-owned provenance metadata. */
@@ -85,8 +86,16 @@ export class TeamsPlanningAdapter {
   }
   get primaryStatus(): DelegatedPrimaryStatus { return this.#primaryStatus; }
 
-  handleToolCall(event: ToolCallEvent): void {
-    if (this.#closed || event.toolName !== TEAMS_SPAWN_TOOL || this.#primaryStatus !== "not-started") return;
+  handleToolCall(event: ToolCallEvent): ToolCallEventResult | void {
+    if (this.#closed) return;
+    if (this.#options.strictSingleSpawn && event.toolName === TEAMS_SWARM_TOOL) {
+      return { block: true, reason: "Delegated writing permits exactly one parent spawn_agent call and no swarm." };
+    }
+    if (event.toolName !== TEAMS_SPAWN_TOOL) return;
+    if (this.#options.strictSingleSpawn && (this.#spawnAttempts !== 0 || this.#primaryStatus !== "not-started")) {
+      return { block: true, reason: "The delegated writer was already spawned; additional parent spawns are blocked." };
+    }
+    if (this.#primaryStatus !== "not-started") return;
 
     this.#spawnAttempts += 1;
     this.#primaryStatus = "starting";

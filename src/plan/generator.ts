@@ -56,7 +56,7 @@ export function validateGeneratorInput(input: PlanGeneratorInput): ValidationRes
     || job.baseDocumentRevision !== session.value.documentRevision
     || !sameStrings(job.selectedAnnotationIds, input.selectedAnnotationIds)
     || job.instruction !== input.instruction) return invalid("invalid-generator-input", "The plan generation correlation is invalid.");
-  if ((input.operation === "revision" || input.operation === "grill") && !session.value.document) return invalid("invalid-generator-input", "Revision and Grill generation require a current plan.");
+  if ((input.operation === "revision" || input.operation === "grill") && !session.value.document) return invalid("invalid-generator-input", "Revision and Adversarial Review generation require a current plan.");
   return session;
 }
 
@@ -77,7 +77,7 @@ export function validateGeneratorSubmission(
     if (!isRevisionMarkdownResult(input)) return failed("invalid-generation-result", "A revision submission must contain exactly kind revision-markdown and the exact Markdown bytes decoded as text.");
     return validateRevisionMarkdownPrivacy(input.markdown, session, skills);
   }
-  if (operation === "grill") return failed("invalid-generation-result", "Grill submissions require the Grill result validator.");
+  if (operation === "grill") return failed("invalid-generation-result", "Adversarial Review submissions require the internal review-result validator.");
   const parsed = validateInitialPlanResult(input);
   if (!parsed.ok) return failed("invalid-generation-result", `The submitted plan is invalid: ${formatIssues(parsed.issues)}`);
   if (!hasImplementationTasks(parsed.value.document)) return failed("missing-implementation-tasks", "The submitted plan omitted valid Implementation Tasks.");
@@ -96,9 +96,9 @@ export function validateGrillSubmission(
   input: unknown, session: PlanSession, skills: readonly PrivateSkillContent[],
 ): PlanGeneratorResult {
   const parsed = validateGrillResult(input);
-  if (!parsed.ok) return failed("invalid-grill", `The Grill submission is invalid: ${formatIssues(parsed.issues)}`);
-  if (!session.document || parsed.value.basedOnDocumentRevision !== session.documentRevision) return failed("stale-grill", "The Grill submission does not match the current plan revision.");
-  if (containsPrivateValue(parsed.value, privateValues(session, skills))) return failed("private-output-exposure", "The Grill submission contained private skill data and was rejected.");
+  if (!parsed.ok) return failed("invalid-grill", `The Adversarial Review submission is invalid: ${formatIssues(parsed.issues)}`);
+  if (!session.document || parsed.value.basedOnDocumentRevision !== session.documentRevision) return failed("stale-grill", "The Adversarial Review submission does not match the current plan revision.");
+  if (containsPrivateValue(parsed.value, privateValues(session, skills))) return failed("private-output-exposure", "The Adversarial Review submission contained private skill data and was rejected.");
   return { ok: true, outcome: parsed.value };
 }
 

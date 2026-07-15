@@ -98,29 +98,86 @@ describe("shared hardened Spec HTTP surface", () => {
       expect(spec.raw.generateFresh).toHaveBeenCalledOnce(); expect(spec.raw.generateFresh).toHaveBeenCalledWith({ expectedStateVersion: 3 }); expect(spec.raw.dispatchGeneration).toHaveBeenCalledOnce();
     } finally { await host.close(); }
   });
-  it("rejects an accept body version that differs from If-Match before replay or controller dispatch", async () => {
+  it("returns the accepted Spec snapshot before terminal close and notifies exactly once after owned resources close", async () => {
     const spec = specController(); spec.set(session({ stateVersion: 3, status: "ready" }));
     spec.raw.accept.mockImplementation(async () => { spec.set(session({ stateVersion: 4, status: "accepted" })); return { ok: true as const, value: undefined }; });
-    const host = await startPlanHttpHost({ controller: planController(), specController: spec.controller, reopenInPi: vi.fn() });
+    const onTerminalClose = vi.fn();
+    const host = await startPlanHttpHost({ controller: planController(), createSpecController: vi.fn(async () => spec.controller), reopenInPi: vi.fn(), onTerminalClose });
+    const headers = { ...browserHeaders(host), Origin: host.origin, "Content-Type": "application/json", "If-Match": '"pi-spec-state-3"' };
+    const response = await fetch(`${host.origin}/api/v1/spec/accept`, { method: "POST", headers, body: JSON.stringify({ requestId: "request-id-spec-terminal", stateVersion: 3, specRevision: 1, confirmed: true }) });
+    expect(response.status).toBe(200); expect(response.headers.get("etag")).toBe('"pi-spec-state-4"');
+    expect(await response.json()).toMatchObject({ ok: true, snapshot: { stateVersion: 4, specRevision: 1, status: "accepted" } });
+    await vi.waitFor(() => expect(host.closed).toBe(true));
+    expect(spec.raw.close).toHaveBeenCalledOnce(); expect(onTerminalClose).toHaveBeenCalledOnce(); expect(onTerminalClose).toHaveBeenCalledWith(host);
+    await host.close(); expect(onTerminalClose).toHaveBeenCalledOnce();
+  });
+  it("keeps validation and version conflicts recoverable until a valid Spec accept succeeds", async () => {
+    const spec = specController(); spec.set(session({ stateVersion: 3, status: "ready" }));
+    spec.raw.accept.mockImplementation(async () => { spec.set(session({ stateVersion: 4, status: "accepted" })); return { ok: true as const, value: undefined }; });
+    const onTerminalClose = vi.fn(); const host = await startPlanHttpHost({ controller: planController(), specController: spec.controller, reopenInPi: vi.fn(), onTerminalClose });
     try {
       const headers = { ...browserHeaders(host), Origin: host.origin, "Content-Type": "application/json", "If-Match": '"pi-spec-state-3"' }; const requestId = "request-id-spec-version-fence";
+      const invalid = await fetch(`${host.origin}/api/v1/spec/accept`, { method: "POST", headers, body: JSON.stringify({ requestId: "request-id-spec-invalid", stateVersion: 3, specRevision: 1, confirmed: false }) });
+      expect(invalid.status).toBe(422); expect(spec.raw.accept).not.toHaveBeenCalled(); expect(host.closed).toBe(false); expect(onTerminalClose).not.toHaveBeenCalled();
       const stale = await fetch(`${host.origin}/api/v1/spec/accept`, { method: "POST", headers, body: JSON.stringify({ requestId, stateVersion: 2, specRevision: 1, confirmed: true }) });
       expect(stale.status).toBe(409); expect(stale.headers.get("etag")).toBe('"pi-spec-state-3"'); expect(await stale.json()).toMatchObject({ error: { code: "state-conflict" }, current: { stateVersion: 3, specRevision: 1 }, snapshot: { status: "ready" } });
-      expect(spec.raw.accept).not.toHaveBeenCalled(); expect(spec.raw.snapshot()).toMatchObject({ stateVersion: 3, status: "ready" });
+      expect(spec.raw.accept).not.toHaveBeenCalled(); expect(spec.raw.snapshot()).toMatchObject({ stateVersion: 3, status: "ready" }); expect(host.closed).toBe(false); expect(onTerminalClose).not.toHaveBeenCalled();
+      expect((await fetch(`${host.origin}/api/v1/spec/snapshot`, { headers: browserHeaders(host) })).status).toBe(200);
       const matching = await fetch(`${host.origin}/api/v1/spec/accept`, { method: "POST", headers, body: JSON.stringify({ requestId, stateVersion: 3, specRevision: 1, confirmed: true }) });
       expect(matching.status).toBe(200); expect(spec.raw.accept).toHaveBeenCalledOnce(); expect(spec.raw.accept).toHaveBeenCalledWith({ expectedStateVersion: 3, specRevision: 1, confirmed: true });
+      await vi.waitFor(() => expect(onTerminalClose).toHaveBeenCalledOnce());
     } finally { await host.close(); }
   });
-  it("fences concurrent multi-tab HTTP acceptance with the committed Spec version", async () => {
-    const spec = specController(); const ready = session({ stateVersion: 3, status: "ready" }); spec.set(ready); let entered!: () => void; let release!: () => void;
+  it("keeps staging and controller failures open with a reachable retry surface", async () => {
+    const spec = specController(); spec.set(session({ stateVersion: 3, status: "ready" })); let stagingPending = false;
+    spec.raw.acceptedStagingPending.mockImplementation(() => stagingPending);
+    spec.raw.accept.mockImplementationOnce(async () => { stagingPending = true; spec.set(session({ stateVersion: 4, status: "accepted" })); return { ok: false as const, error: { code: "stage-failed", message: "The accepted Spec could not be sent." } }; })
+      .mockImplementationOnce(async () => { stagingPending = false; return { ok: true as const, value: undefined }; });
+    const onTerminalClose = vi.fn(); const host = await startPlanHttpHost({ controller: planController(), specController: spec.controller, reopenInPi: vi.fn(), onTerminalClose });
+    try {
+      const firstHeaders = { ...browserHeaders(host), Origin: host.origin, "Content-Type": "application/json", "If-Match": '"pi-spec-state-3"' };
+      const failed = await fetch(`${host.origin}/api/v1/spec/accept`, { method: "POST", headers: firstHeaders, body: JSON.stringify({ requestId: "request-id-spec-stage-fail", stateVersion: 3, specRevision: 1, confirmed: true }) });
+      expect(failed.status).toBe(422); expect(await failed.json()).toMatchObject({ error: { code: "stage-failed" } }); expect(host.closed).toBe(false); expect(onTerminalClose).not.toHaveBeenCalled();
+      const retrySnapshot = await fetch(`${host.origin}/api/v1/spec/snapshot`, { headers: browserHeaders(host) });
+      expect(retrySnapshot.status).toBe(200); expect(await retrySnapshot.json()).toMatchObject({ snapshot: { stateVersion: 4, status: "accepted", actions: { canRetryStaging: true } } });
+      const retryHeaders = { ...browserHeaders(host), Origin: host.origin, "Content-Type": "application/json", "If-Match": '"pi-spec-state-4"' };
+      const retried = await fetch(`${host.origin}/api/v1/spec/accept`, { method: "POST", headers: retryHeaders, body: JSON.stringify({ requestId: "request-id-spec-stage-retry", stateVersion: 4, specRevision: 1, confirmed: true }) });
+      expect(retried.status).toBe(200); await vi.waitFor(() => expect(onTerminalClose).toHaveBeenCalledOnce());
+    } finally { await host.close(); }
+
+    for (const code of ["persistence-failed", "controller-closed"] as const) {
+      const failedSpec = specController(); failedSpec.set(session({ stateVersion: 3, status: "ready" })); failedSpec.raw.accept.mockResolvedValue({ ok: false as const, error: { code, message: "Retry safely." } });
+      const callback = vi.fn(); const failedHost = await startPlanHttpHost({ controller: planController(), specController: failedSpec.controller, reopenInPi: vi.fn(), onTerminalClose: callback });
+      try {
+        const headers = { ...browserHeaders(failedHost), Origin: failedHost.origin, "Content-Type": "application/json", "If-Match": '"pi-spec-state-3"' };
+        const requestId = `request-id-spec-${code}`;
+        const response = await fetch(`${failedHost.origin}/api/v1/spec/accept`, { method: "POST", headers, body: JSON.stringify({ requestId, stateVersion: 3, specRevision: 1, confirmed: true }) });
+        expect(response.status).toBe(503); expect(failedHost.closed).toBe(false); expect(callback).not.toHaveBeenCalled();
+        const replayConflict = await fetch(`${failedHost.origin}/api/v1/spec/accept`, { method: "POST", headers, body: JSON.stringify({ requestId, stateVersion: 3, specRevision: 2, confirmed: true }) });
+        expect(replayConflict.status).toBe(409); expect(await replayConflict.json()).toMatchObject({ error: { code: "request-id-conflict" } }); expect(failedSpec.raw.accept).toHaveBeenCalledOnce();
+        expect(failedHost.closed).toBe(false); expect(callback).not.toHaveBeenCalled(); expect((await fetch(`${failedHost.origin}/api/v1/spec/snapshot`, { headers: browserHeaders(failedHost) })).status).toBe(200);
+      } finally { await failedHost.close(); }
+    }
+  });
+  it("shares successful accept replays and drains queued acceptance before one terminal close", async () => {
+    const spec = specController(); spec.set(session({ stateVersion: 3, status: "ready" })); let entered!: () => void; let release!: () => void;
     const started = new Promise<void>((resolve) => { entered = resolve; }); const blocked = new Promise<void>((resolve) => { release = resolve; });
     spec.raw.accept.mockImplementation(async () => { entered(); await blocked; spec.set(session({ stateVersion: 4, status: "accepted" })); return { ok: true as const, value: undefined }; });
-    const host = await startPlanHttpHost({ controller: planController(), specController: spec.controller, reopenInPi: vi.fn() });
+    const onTerminalClose = vi.fn(); const host = await startPlanHttpHost({ controller: planController(), specController: spec.controller, reopenInPi: vi.fn(), onTerminalClose });
     try {
-      const headers = { ...browserHeaders(host), Origin: host.origin, "Content-Type": "application/json", "If-Match": '"pi-spec-state-3"' };
-      const request = (requestId: string) => fetch(`${host.origin}/api/v1/spec/accept`, { method: "POST", headers, body: JSON.stringify({ requestId, stateVersion: 3, specRevision: 1, confirmed: true }) });
-      const firstPending = request("request-id-spec-accept-01"); await started; const secondPending = request("request-id-spec-accept-02"); release(); const [first, second] = await Promise.all([firstPending, secondPending]);
-      expect(first.status).toBe(200); expect(await first.json()).toMatchObject({ snapshot: { stateVersion: 4, status: "accepted" } }); expect(second.status).toBe(409); expect(await second.json()).toMatchObject({ error: { code: "state-conflict" }, current: { stateVersion: 4, specRevision: 1 } }); expect(spec.raw.accept).toHaveBeenCalledOnce();
+      const token = new URL(host.launchUrl).hash.slice("#capability=".length);
+      const request = (requestId: string, connection: "keep-alive" | "close") => {
+        const body = JSON.stringify({ requestId, stateVersion: 3, specRevision: 1, confirmed: true });
+        return ["POST /api/v1/spec/accept HTTP/1.1", `Host: 127.0.0.1:${host.port}`, `Authorization: Bearer ${token}`, `X-Pi-Prompt-Origin: ${host.origin}`, `Origin: ${host.origin}`, "Content-Type: application/json", 'If-Match: "pi-spec-state-3"', `Content-Length: ${Buffer.byteLength(body)}`, `Connection: ${connection}`, "", body].join("\r\n");
+      };
+      const responses = new Promise<string>((resolve, reject) => {
+        const socket = connect(host.port, "127.0.0.1"); let raw = ""; socket.setEncoding("utf8"); socket.once("error", reject); socket.on("data", (chunk) => { raw += chunk; }); socket.once("close", () => resolve(raw));
+        socket.once("connect", () => socket.write(request("request-id-spec-accept-01", "keep-alive") + request("request-id-spec-accept-01", "keep-alive") + request("request-id-spec-accept-02", "close")));
+      });
+      await started; await new Promise<void>((resolve) => setImmediate(resolve)); release(); const raw = await responses;
+      expect(raw.match(/HTTP\/1\.1 200 OK/gu)).toHaveLength(2); expect(raw.match(/"ok":true/gu)).toHaveLength(2);
+      expect(raw).toContain("HTTP/1.1 503 Service Unavailable"); expect(raw).toContain('"code":"closing"'); expect(spec.raw.accept).toHaveBeenCalledOnce();
+      await vi.waitFor(() => expect(host.closed).toBe(true)); expect(onTerminalClose).toHaveBeenCalledOnce();
     } finally { await host.close(); }
   });
   it("rejects plan ETags on Spec mutations and rejects spec results when no active Spec job exists", async () => {

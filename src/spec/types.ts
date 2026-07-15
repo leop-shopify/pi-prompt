@@ -4,7 +4,7 @@ export type SpecStatus = "paused" | "generating" | "ready" | "revising" | "accep
 export type SpecOperation = "initial" | "revision";
 export type SpecCommentStatus = "open" | "addressed" | "dismissed" | "orphaned";
 
-/** Immutable reference to the exact durable Plan and Grill projections used by Spec. */
+/** Immutable reference to the exact durable Plan and Adversarial Review projections used by Spec. */
 export interface SpecSourceReference {
   readonly planSessionId: string;
   readonly planArtifactPath: string;

@@ -5,7 +5,7 @@ import type { PlanDocument, PlanElement } from "./types.js";
  * Builds a deliberately non-authoritative compatibility document for consumers that
  * still require the legacy PlanDocument shape. The committed Markdown remains the
  * sole content authority; this total projection only chunks exact code points so
- * browser selections and Grill annotations can refer back to the displayed bytes.
+ * browser selections and Adversarial Review findings can refer back to the displayed bytes.
  */
 export function projectMarkdownPlan(markdown: string, revision: number): PlanDocument {
   const chunks = chunkCodePoints(markdown, PLAN_LIMITS.bodyCodePoints);

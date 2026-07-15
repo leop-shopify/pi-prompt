@@ -226,6 +226,12 @@ describe("Grill result schema", () => {
     expect(result.ok).toBe(true); if (result.ok) expect(result.value.annotations.risk?.target).toMatchObject({ selector: { exact } });
   });
 
+  it("accepts non-branching findings without artificial option cardinality", () => {
+    const node = grill.decisionTree.nodes[0]!;
+    expect(validateGrillResult({ ...grill, decisionTree: { nodes: [{ ...node, options: [] }] } }).ok).toBe(true);
+    expect(validateGrillResult({ ...grill, decisionTree: { nodes: [{ ...node, options: [{ id: "only", label: "Proceed", decision: "Proceed with the recorded finding." }] }] } }).ok).toBe(true);
+  });
+
   it("accepts a true no-findings result only with an empty decision tree", () => {
     expect(validateGrillResult({ kind: "grill", basedOnDocumentRevision: 1, annotations: {}, decisionTree: { nodes: [] } }).ok).toBe(true);
     expect(validateGrillResult({ kind: "grill", basedOnDocumentRevision: 1, annotations: {}, decisionTree: { rootNodeId: "root", nodes: [] } }).ok).toBe(false);

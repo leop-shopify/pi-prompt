@@ -47,8 +47,10 @@ export interface PlanHttpHostOptions {
   readonly planRoot?: string;
   /** Optional independent sidecar. No Spec result is ever routed through the Plan controller. */
   readonly specController?: SpecController;
-  /** Lazily creates the sidecar after the current Plan has a Grill artifact. */
+  /** Lazily creates the sidecar after the current Plan has an Adversarial Review artifact. */
   readonly createSpecController?: () => Promise<SpecController | null>;
+  /** Runs exactly once after a scheduled terminal close completes. Manual, idle, and reopen closes do not notify. */
+  readonly onTerminalClose?: (host: PlanHttpHost) => void | Promise<void>;
 }
 export interface PlanHttpHost {
   readonly port: number; readonly origin: string; readonly launchUrl: string;
@@ -102,6 +104,7 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
   let ownsSpecController = false;
   let specCreation: Promise<SpecController | null> | null = null;
   let unsubscribeSpec: () => void = () => undefined;
+  let hostHandle!: PlanHttpHost;
 
   const subscribeSpec = (controller: SpecController): void => {
     unsubscribeSpec();
@@ -166,8 +169,8 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
     const queued = mutationTail;
     void queued.then(() => new Promise<void>((resolve) => setImmediate(resolve))).then(async () => {
       if (disposition === "reopen") await close().then(options.reopenInPi, () => undefined);
-      else await close();
-    });
+      else { await close(); await options.onTerminalClose?.(hostHandle); }
+    }).catch(() => undefined);
   };
 
   const server = createServer(async (request, response) => {
@@ -279,7 +282,7 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
       if (!state) { send(response, { status: 404, body: errorBody("plan-unavailable", "The plan file is not available yet.") }); return; }
       if (!state.document) { send(response, { status: 404, body: errorBody("plan-unavailable", "No committed plan is available yet.") }); return; }
       const markdown = state.committedMarkdown ?? renderPlanMarkdown(state.document);
-      send(response, { status: 200, body: markdown, headers: { "Content-Type": "text/markdown; charset=utf-8" } });
+      send(response, { status: 200, body: markdown, headers: { "Content-Type": "text/markdown; charset=utf-8", ETag: stateEtag(state.stateVersion) } });
       return;
     }
     if (pathname === "/api/v1/snapshot") {
@@ -339,7 +342,7 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
     if (closing) { send(response, closingRecord()); return; }
     const controller = await ensureSpecController();
     if (closing) { send(response, closingRecord()); return; }
-    if (!controller) { send(response, { status: 404, body: errorBody("spec-unavailable", "The Spec sidecar is unavailable until the current Plan has completed Grill.") }); return; }
+    if (!controller) { send(response, { status: 404, body: errorBody("spec-unavailable", "The Spec sidecar is unavailable until the current Plan has completed Adversarial Review.") }); return; }
     const method = request.method ?? "";
     if (pathname === "/api/v1/spec/snapshot") {
       if (method !== "GET") { methodNotAllowed(response, ["GET"]); return; }
@@ -377,8 +380,12 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
     if (definition.kind === "accept" && "stateVersion" in parsed.value && parsed.value.stateVersion !== expected) { send(response, specConflict()); return; }
     let commentId: string | undefined; const idMatch = commentMatch ?? statusMatch; if (idMatch) { try { commentId = decodeURIComponent(idMatch[1]!); } catch { send(response, { status: 400, body: errorBody("invalid-comment-id", "Spec comment ID is invalid.") }); return; } if (!/^[!-~]{1,64}$/u.test(commentId)) { send(response, { status: 400, body: errorBody("invalid-comment-id", "Spec comment ID is invalid.") }); return; } }
     if (closing) { send(response, closingRecord()); return; }
-    const fingerprint = specMutationFingerprint(definition.kind, expected, parsed.value); const decision = replay.run(parsed.value.requestId, fingerprint, () => serialize(() => dispatchSpec(definition.kind, expected, parsed.value, commentId)));
-    if (decision.kind === "conflict") { send(response, { status: 409, body: errorBody("request-id-conflict", "The request ID was already used for different input.") }); return; } if (decision.kind === "overloaded") { send(response, { status: 503, body: errorBody("replay-overloaded", "Too many Spec mutations are awaiting completion.") }); return; } const result = await decision.result; send(response, closing ? closingRecord() : result);
+    const fingerprint = specMutationFingerprint(definition.kind, expected, parsed.value); const decision = replay.run(parsed.value.requestId, fingerprint, () => serialize(async () => {
+      const result = await dispatchSpec(definition.kind, expected, parsed.value, commentId);
+      if (result.closeAfter) closing = true;
+      return result;
+    }));
+    if (decision.kind === "conflict") { send(response, { status: 409, body: errorBody("request-id-conflict", "The request ID was already used for different input.") }); return; } if (decision.kind === "overloaded") { send(response, { status: 503, body: errorBody("replay-overloaded", "Too many Spec mutations are awaiting completion.") }); return; } const result = await decision.result; send(response, result); if (result.closeAfter) scheduleClose(result.closeAfter);
   }
 
   async function dispatchSpec(kind: SpecRequestKind, expected: number, body: SpecMutation, commentId?: string): Promise<ResponseRecord> {
@@ -393,7 +400,9 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
     else if (kind === "cancel" && "disposition" in body) result = body.disposition === "pause" ? await controller.pause({ expectedStateVersion: expected }) : await controller.cancel({ expectedStateVersion: expected });
     else return { status: 422, body: errorBody("invalid-request", "Spec mutation is invalid.") };
     if (closing) return closingRecord();
-    return result.ok ? specSnapshot(200, { ok: true }) : specFailure(result);
+    if (!result.ok) return specFailure(result);
+    const response = specSnapshot(200, { ok: true });
+    return kind === "accept" ? { ...response, closeAfter: "terminal" } : response;
   }
   function specSnapshot(status: number, body: Record<string, unknown>): ResponseRecord { const controller = activeSpecController!; const snapshot = toPublicSpecSnapshot(controller.snapshot(), controller.acceptedStagingPending()); return { status, body: { ...body, snapshot }, headers: { ETag: specStateEtag(snapshot.stateVersion) } }; }
   function specConflict(): ResponseRecord { const controller = activeSpecController!; const snapshot = toPublicSpecSnapshot(controller.snapshot(), controller.acceptedStagingPending()); return { status: 409, body: { error: { code: "state-conflict", message: "The Spec changed. Refresh and retry." }, current: { stateVersion: snapshot.stateVersion, specRevision: snapshot.specRevision }, snapshot }, headers: { ETag: specStateEtag(snapshot.stateVersion) } }; }
@@ -416,7 +425,7 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
       if (!dispatched.ok) return controllerFailure(dispatched);
       return withSnapshot(202, { job: { id: started.value.jobId, status: "revising" } });
     } else if (kind === "grill") {
-      if (!["ready", "error"].includes(state.status) || state.document === null || state.generationJob) return { status: 409, body: errorBody("grill-unavailable", "Grill cannot start from the current state.") };
+      if (!["ready", "error"].includes(state.status) || state.document === null || state.generationJob) return { status: 409, body: errorBody("grill-unavailable", "Adversarial Review cannot start from the current state.") };
       const started = await options.controller.grill({ expectedStateVersion: expected });
       if (!started.ok) return controllerFailure(started);
       const dispatched = options.controller.dispatchGeneration(started.value.jobId); if (!dispatched.ok) return controllerFailure(dispatched);
@@ -468,11 +477,12 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
     return { status, body: errorBody(result.error.code, result.error.message) };
   }
 
-  return Object.freeze({
+  hostHandle = Object.freeze({
     port: address.port, origin, launchUrl: `${origin}/#capability=${capability}`,
     get closed() { return closed; },
     close,
   });
+  return hostHandle;
 }
 
 function validateWriterHead(

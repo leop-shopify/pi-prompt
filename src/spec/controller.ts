@@ -56,13 +56,13 @@ export class SpecController {
       if (this.#staged || accepted !== captured || accepted.status !== "accepted" || !accepted.markdown || accepted.stateVersion !== input.expectedStateVersion || accepted.specRevision !== input.specRevision) return failure("state-conflict", "Accepted Spec staging is not pending at the expected version.");
       return this.#stageAccepted(accepted);
     });
-    let fresh; try { fresh = await this.#options.source.fresh(); } catch { return failure("source-unavailable", "Fresh Plan and Grill source could not be verified."); }
+    let fresh; try { fresh = await this.#options.source.fresh(); } catch { return failure("source-unavailable", "Fresh Plan and Adversarial Review source could not be verified."); }
     return this.#enqueue(async () => {
       if (this.#unavailable()) return failure("controller-closed", "Spec controller is closed.");
       const current = this.#state;
       if (current !== captured || current.status !== "ready" || !current.markdown || current.stateVersion !== input.expectedStateVersion || current.specRevision !== input.specRevision) return failure("state-conflict", "Spec is not ready at the expected version.");
       if (!fresh.ok) return fresh;
-      if (!sameSpecSource(captured.source, fresh.value.reference)) return failure("stale-spec-source", "Plan or Grill source changed before Spec acceptance.");
+      if (!sameSpecSource(captured.source, fresh.value.reference)) return failure("stale-spec-source", "Plan or Adversarial Review source changed before Spec acceptance.");
       const next = { ...current, stateVersion: current.stateVersion + 1, status: "accepted" as const };
       const committed = await this.#commitAccepted(next, current); if (!committed.ok) return committed;
       return this.#stageAccepted(this.#state);
@@ -91,13 +91,13 @@ export class SpecController {
   async #start(operation: SpecOperation, expected: number, selected: readonly string[], instruction: string | undefined, rebase: boolean): Promise<SpecResult<SpecJobHandle>> {
     if (this.#unavailable()) return failure("controller-closed", "Spec controller is closed.");
     if (instruction !== undefined && Buffer.byteLength(instruction.trim(), "utf8") > SPEC_LIMITS.instructionBytes) return failure("invalid-instruction", "Spec instruction is too long.");
-    let fresh; try { fresh = await this.#options.source.fresh(); } catch { return failure("source-unavailable", "Fresh Plan and Grill source could not be verified."); } if (!fresh.ok) return fresh;
+    let fresh; try { fresh = await this.#options.source.fresh(); } catch { return failure("source-unavailable", "Fresh Plan and Adversarial Review source could not be verified."); } if (!fresh.ok) return fresh;
     const started = await this.#enqueue(async (): Promise<SpecResult<{ readonly state: SpecSession; readonly runtime: RuntimeJob }>> => {
       const current = this.#mutable(expected); if (!current.ok) return current;
       if (this.#active || current.value.generationJob) return failure("job-active", "A Spec generation job is active.");
       const sourceChanged = !sameSpecSource(current.value.source, fresh.value.reference);
-      if (rebase && !sourceChanged) return failure("spec-source-current", "The Spec already uses the current Plan and Grill source.");
-      if (!rebase && sourceChanged) return failure("stale-spec-source", "Plan or Grill source changed; generate a fresh Spec.");
+      if (rebase && !sourceChanged) return failure("spec-source-current", "The Spec already uses the current Plan and Adversarial Review source.");
+      if (!rebase && sourceChanged) return failure("stale-spec-source", "Plan or Adversarial Review source changed; generate a fresh Spec.");
       if (rebase && !["paused", "ready", "error"].includes(current.value.status)) return failure("invalid-status", "Fresh Spec generation is unavailable.");
       if (!rebase && operation === "initial" && (current.value.markdown !== null || !["paused", "error"].includes(current.value.status))) return failure("invalid-status", "Initial Spec generation is unavailable.");
       if (operation === "revision" && (current.value.markdown === null || !["ready", "error"].includes(current.value.status))) return failure("invalid-status", "Spec revision is unavailable.");
@@ -113,7 +113,7 @@ export class SpecController {
   }
   async #run(started: SpecSession, runtime: RuntimeJob): Promise<SpecResult> { const job = started.generationJob!; let result: SpecGeneratorResult; try { result = await this.#options.generator.generate({ session: started, source: runtime.source, jobId: job.jobId, operation: job.operation, selectedCommentIds: job.selectedCommentIds, ...(job.instruction ? { instruction: job.instruction } : {}), signal: runtime.abort.signal }); } catch { result = { ok: false, error: { code: "generation-failed", message: "Spec generation failed." } }; } return this.#enqueue(async () => { if (this.#unavailable()) return failure("controller-closed", "Spec controller is closed."); const current = this.#state; if (!current.generationJob || current.generationJob.jobId !== job.jobId || this.#active?.id !== job.jobId) return failure("job-stale", "Late Spec result was ignored."); this.#active = null; if (!result.ok) return this.#commit({ ...current, stateVersion: current.stateVersion + 1, status: "error", generationJob: undefined, lastError: result.error }, current, "state-changed");
       const markdown = validateSpecMarkdown(result.markdown); if (!markdown.ok) return this.#commit({ ...current, stateVersion: current.stateVersion + 1, status: "error", generationJob: undefined, lastError: { code: markdown.issues[0]?.code ?? "invalid-spec", message: markdown.issues[0]?.message ?? "Spec Markdown is invalid." } }, current, "state-changed");
-      let fresh; try { fresh = await this.#options.source.fresh(); } catch { fresh = { ok: false as const, error: { code: "source-unavailable", message: "Fresh Plan and Grill source could not be verified." } }; } if (!fresh.ok || !sameSpecSource(current.source, fresh.value.reference)) { const error = fresh.ok ? { code: "stale-spec-source", message: "Plan or Grill changed while Spec generation was active." } : fresh.error; return this.#commit({ ...current, stateVersion: current.stateVersion + 1, status: "error", generationJob: undefined, lastError: error }, current, "state-changed"); }
+      let fresh; try { fresh = await this.#options.source.fresh(); } catch { fresh = { ok: false as const, error: { code: "source-unavailable", message: "Fresh Plan and Adversarial Review source could not be verified." } }; } if (!fresh.ok || !sameSpecSource(current.source, fresh.value.reference)) { const error = fresh.ok ? { code: "stale-spec-source", message: "Plan or Adversarial Review changed while Spec generation was active." } : fresh.error; return this.#commit({ ...current, stateVersion: current.stateVersion + 1, status: "error", generationJob: undefined, lastError: error }, current, "state-changed"); }
       if (job.operation === "initial") return this.#commit({ ...current, stateVersion: current.stateVersion + 1, specRevision: 1, status: "ready", markdown: markdown.value, comments: [], generationJob: undefined, lastError: undefined }, current, "revision-committed"); const addressed = job.selectedCommentIds; const comments = reconcileSpecRevision({ previousMarkdown: current.markdown!, nextMarkdown: markdown.value, previousRevision: current.specRevision, comments: current.comments, selectedCommentIds: job.selectedCommentIds, addressedCommentIds: addressed, now: this.#now() }); if (!comments.ok) return this.#commit({ ...current, stateVersion: current.stateVersion + 1, status: "error", generationJob: undefined, lastError: comments.error }, current, "state-changed"); return this.#commit({ ...current, stateVersion: current.stateVersion + 1, specRevision: current.specRevision + 1, status: "ready", markdown: markdown.value, comments: comments.value, generationJob: undefined, lastError: undefined }, current, "revision-committed"); }); }
   async #changeComment(input: { readonly expectedStateVersion: number; readonly commentId: string }, change: (comment: SpecComment) => SpecResult<SpecComment>): Promise<SpecResult> { return this.#enqueue(async () => { const current = this.#mutable(input.expectedStateVersion); if (!current.ok) return current; if (current.value.generationJob?.selectedCommentIds.includes(input.commentId)) return failure("comment-locked", "Selected comment is locked during revision."); const index = current.value.comments.findIndex((comment) => comment.id === input.commentId); const comment = current.value.comments[index]; if (!comment) return failure("comment-not-found", "Spec comment does not exist."); const changed = change(comment); if (!changed.ok) return changed; const comments = [...current.value.comments]; comments[index] = changed.value; return this.#commit({ ...current.value, stateVersion: current.value.stateVersion + 1, comments }, current.value, "state-changed"); }); }
   #transition(comment: SpecComment, status: SpecCommentStatus): SpecComment { if (comment.status === status) return comment; const at = this.#now(); return { ...comment, status, history: [...comment.history, { from: comment.status, to: status, at }], updatedAt: at }; }
@@ -137,7 +137,7 @@ export function formatAcceptedSpec(session: SpecSession): string {
     "You are the current main Pi agent. IMPLEMENT the authenticated specification now in the current repository.",
     "Continue through implementation and verification. Do not merely acknowledge receipt, report readiness, or stop after producing another plan.",
     "The exact accepted Spec Markdown at the end of this message is authoritative. Do not rewrite it before implementation.",
-    "Use the Plan and Grill references below as source context. Follow the current session's normal permissions and instructions.",
+    "Use the Plan and Adversarial Review references below as source context. Follow the current session's normal permissions and instructions.",
     "Do not create /create-goal or issue-tracker items. Do not commit, push, deploy, install dependencies, or start services unless the user has explicitly authorized that action.",
     "",
     "Authenticated Spec source",
@@ -147,9 +147,9 @@ export function formatAcceptedSpec(session: SpecSession): string {
     `Plan annotations: ${source.annotationsPath}`,
     `Plan revision: ${source.planDocumentRevision}`,
     `Plan state revision: ${source.planStateVersion}`,
-    `Grill: ${source.grillPath}${source.grillPointer}`,
-    `Grill based-on revision: ${source.grillBasedOnDocumentRevision}`,
-    `Grill state revision: ${source.grillStateVersion}`,
+    `Adversarial Review: ${source.grillPath}${source.grillPointer}`,
+    `Adversarial Review based-on revision: ${source.grillBasedOnDocumentRevision}`,
+    `Adversarial Review state revision: ${source.grillStateVersion}`,
   ].join("\n");
   return `${dispatch}\n\n${session.markdown}`;
 }

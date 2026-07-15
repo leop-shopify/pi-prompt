@@ -13,9 +13,16 @@ describe("isolated Spec protocol", () => {
     expect(parseSpecMutation("fresh-generation", { requestId }).ok).toBe(true);
     expect(parseSpecMutation("fresh-generation", { requestId, source: {} })).toMatchObject({ ok: false, code: "invalid-request" });
   });
-  it("exposes an allowlisted snapshot without durable local paths or source hashes", () => {
-    const snapshot = toPublicSpecSnapshot(session()); const serialized = JSON.stringify(snapshot);
+  it("exposes an allowlisted snapshot and opaque job id without private generation input", () => {
+    const base = session();
+    const snapshot = toPublicSpecSnapshot(session({
+      stateVersion: 3, status: "revising",
+      generationJob: { jobId: "opaque-spec-job", operation: "revision", baseSpecRevision: 1, selectedCommentIds: ["private-comment"], source: base.source, instruction: "PRIVATE INSTRUCTION", startedAt: "2026-07-12T00:00:00.000Z" },
+    }));
+    const serialized = JSON.stringify(snapshot);
     expect(snapshot).toMatchObject({ protocolVersion: 1, planSessionId: "plan-session", specRevision: 1, markdown: "# Spec\n\nBuild 😀 safely.\n" });
-    expect(serialized).not.toContain("/tmp/"); expect(serialized).not.toContain("Sha256");
+    expect(snapshot.job).toEqual({ id: "opaque-spec-job", operation: "revision", baseSpecRevision: 1, startedAt: "2026-07-12T00:00:00.000Z" });
+    expect(Object.keys(snapshot.job!)).toEqual(["id", "operation", "baseSpecRevision", "startedAt"]);
+    expect(serialized).not.toContain("/tmp/"); expect(serialized).not.toContain("Sha256"); expect(serialized).not.toContain("PRIVATE INSTRUCTION"); expect(serialized).not.toContain("private-comment"); expect(serialized).not.toContain("jobId");
   });
 });

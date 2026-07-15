@@ -1,6 +1,7 @@
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { renderClarification, renderPlan, renderSpec } from "../plan/browser/components.js";
 import { selectionTarget } from "../plan/browser/range.js";
+import { createStore } from "../plan/browser/store.js";
 import { projectMarkdownPlan } from "../plan/markdown-projection.js";
 
 class TestNode {
@@ -56,6 +57,10 @@ let captureFocus;
 let restoreFocus;
 let createRebuildTransitionTracker;
 let isPlanRebuilding;
+let createAgentWorkTransitionTracker;
+let agentWorkIdentity;
+let agentWorkLabel;
+let createSnapshotCoordinator;
 function installDocument() {
   documentFixture = new TestDocument();
   Object.assign(globalThis, {
@@ -80,7 +85,7 @@ function planSurface(tree) { return tree.querySelector('[data-comment-surface="p
 
 beforeAll(async () => {
   installDocument();
-  ({ captureFocus, restoreFocus, createRebuildTransitionTracker, isPlanRebuilding } = await import("../plan/browser/app.js"));
+  ({ captureFocus, restoreFocus, createRebuildTransitionTracker, isPlanRebuilding, createAgentWorkTransitionTracker, agentWorkIdentity, agentWorkLabel, createSnapshotCoordinator } = await import("../plan/browser/app.js"));
 });
 
 describe("clarification redraw focus", () => {
@@ -149,16 +154,16 @@ describe("canonical annotation selectors", () => {
 });
 
 describe("staged author rendering", () => {
-  it("filters Grill authors from Plan and labels both provenance classes in Grill", () => {
+  it("filters generated review authors from Plan and labels both Adversarial Review provenance classes", () => {
     installDocument(); const tree = document.createElement("div"); document.body.append(tree); const base = fieldSnapshot();
     const snapshot = { ...base, grill: { basedOnDocumentRevision: 1 }, documentRevision: 1, annotations: [
       { ...base.annotations[0], id: "user-note", author: "user", body: "user body" },
       { ...base.annotations[1], id: "grill-note", author: "grill", body: "generated body" },
     ] };
-    renderPlan(snapshot, tree, () => {}, () => {}, false, "plan"); expect(tree.querySelectorAll("button")).toHaveLength(1); expect(tree.querySelectorAll("button")[0].attributes.get("aria-label")).not.toContain("Grill critique");
+    renderPlan(snapshot, tree, () => {}, () => {}, false, "plan"); expect(tree.querySelectorAll("button")).toHaveLength(1); expect(tree.querySelectorAll("button")[0].attributes.get("aria-label")).not.toContain("Adversarial Review finding");
     renderPlan(snapshot, tree, () => {}, () => {}, false, "grill"); const buttons = tree.querySelectorAll("button");
     expect(buttons.map((button) => button.className)).toEqual(expect.arrayContaining([expect.stringContaining("author-user"), expect.stringContaining("author-grill")]));
-    expect(buttons.map((button) => button.attributes.get("aria-label"))).toEqual(expect.arrayContaining([expect.stringContaining("Your comment:"), expect.stringContaining("Grill critique:")]));
+    expect(buttons.map((button) => button.attributes.get("aria-label"))).toEqual(expect.arrayContaining([expect.stringContaining("Your comment:"), expect.stringContaining("Adversarial Review finding:")]));
   });
 
   it("renders open generated critiques as named checked controls without making their body editable", () => {
@@ -167,7 +172,7 @@ describe("staged author rendering", () => {
     renderPlan({ ...base, annotations: [generated] }, tree, () => {}, (item) => opened.push(item.id), false, "grill", [generated.id], (id) => toggled.push(id));
     const badge = tree.querySelector("button");
     expect(badge.attributes.get("role")).toBe("checkbox"); expect(badge.attributes.get("aria-checked")).toBe("true"); expect(badge.textContent).toBe("✓"); expect(badge.className).toContain("is-selected");
-    expect(badge.attributes.get("aria-label")).toContain("Grill critique: Preserve auth boundaries"); expect(badge.attributes.get("aria-label")).toContain("Generated text is read-only"); expect(badge.attributes.get("aria-label")).toContain("Selected for Plan revision");
+    expect(badge.attributes.get("aria-label")).toContain("Adversarial Review finding: Preserve auth boundaries"); expect(badge.attributes.get("aria-label")).toContain("Generated text is read-only"); expect(badge.attributes.get("aria-label")).toContain("Selected for Plan revision");
     badge.dispatchEvent({ type: "click" }); expect(toggled).toEqual([generated.id]); expect(opened).toEqual([generated.id]);
   });
 
@@ -202,6 +207,69 @@ describe("Plan rebuild transitions", () => {
     const entered = createRebuildTransitionTracker(); const ready = { status: "ready", job: null }; const revising = { status: "revising", job: { operation: "revision" } };
     expect(isPlanRebuilding(revising)).toBe(true); expect(isPlanRebuilding({ status: "ready", job: { operation: "revision" } })).toBe(true);
     expect([entered(ready), entered(revising), entered(revising), entered(ready), entered(revising)]).toEqual([false, true, false, false, true]);
+  });
+});
+
+describe("agent work transitions", () => {
+  it("uses projected job ids once across higher states, same-operation jobs, recovery, and Spec rebases", () => {
+    const entered = createAgentWorkTransitionTracker(); const readyPlan = { status: "ready", job: null };
+    const review = { stateVersion: 10, status: "grilling", job: { id: "review-1", operation: "grill" } };
+    const sameReview = { ...review, stateVersion: 11 }; const nextReview = { stateVersion: 12, status: "grilling", job: { id: "review-2", operation: "grill" } };
+    const spec = { stateVersion: 5, status: "generating", job: { id: "spec-1", operation: "initial" } }; const rebase = { stateVersion: 6, specRevision: 0, markdown: null, status: "generating", job: { id: "spec-rebase", operation: "initial" } };
+    expect(agentWorkIdentity(review, null)).toBe("plan:review-1"); expect(agentWorkIdentity(readyPlan, spec)).toBe("spec:spec-1"); expect(agentWorkIdentity({ status: "revising", job: null }, null)).toBe("plan-status:revising");
+    expect(agentWorkIdentity({ status: "revising", job: { operation: "revision", startedAt: "legacy" } }, null)).toBeNull();
+    expect(agentWorkLabel(review, null)).toBe("Running Adversarial Review…"); expect(agentWorkLabel({ status: "revising", job: { id: "plan-revision", operation: "revision" } }, null)).toBe("Revising Plan…");
+    expect(agentWorkLabel(readyPlan, spec)).toBe("Generating Spec…"); expect(agentWorkLabel(readyPlan, { status: "revising", job: { id: "spec-revision", operation: "revision" } })).toBe("Revising Spec…");
+    expect([
+      entered(readyPlan, null), entered(review, null), entered(sameReview, null), entered(nextReview, null),
+      entered(readyPlan, null), entered(nextReview, null), entered(readyPlan, spec), entered(readyPlan, { ...spec, stateVersion: 6 }),
+      entered(readyPlan, { status: "ready", job: null }), entered(readyPlan, rebase), entered({ status: "generating" }, null),
+      entered({ status: "generating", job: { operation: "initial", startedAt: "legacy" } }, null), entered({ status: "generating", job: { operation: "initial", startedAt: "legacy" } }, null),
+    ]).toEqual([false, true, false, true, false, false, true, false, false, true, true, false, false]);
+  });
+});
+
+describe("snapshot response ordering", () => {
+  it("rejects a delayed stale Plan pair before ETag, tracker, selection, composer, or store changes", async () => {
+    let resolveMarkdown; const delayedMarkdown = new Promise((resolve) => { resolveMarkdown = resolve; });
+    const document = { id: "plan" }; const initial = { stateVersion: 9, documentRevision: 2, status: "ready", document, annotations: [], planMarkdown: "# V9\n" };
+    const stale = { stateVersion: 10, documentRevision: 1, status: "revising", document, annotations: [], job: { id: "plan-old", operation: "revision" } };
+    const current = { stateVersion: 11, documentRevision: 2, status: "revising", document, annotations: [], job: { id: "plan-new", operation: "revision" } };
+    const store = createStore({ snapshot: initial, selectedAnnotationIds: ["keep-plan"], selectedGrillAnnotationIds: ["keep-grill"] });
+    const api = {
+      snapshot: vi.fn().mockResolvedValueOnce(stale).mockResolvedValueOnce(current).mockResolvedValueOnce(stale),
+      plan: vi.fn().mockReturnValueOnce(delayedMarkdown).mockResolvedValueOnce({ markdown: "# V11\n", stateVersion: 11, etag: '"pi-plan-state-11"' }).mockResolvedValueOnce({ markdown: "# V10\n", stateVersion: 10, etag: '"pi-plan-state-10"' }),
+      setVersion: vi.fn(), setSpecVersion: vi.fn(), specSnapshot: vi.fn(),
+    };
+    const closeComposer = vi.fn(); const scrollToTop = vi.fn();
+    const coordinator = createSnapshotCoordinator({ api, store, enteredAgentWork: createAgentWorkTransitionTracker(), closeComposer, scrollToTop });
+    const delayed = coordinator.refreshPlan(); await vi.waitFor(() => expect(api.plan).toHaveBeenCalledOnce());
+    await coordinator.refreshPlan();
+    resolveMarkdown({ markdown: "# Mismatched V9\n", stateVersion: 9, etag: '"pi-plan-state-9"' }); await delayed;
+    expect(api.snapshot).toHaveBeenCalledTimes(3); expect(api.plan).toHaveBeenCalledTimes(3);
+    expect(store.get()).toMatchObject({ snapshot: { stateVersion: 11, documentRevision: 2, planMarkdown: "# V11\n", job: { id: "plan-new" } }, selectedAnnotationIds: ["keep-plan"], selectedGrillAnnotationIds: ["keep-grill"] });
+    expect(api.setVersion).toHaveBeenCalledTimes(1); expect(api.setVersion).toHaveBeenCalledWith(11); expect(scrollToTop).toHaveBeenCalledOnce(); expect(closeComposer).not.toHaveBeenCalled();
+  });
+
+  it("ignores stale Spec null/V4, accepts a V6 rebase, and keeps equal-version application idempotent", async () => {
+    let resolveNull; const delayedNull = new Promise((resolve) => { resolveNull = resolve; });
+    const plan = { stateVersion: 8, documentRevision: 2, status: "ready", document: { id: "plan" }, annotations: [] };
+    const v5 = { stateVersion: 5, specRevision: 2, status: "revising", markdown: "# V5\n", comments: [{ id: "comment", status: "open" }], job: { id: "spec-job-5", operation: "revision" } };
+    const v4 = { ...v5, stateVersion: 4, markdown: "# V4\n", job: { id: "spec-job-4", operation: "revision" } };
+    const v6 = { stateVersion: 6, specRevision: 0, status: "generating", markdown: null, comments: [], job: { id: "spec-rebase-6", operation: "initial" } };
+    const store = createStore({ snapshot: plan, specSnapshot: null, selectedSpecCommentIds: ["keep-selection"] });
+    const api = { specSnapshot: vi.fn().mockReturnValueOnce(delayedNull).mockResolvedValueOnce(v5), setSpecVersion: vi.fn(), setVersion: vi.fn(), snapshot: vi.fn(), plan: vi.fn() };
+    const closeComposer = vi.fn(); const scrollToTop = vi.fn();
+    const coordinator = createSnapshotCoordinator({ api, store, enteredAgentWork: createAgentWorkTransitionTracker(), closeComposer, scrollToTop });
+    const staleNull = coordinator.refreshSpec(); await vi.waitFor(() => expect(api.specSnapshot).toHaveBeenCalledOnce()); await coordinator.refreshSpec();
+    expect(store.get().specSnapshot).toBe(v5); expect(scrollToTop).toHaveBeenCalledOnce();
+    resolveNull(null); await staleNull;
+    expect(coordinator.applySpecSnapshot({ ...v5, markdown: "# stale equal\n" }, 1)).toBe(false);
+    const v4Epoch = coordinator.beginSpecRequest(); expect(coordinator.applySpecSnapshot(v4, v4Epoch)).toBe(false);
+    const equalEpoch = coordinator.beginSpecRequest(); expect(coordinator.applySpecSnapshot(v5, equalEpoch)).toBe(true); expect(scrollToTop).toHaveBeenCalledOnce();
+    const rebaseEpoch = coordinator.beginSpecRequest(); expect(coordinator.applySpecSnapshot(v6, rebaseEpoch)).toBe(true);
+    expect(store.get()).toMatchObject({ specSnapshot: { stateVersion: 6, specRevision: 0, markdown: null, job: { id: "spec-rebase-6" } }, selectedSpecCommentIds: ["keep-selection"] });
+    expect(api.setSpecVersion.mock.calls.map(([version]) => version)).toEqual([5, 5, 6]); expect(scrollToTop).toHaveBeenCalledTimes(2); expect(closeComposer).not.toHaveBeenCalled();
   });
 });
 

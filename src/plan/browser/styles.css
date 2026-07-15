@@ -428,7 +428,7 @@ input:focus-visible {
 }
 
 #spec-tree {
-  margin-top: 18px;
+  margin-top: 0;
 }
 
 .spec-markdown {
@@ -440,8 +440,9 @@ input:focus-visible {
   text-wrap: pretty;
 }
 
-.plan-surface {
+.document-surface {
   position: relative;
+  isolation: isolate;
   min-height: 180px;
   margin-top: 18px;
 }
@@ -459,26 +460,41 @@ input:focus-visible {
   font: 500 15px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-.plan-rebuild-overlay {
+.agent-work-overlay {
   position: absolute;
   z-index: 8;
   inset: 0;
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-  gap: 10px;
-  min-height: 180px;
-  padding: 44px 16px;
-  border-radius: 12px;
-  background: rgba(12, 17, 27, .78);
+  min-height: 100%;
+  border-radius: 14px;
+  background: rgba(12, 17, 27, .84);
   color: var(--ink);
-  backdrop-filter: blur(2px);
+  box-shadow: inset 0 0 0 1px rgba(141, 168, 255, .12);
+  backdrop-filter: blur(4px);
 }
 
-.plan-rebuild-spinner {
-  width: 20px;
-  height: 20px;
-  border: 2px solid rgba(141, 168, 255, .28);
+.agent-work-status {
+  position: sticky;
+  top: 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  min-height: clamp(180px, 34vh, 280px);
+  padding: 32px 16px;
+  text-align: center;
+}
+
+.agent-work-status strong {
+  font-size: 18px;
+  line-height: 1.3;
+  text-wrap: balance;
+}
+
+.agent-work-spinner {
+  width: 34px;
+  height: 34px;
+  border: 3px solid rgba(141, 168, 255, .28);
   border-top-color: var(--blue);
   border-radius: 50%;
   animation: plan-rebuild-spin .8s linear infinite;
@@ -1165,8 +1181,10 @@ dialog h2 {
     display: grid;
   }
 
-  .plan-rebuild-overlay {
-    padding: 32px 12px;
+  .agent-work-status {
+    top: 16px;
+    min-height: 160px;
+    padding: 24px 12px;
   }
 
   .run-heading {
@@ -1227,7 +1245,7 @@ dialog h2 {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .plan-rebuild-spinner {
+  .agent-work-spinner {
     animation: none;
     border-color: var(--blue);
   }

@@ -21,6 +21,8 @@ import {
 } from "./teams-planning-adapter.js";
 
 export const PLAN_SUBMIT_TOOL_NAME = "pi_prompt_submit_plan";
+// SpecSession has no generation profile; use the existing semantic hard-writing slot consistently.
+const SPEC_WRITER_MODEL_SLOT = "writing-hard";
 export type PlanningAdapterKind = "delegated" | "direct";
 export type PlanningActivityPhase =
   | "capability-detected" | "primary-starting" | "primary-active" | "waiting-report" | "report-received"
@@ -54,7 +56,10 @@ interface SpecGate {
   readonly input: SpecGeneratorInput;
   readonly resolve: (result: SpecGeneratorResult) => void;
   readonly attemptId: string;
+  readonly adapterKind: PlanningAdapterKind;
   writerEndpoint?: string;
+  teams?: TeamsPlanningAdapter;
+  stopReportObservation?: () => void;
   latestValidationError?: { readonly code: string; readonly message: string };
   marker?: string;
   state: "preparing" | "ready" | "open" | "settled" | "closed";
@@ -172,7 +177,11 @@ export class CurrentAgentPlanBridge {
 
   beforeAgentStart(event: BeforeAgentStartEvent): { readonly message: { readonly customType: string; readonly content: string; readonly display: false } } | void {
     const spec = this.#activeSpec;
-    if (spec && spec.state === "open" && spec.queued && event.prompt === spec.marker) { spec.queued = false; spec.active = true; spec.marker = undefined; return { message: { customType: "pi-prompt-spec-request", content: this.#specMission(spec), display: false } }; }
+    if (spec && spec.state === "open" && spec.queued && event.prompt === spec.marker) {
+      spec.queued = false; spec.active = true; spec.marker = undefined;
+      const content = spec.adapterKind === "delegated" ? this.#specOrchestrationMessage() : this.#specMission(spec);
+      return { message: { customType: "pi-prompt-spec-request", content, display: false } };
+    }
     const gate = this.#active;
     if (!this.#isOpen(gate) || !gate.levelMarkdown || !gate.skills) return;
     if (event.prompt !== gate.marker || gate.queuedRun !== gate.sentRun || !gate.sentRun) return;
@@ -202,12 +211,16 @@ export class CurrentAgentPlanBridge {
   }
 
   toolCall(event: ToolCallEvent) {
+    const spec = this.#activeSpec;
+    if (spec && spec.state === "open" && spec.active && spec.adapterKind === "delegated" && spec.teams) return spec.teams.handleToolCall(event);
     const gate = this.#active;
     if (!this.#isOpen(gate) || gate.adapterKind !== "delegated" || !gate.teams) return;
     return gate.teams.handleToolCall(event);
   }
 
   toolResult(event: ToolResultEvent): void {
+    const spec = this.#activeSpec;
+    if (spec && spec.state === "open" && spec.active && spec.adapterKind === "delegated") { spec.teams?.handleToolResult(event); return; }
     const gate = this.#active;
     if (!this.#isOpen(gate) || gate.adapterKind !== "delegated") return;
     gate.teams?.handleToolResult(event);
@@ -216,9 +229,11 @@ export class CurrentAgentPlanBridge {
   agentEnd(_event: AgentEndEvent): void {
     const spec = this.#activeSpec;
     if (spec && spec.active && !["settled", "closed"].includes(spec.state)) {
-      const error = spec.latestValidationError ?? { code: "missing-spec-submission", message: "The correlated Spec writer ended without an accepted HTTP submission." };
-      this.#settleSpec(spec, { ok: false, error });
-      this.#sendSpecFailureFollowUp(spec.input, error);
+      if (spec.adapterKind === "delegated" && spec.teams?.primaryStatus === "waiting") return;
+      const error = spec.latestValidationError ?? (spec.adapterKind === "delegated"
+        ? { code: "delegation-not-started", message: "The mandatory Spec writer did not start." }
+        : { code: "missing-spec-submission", message: "The correlated Spec writer ended without an accepted HTTP submission." });
+      this.#failSpec(spec, error);
       return;
     }
     const gate = this.#active;
@@ -261,13 +276,43 @@ export class CurrentAgentPlanBridge {
       const error = { code: "attempt-identity-unavailable", message: "The private Spec writer identity could not be created." };
       this.#sendSpecFailureFollowUp(input, error); return { ok: false, error };
     }
+    const adapterKind: PlanningAdapterKind = detectTeamsPlanningCapability(this.#pi, SPEC_WRITER_MODEL_SLOT) ? "delegated" : "direct";
     let resolve!: (result: SpecGeneratorResult) => void; const completion = new Promise<SpecGeneratorResult>((done) => { resolve = done; });
-    const gate: SpecGate = { owner, input, resolve, attemptId, ...(writerEndpoint ? { writerEndpoint } : {}), state: writerEndpoint ? "ready" : "preparing", dispatchRequested: false, queued: false, active: false };
-    this.#activeSpec = gate; input.signal.addEventListener("abort", () => this.#closeSpecGate(gate), { once: true }); return completion;
+    const gate: SpecGate = { owner, input, resolve, attemptId, adapterKind, ...(writerEndpoint ? { writerEndpoint } : {}), state: "preparing", dispatchRequested: false, queued: false, active: false };
+    this.#activeSpec = gate;
+    input.signal.addEventListener("abort", () => this.#closeSpecGate(gate), { once: true });
+    if (adapterKind === "delegated" && !this.#configureSpecTeams(gate)) return completion;
+    this.#prepareSpecReadyGate(gate);
+    return completion;
+  }
+  #configureSpecTeams(gate: SpecGate): boolean {
+    const primaryName = this.#primaryNameFactory(); const correlation = this.#correlationFactory();
+    if (!/^planner-[A-Za-z0-9_-]{8,80}$/u.test(primaryName) || !/^[A-Za-z0-9_-]{8,128}$/u.test(correlation)) {
+      this.#failSpec(gate, { code: "delegation-identity-unavailable", message: "The private Spec writer identity could not be created." });
+      return false;
+    }
+    const adapter = new TeamsPlanningAdapter({
+      primaryName, correlation, cwd: gate.input.source.reference.planArtifactPath, mission: "pending-controller-mission",
+      modelSlot: SPEC_WRITER_MODEL_SLOT, strictSingleSpawn: true,
+      onPhase: () => undefined, onReport: () => this.#specReport(gate), onProgress: () => undefined,
+      now: () => this.#clock().getTime(),
+    });
+    gate.teams = adapter;
+    gate.stopReportObservation = observeTeamsEvents(this.#pi.events, adapter);
+    return true;
+  }
+  #prepareSpecReadyGate(gate: SpecGate): void {
+    if (["settled", "closed"].includes(gate.state) || gate.state !== "preparing" || !gate.writerEndpoint) return;
+    if (gate.teams && !gate.teams.setMission(this.#specChildMission(gate))) {
+      this.#failSpec(gate, { code: "delegation-mission-unavailable", message: "The private Spec writer mission could not be prepared." });
+      return;
+    }
+    gate.state = "ready";
+    if (gate.dispatchRequested) this.#sendSpecRun(gate);
   }
   #configureSpecWriterEndpoint(owner: symbol, url: string): PlanDispatchResult {
     if (!validWriterEndpoint(url)) return dispatchFailed("invalid-writer-endpoint", "The private Spec writer endpoint is invalid."); const gate = this.#activeSpec;
-    if (gate?.owner === owner && !["settled", "closed"].includes(gate.state)) { if (gate.dispatchRequested && gate.writerEndpoint !== url) return dispatchFailed("writer-endpoint-locked", "The active Spec endpoint cannot be changed."); gate.writerEndpoint = url; if (gate.state === "preparing") gate.state = "ready"; if (gate.dispatchRequested) this.#sendSpecRun(gate); }
+    if (gate?.owner === owner && !["settled", "closed"].includes(gate.state)) { if (gate.dispatchRequested && gate.writerEndpoint !== url) return dispatchFailed("writer-endpoint-locked", "The active Spec endpoint cannot be changed."); gate.writerEndpoint = url; this.#prepareSpecReadyGate(gate); }
     return { ok: true, value: undefined };
   }
   #dispatchSpec(owner: symbol, jobId: string, isIdle: () => boolean): PlanDispatchResult {
@@ -275,10 +320,24 @@ export class CurrentAgentPlanBridge {
   }
   #sendSpecRun(gate: SpecGate): void { if (["closed", "settled"].includes(gate.state) || gate.marker || gate.active) return; gate.marker = `pi-prompt Spec ${gate.input.operation === "initial" ? "creation" : "revision"} in progress`; gate.state = "open"; try { if (gate.isIdle?.() ?? true) this.#pi.sendUserMessage(gate.marker); else this.#pi.sendUserMessage(gate.marker, { deliverAs: "followUp" }); } catch { this.#settleSpec(gate, { ok: false, error: { code: "dispatch-failed", message: "The Spec writer request could not be sent." } }); } }
   async #submitSpecWriterResult(owner: symbol, input: SpecWriterSubmission): Promise<PlanDispatchResult> {
-    const gate = this.#activeSpec; const job = gate?.input.session.generationJob; if (!gate || gate.owner !== owner || gate.state !== "open" || !gate.active || !job || input.kind !== "spec" || input.attemptId !== gate.attemptId || input.planSessionId !== gate.input.session.planSessionId || input.jobId !== gate.input.jobId || input.operation !== gate.input.operation || input.baseSpecRevision !== job.baseSpecRevision) return dispatchFailed("writer-attempt-rejected", "The Spec writer submission is not active.");
+    const gate = this.#activeSpec; const job = gate?.input.session.generationJob; if (!gate || gate.owner !== owner || gate.state !== "open" || !this.#specSubmissionActive(gate) || !job || input.kind !== "spec" || input.attemptId !== gate.attemptId || input.planSessionId !== gate.input.session.planSessionId || input.jobId !== gate.input.jobId || input.operation !== gate.input.operation || input.baseSpecRevision !== job.baseSpecRevision) return dispatchFailed("writer-attempt-rejected", "The Spec writer submission is not active.");
     const result = specResultFromBytes(input.body);
     if (!result.ok) { gate.latestValidationError = result.error; return dispatchFailed(result.error.code, result.error.message); }
     this.#settleSpec(gate, result); return { ok: true, value: undefined };
+  }
+  #specOrchestrationMessage(): string {
+    return [
+      "Pi Prompt detected a validated active pi-extended-teams capability for this Spec.",
+      "You are orchestration-only. Call spawn_agent exactly once now. The adapter will replace every argument with the private Spec writer mission.",
+      "Do not inspect or write the Spec, inspect files, call another tool, spawn a swarm or other helper, or delegate any further. After the one spawn call succeeds, end this run and wait for the report.",
+    ].join("\n\n");
+  }
+  #specChildMission(gate: SpecGate): string {
+    return [
+      "You are the one dedicated Spec writer. Complete this mission alone. Do not call spawn_agent or spawn_swarm_agents, create helpers or swarms, or delegate any part of the work.",
+      this.#specMission(gate),
+      "Finish by calling report_and_exit with `spec uploaded`. The report is cleanup-only and must contain no Spec bytes, submission URL, bearer, or validation details.",
+    ].join("\n\n");
   }
   #specMission(gate: SpecGate): string {
     const source = gate.input.source.reference;
@@ -291,17 +350,30 @@ export class CurrentAgentPlanBridge {
       "## Controller-owned Spec writer mission", `Operation: ${gate.input.operation}`, `Plan session: ${source.planSessionId}`,
       `Plan Markdown: ${source.planMarkdownPath}`, `Plan annotations: ${source.annotationsPath}`,
       `Plan revision/state: ${source.planDocumentRevision}/${source.planStateVersion}`,
-      `Grill decision tree: ${source.grillPath}${source.grillPointer}`,
-      `Grill revision/state: ${source.grillBasedOnDocumentRevision}/${source.grillStateVersion}`,
+      `Adversarial Review decision tree: ${source.grillPath}${source.grillPointer}`,
+      `Adversarial Review revision/state: ${source.grillBasedOnDocumentRevision}/${source.grillStateVersion}`,
       ...(gate.input.operation === "revision" ? [`Existing Spec input: ${canonical}`] : []),
       `Selected Spec comments: ${JSON.stringify(comments)}`,
       ...(gate.input.instruction ? [`Revision instruction: ${gate.input.instruction}`] : []),
-      "Read only those exact durable Plan, annotation, Grill, and existing Spec inputs. Write a precise implementation Spec as UTF-8 Markdown with at least one H1. Do not use the Plan storage schema, do not create issue-tracker artifacts, and do not mutate Plan, annotations, or Grill.",
+      "Read only those exact durable Plan, annotation, Adversarial Review, and existing Spec inputs. Write the shortest unambiguous implementation Spec as UTF-8 Markdown with at least one H1. Do not restate the Plan, findings, or decision-tree branches, introduce requirements, silently resolve material decisions, or add speculative improvements.",
+      "Use exactly these H2 sections in order: Artifact References, Intended Outcome, Implementation Decisions, Testing Approach, Unresolved Decisions, Out of Scope, Acceptance Criteria. Do not add User Stories or Further Notes. Keep prose compact and prefer bullets.",
+      "Artifact References must identify the Plan session/path/revision and Adversarial Review path/pointer/revision. Every Acceptance Criterion must be independently pass/fail, externally observable or contract-verifiable, trace to the approved outcome or a settled decision, and state material failure/denied/empty/retry/rollback behavior without inventing implementation detail. Reject vague criteria such as works correctly, handles appropriately, or tests pass.",
+      "Do not use the Plan storage schema, create issue-tracker artifacts, or mutate Plan, annotations, or Adversarial Review artifacts.",
       `Write only the transient writer draft ${output}; never write the repository-owned canonical Spec ${canonical}. Then upload the exact draft bytes and do not edit them afterward:`,
       `curl --fail-with-body --silent --show-error --request POST --header 'Authorization: Bearer ${gate.attemptId}' --header 'Content-Type: text/markdown' --header 'X-Pi-Prompt-Result: spec' --data-binary '@${output}' '${gate.writerEndpoint}'`,
       "If the upload returns an error, inspect the response, fix the transient draft, and retry the same upload during this turn. The gate remains active until a submission is accepted or this turn ends.",
       "The authenticated HTTP bytes are the sole result authority.",
     ].join("\n\n");
+  }
+  #specSubmissionActive(gate: SpecGate): boolean {
+    if (!gate.active) return false;
+    if (gate.adapterKind === "direct") return true;
+    return gate.teams?.primaryCount === 1 && gate.teams.primaryStatus === "waiting";
+  }
+  #specReport(gate: SpecGate): void {
+    if (["settled", "closed"].includes(gate.state) || !gate.active) return;
+    const error = gate.latestValidationError ?? { code: "missing-spec-submission", message: "The correlated Spec writer reported without an accepted HTTP submission." };
+    this.#failSpec(gate, error);
   }
   #sendSpecFailureFollowUp(input: SpecGeneratorInput, error: { readonly code: string; readonly message: string }): void {
     let draft: string;
@@ -313,9 +385,17 @@ export class CurrentAgentPlanBridge {
     ].join("\n");
     try { this.#pi.sendUserMessage(message, { deliverAs: "followUp" }); } catch {}
   }
-  #settleSpec(gate: SpecGate, result: SpecGeneratorResult): void { if (["settled", "closed"].includes(gate.state)) return; gate.state = "settled"; gate.active = false; gate.resolve(result); }
+  #failSpec(gate: SpecGate, error: { readonly code: string; readonly message: string }): void {
+    this.#settleSpec(gate, { ok: false, error });
+    this.#sendSpecFailureFollowUp(gate.input, error);
+  }
+  #settleSpec(gate: SpecGate, result: SpecGeneratorResult): void { if (["settled", "closed"].includes(gate.state)) return; gate.state = "settled"; gate.active = false; this.#closeSpecObservation(gate); gate.resolve(result); }
   #closeSpecOwner(owner: symbol): void { const gate = this.#activeSpec; if (gate?.owner === owner) this.#closeSpecGate(gate); }
-  #closeSpecGate(gate: SpecGate): void { if (["settled", "closed"].includes(gate.state)) return; gate.state = "closed"; gate.active = false; gate.resolve({ ok: false, error: { code: "generation-cancelled", message: "Spec generation was cancelled." } }); }
+  #closeSpecGate(gate: SpecGate): void { if (["settled", "closed"].includes(gate.state)) return; gate.state = "closed"; gate.active = false; this.#closeSpecObservation(gate); gate.resolve({ ok: false, error: { code: "generation-cancelled", message: "Spec generation was cancelled." } }); }
+  #closeSpecObservation(gate: SpecGate): void {
+    gate.stopReportObservation?.(); gate.stopReportObservation = undefined;
+    gate.teams?.close();
+  }
 
   async #generate(owner: symbol, input: PlanGeneratorInput, activity?: CurrentAgentActivity, writerEndpoint?: string): Promise<PlanGeneratorResult> {
     const validated = validateGeneratorInput(input);
@@ -475,7 +555,7 @@ export class CurrentAgentPlanBridge {
     }
     let validated: PlanGeneratorResult;
     if (input.kind === "plan") {
-      if (gate.input.operation === "grill") return this.#rejectWriterResult(gate, failed("invalid-grill", "Grill jobs require a strict JSON Grill result."));
+      if (gate.input.operation === "grill") return this.#rejectWriterResult(gate, failed("invalid-grill", "Adversarial Review jobs require a strict JSON result."));
       let markdown: string;
       try { markdown = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(input.body); }
       catch { return this.#rejectWriterResult(gate, failed("invalid-utf8", "The plan submission must be valid UTF-8.")); }
@@ -489,7 +569,7 @@ export class CurrentAgentPlanBridge {
       try { text = new TextDecoder("utf-8", { fatal: true }).decode(input.body); }
       catch {
         if (input.kind === "clarification") this.#settle(gate, failed("invalid-writer-result", "The writer could not submit a valid clarification batch."));
-        if (input.kind === "grill") this.#settle(gate, failed("invalid-grill", "The Grill submission must be valid UTF-8."));
+        if (input.kind === "grill") this.#settle(gate, failed("invalid-grill", "The Adversarial Review submission must be valid UTF-8."));
         return dispatchFailed(input.kind === "grill" ? "invalid-grill" : "invalid-utf8", `The ${input.kind} submission must be valid UTF-8.`);
       }
       const parsed = parseStrictJsonObject(text, { maxBytes: input.kind === "grill" ? MAX_GRILL_RESULT_BYTES : MAX_WRITER_RESULT_BYTES, maxDepth: 14 });
@@ -621,15 +701,20 @@ export class CurrentAgentPlanBridge {
 
   #grillMission(gate: Gate): string {
     return [
-      "## Controller-owned Grill critique mission",
+      "## Controller-owned Adversarial Review mission",
       `Current plan path: ${planFilePath(this.#planRoot, gate.input.session.id)}`,
-      `Grill result path: ${writerGrillFilePath(this.#planRoot, gate.input.session.id)}`,
+      `Adversarial Review result path: ${writerGrillFilePath(this.#planRoot, gate.input.session.id)}`,
       `Current document revision: ${gate.input.session.documentRevision}`,
-      "Read exactly the current plan.md and this bounded canonical public anchor map. Critique assumptions, risks, ambiguities, and decision points without changing plan.md or any other file.",
+      "Treat the current Plan as immutable source material. Read exactly plan.md and the bounded canonical public anchor map below. Do not inspect the repository or working directory, and do not change plan.md or any other file.",
       `Canonical public anchor map (the complete current document projection, including revision chunks):\n${this.#grillAnchorMap(gate)}`,
       "Use only document and element IDs in this map. Range offsets are zero-based, half-open Unicode code points (not UTF-16). Do not copy quoted exact/prefix/suffix text already present in the Plan; use flat range targets and let the controller derive it.",
-      `Write exactly this JSON shape, replacing example values: {"kind":"grill","basedOnDocumentRevision":${gate.input.session.documentRevision},"annotations":{"risk":{"target":{"kind":"range","elementId":"anchor-id","field":"body","start":0,"end":4},"body":"State the concern."}},"decisionTree":{"nodes":[{"id":"root","question":"Proceed?","annotationKeys":["risk"],"options":[{"id":"yes","label":"Yes","decision":"Proceed."},{"id":"no","label":"No","decision":"Revise."}]}]}}`,
-      "A canonical selector range target is also accepted. Omit rootNodeId only when nextNodeId edges have exactly one zero-indegree root. Every annotation key appears exactly once; each option has exactly one nextNodeId or decision; nodes are reachable and acyclic. No findings is annotations {} with decisionTree {nodes:[]}.",
+      "Apply these bounded goal-backward gates in order, then retain at most eight material, evidence-backed findings: (1) derive concise observable truths from the Plan's intended outcome; (2) verify each truth has substantive planned artifacts or actions rather than names, placeholders, or setup alone; (3) verify the critical wiring between those artifacts or actions is explicitly planned end to end; (4) verify tasks are atomic, complete, concretely actionable, and ordered after their real dependencies; (5) detect silent scope reduction or expansion, internal contradictions, vague or unverifiable acceptance criteria, and missing relevant failure, rollback, operability, or test coverage; (6) detect conflicts with decisions or context stated in the Plan. Do not penalize stylistic preferences, invent requirements, or emit generic praise, speculation, or low-impact commentary.",
+      "Map each retained finding to one existing classification by using a stable annotation key prefixed risk-, ambiguity-, missing-decision-, contradiction-, test-gap-, adr-candidate-, or glossary-. Do not add a classification field or any other result field. State the Plan evidence and the concrete correction or decision needed in the annotation body. Attach it to the narrowest honest Plan target. Preserve user-authored notes as separate provenance.",
+      "Use the decisionTree only to organize retained findings and material decisions. Reference every annotation key exactly once. A node's options array may be empty or contain a single option; never fabricate alternatives to satisfy a cardinality. Add multiple options only when a genuine unresolved choice changes implementation, and make consequences explicit. Do not reopen a decision already resolved by the Plan or supplied context.",
+      "This is an adapted checker technique, not adoption of Open GSD's planning system. Do not create or require .planning directories; ROADMAP, CONTEXT, REQUIREMENTS, or VERIFICATION files; must_haves; requirement IDs; waves or frontmatter; XML task blocks; or any GSD report format.",
+      "Do not reveal chain-of-thought or analysis. Output only the structured JSON findings. Do not implement the Plan, create documentation, publish issues, commit, push, deploy, install, or start services.",
+      `Write exactly this JSON shape, replacing example values but adding no fields: {"kind":"grill","basedOnDocumentRevision":${gate.input.session.documentRevision},"annotations":{"risk-example":{"target":{"kind":"range","elementId":"anchor-id","field":"body","start":0,"end":4},"body":"Plan evidence and the material correction needed."}},"decisionTree":{"nodes":[{"id":"root","question":"Material findings","annotationKeys":["risk-example"],"options":[]}]}}`,
+      "A canonical selector range target is also accepted. Omit rootNodeId only when nextNodeId edges have exactly one zero-indegree root. Every annotation key appears exactly once; each option has exactly one nextNodeId or decision; nodes are reachable and acyclic. No material findings is annotations {} with decisionTree {nodes:[]}.",
       `Upload the exact result bytes and do not edit them afterward:\n${this.#grillUpload(gate)}`,
       "Modify only grill-result.json. Do not call pi_prompt_submit_plan.",
     ].join("\n\n");
@@ -681,7 +766,7 @@ export class CurrentAgentPlanBridge {
   }
 
   #correctionMission(gate: Gate, delegated = true): string {
-    if (gate.input.operation === "grill") return [this.#grillMission(gate), `Validation feedback: ${gate.correctionFeedback ?? "The submitted Grill result was invalid."}`, "Fix only the validation feedback and re-upload."].join("\n\n");
+    if (gate.input.operation === "grill") return [this.#grillMission(gate), `Validation feedback: ${gate.correctionFeedback ?? "The submitted Adversarial Review result was invalid."}`, "Fix only the validation feedback and re-upload."].join("\n\n");
     return [
       "## Saved plan correction",
       `Plan path: ${planFilePath(this.#planRoot, gate.input.session.id)}`,
@@ -693,7 +778,7 @@ export class CurrentAgentPlanBridge {
   }
 
   #visibleRunMarker(gate: Gate, run: RunKind, verbose: boolean): string {
-    const kind = run === "correction" ? "correction" : gate.input.operation === "revision" ? "revision" : gate.input.operation === "grill" ? "Grill critique" : "creation";
+    const kind = run === "correction" ? "correction" : gate.input.operation === "revision" ? "revision" : gate.input.operation === "grill" ? "Adversarial Review" : "creation";
     const concise = `pi-prompt plan ${kind} in progress`;
     if (!verbose) return concise;
     return [concise, "server initialized...", `id: ${gate.input.session.id}`, "", `prompt: ${gate.input.session.source.prompt}`].join("\n");

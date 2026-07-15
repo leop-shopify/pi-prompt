@@ -9,7 +9,7 @@ export function renderPlan(snapshot, treeNode, _onComment, onEdit, busy = false,
   }
   const visible = snapshot.annotations.filter((note) => stage === "grill" || note.author !== "grill");
   const projection = projectPlanAnnotations(markdown, snapshot.document, visible); const selected = new Set(selectedAnnotationIds);
-  const surface = element("pre", { className: "plan-markdown", dataset: { commentSurface: stage }, tabIndex: 0, "aria-label": `${stage === "grill" ? "Grill review of" : "Plan"} Markdown revision ${snapshot.documentRevision ?? "current"}` }, annotatedNodes(markdown, projection.inline, onEdit, busy, selected, onToggleSelection));
+  const surface = element("pre", { className: "plan-markdown", dataset: { commentSurface: stage }, tabIndex: 0, "aria-label": `${stage === "grill" ? "Adversarial Review of" : "Plan"} Markdown revision ${snapshot.documentRevision ?? "current"}` }, annotatedNodes(markdown, projection.inline, onEdit, busy, selected, onToggleSelection));
   surface.planProjection = projection.fields; surface.planDocumentId = snapshot.document.id;
   const fallback = projection.fallback.length
     ? [element("div", { className: "root-annotation-badges", "aria-label": "Plan-level and unmatched comments" }, projection.fallback.map((note) => annotationBadge(note, onEdit, busy, true, selected, onToggleSelection)))]
@@ -53,7 +53,7 @@ function projectDocumentFields(markdown, document) {
 }
 
 export function renderSpec(snapshot, target, onEdit, busy = false) {
-  if (!snapshot?.markdown) { replaceChildren(target, [placeholder(snapshot?.job ? "The Spec is being generated" : "No Spec yet", snapshot?.job ? "The independent Spec snapshot will appear here automatically." : "Generate To Spec from the current Plan and Grill.")]); return; }
+  if (!snapshot?.markdown) { replaceChildren(target, [placeholder(snapshot?.job ? "The Spec is being generated" : "No Spec yet", snapshot?.job ? "The independent Spec snapshot will appear here automatically." : "Generate To Spec from the current Plan and Adversarial Review.")]); return; }
   const notes = snapshot.comments.filter((comment) => comment.status !== "orphaned").map((comment) => ({ ...comment, author: "user", target: { selector: comment.target } }));
   const pre = element("pre", { className: "spec-markdown", dataset: { commentSurface: "spec" }, tabIndex: 0, "aria-label": `Implementation Spec revision ${snapshot.specRevision}` }, annotatedNodes(snapshot.markdown, notes, onEdit, busy));
   const orphaned = snapshot.comments.filter((comment) => comment.status === "orphaned");
@@ -84,7 +84,7 @@ function annotatedNodes(text, notes, onEdit, busy, selected = new Set(), onToggl
   return nodes;
 }
 function annotationBadge(note, onEdit, busy, fallback, selectedIds = new Set(), onToggleSelection = () => {}) {
-  const generated = note.author === "grill"; const selectable = generated && note.status === "open"; const selected = selectable && selectedIds.has(note.id); const provenance = generated ? "Grill critique" : "Your comment"; const status = note.locked ? `${note.status}, locked` : note.status;
+  const generated = note.author === "grill"; const selectable = generated && note.status === "open"; const selected = selectable && selectedIds.has(note.id); const provenance = generated ? "Adversarial Review finding" : "Your comment"; const status = note.locked ? `${note.status}, locked` : note.status;
   const selection = selectable ? ` ${selected ? "Selected" : "Not selected"} for Plan revision. Press Enter to ${selected ? "deselect" : "select"} and review.` : "";
   const label = `${provenance}: ${note.body}. Status: ${status}.${generated ? ` Generated text is read-only.${selection}` : " Press Enter to edit."}`;
   const badge = element("button", { type: "button", className: `annotation-badge author-${generated ? "grill" : "user"} status-${note.status}${selected ? " is-selected" : ""}${fallback ? " annotation-fallback" : ""}`, title: label, disabled: busy,

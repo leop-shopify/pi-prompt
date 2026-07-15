@@ -65,6 +65,28 @@ describe("pi-extended-teams planning adapter", () => {
     expect(phases).toEqual(["primary-starting", "primary-active", "waiting-report"]);
   });
 
+  it("optionally blocks swarms and every parent spawn after the one canonical writer", () => {
+    const adapter = new TeamsPlanningAdapter({
+      primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "WRITE SPEC MISSION", modelSlot: "writing-hard",
+      onPhase: vi.fn(), onReport: vi.fn(), onProgress: vi.fn(), strictSingleSpawn: true,
+    });
+    const earlySwarm = call("spawn_swarm_agents", { prompts: ["attacker"] });
+    expect(adapter.handleToolCall(earlySwarm)).toMatchObject({ block: true });
+    expect(earlySwarm.input).toEqual({ prompts: ["attacker"] });
+
+    const first = call("spawn_agent", { prompt: "attacker", model_slot: "writing-basic", extra: true });
+    expect(adapter.handleToolCall(first)).toBeUndefined();
+    expect(first.input).toEqual({
+      prompt: "WRITE SPEC MISSION", model_slot: "writing-hard", name: "planner-private", cwd: "/repo",
+      metadata: { piPromptPlanning: { version: 1, correlation: "correlation-private" } },
+    });
+    const extra = call("spawn_agent", { prompt: "second", model_slot: "writing-basic" });
+    expect(adapter.handleToolCall(extra)).toMatchObject({ block: true });
+    expect(extra.input).toEqual({ prompt: "second", model_slot: "writing-basic" });
+    expect(adapter.handleToolCall(call("spawn_swarm_agents"))).toMatchObject({ block: true });
+    expect(adapter.primaryCount).toBe(1);
+  });
+
   it("reports only sanitized resolved model metadata for the selected slot", () => {
     const models = vi.fn();
     const adapter = new TeamsPlanningAdapter({

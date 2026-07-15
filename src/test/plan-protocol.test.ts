@@ -6,7 +6,7 @@ const privateState: PlanSession = {
   schemaVersion: 1, id: "session", stateVersion: 9, documentRevision: 2, status: "revising",
   source: { prompt: "SECRET PROMPT", cwd: "/private/cwd", skills: [{ name: "secret", path: "/private/SKILL.md", baseDir: "/private", sha256: "d".repeat(64) }] },
   execution: { kind: "goal" }, generation: { mode: "careful" },
-  generationJob: { jobId: "private-job", operation: "revision", baseDocumentRevision: 2, selectedAnnotationIds: ["note"], instruction: "PRIVATE INSTRUCTION", startedAt: "2026-07-10T00:00:00.000Z" },
+  generationJob: { jobId: "opaque-public-job", operation: "revision", baseDocumentRevision: 2, selectedAnnotationIds: ["note"], instruction: "PRIVATE INSTRUCTION", startedAt: "2026-07-10T00:00:00.000Z" },
   document: { id: "document", title: { id: "title", kind: "title", body: "<img src=x onerror=alert(1)>", children: [] }, elements: [{ id: "execution", kind: "execution", body: "/goal (read only)", children: [] }] },
   annotations: [{ id: "note", target: { kind: "element", elementId: "execution" }, targetSnapshot: { documentRevision: 2, target: { kind: "element", elementId: "execution" }, elementKind: "execution", text: "/goal (read only)" }, body: "literal <script>hostile()</script>", status: "open", history: [], createdAgainstRevision: 2, createdAt: "2026-07-10T00:00:00.000Z", updatedAt: "2026-07-10T00:00:00.000Z" }],
 };
@@ -24,7 +24,8 @@ describe("browser protocol", () => {
     expect(snapshot.id).toBe("session");
     expect(snapshot.document?.title.body).toBe("<img src=x onerror=alert(1)>");
     expect(snapshot.annotations[0]).toMatchObject({ author: "user", body: "literal <script>hostile()</script>", locked: true, targetSummary: { label: "Execution" } });
-    expect(snapshot.job).toEqual({ operation: "revision", baseDocumentRevision: 2, startedAt: "2026-07-10T00:00:00.000Z" });
+    expect(snapshot.job).toEqual({ id: "opaque-public-job", operation: "revision", baseDocumentRevision: 2, startedAt: "2026-07-10T00:00:00.000Z" });
+    expect(Object.keys(snapshot.job!)).toEqual(["id", "operation", "baseDocumentRevision", "startedAt"]);
     expect(snapshot.originalPrompt).toBe(privateState.source.prompt);
     expect(snapshot.promptPreview).toBe(privateState.source.prompt);
     expect(snapshot.actions).toEqual({ canRetryGeneration: false, canRetryStaging: false });
@@ -36,7 +37,7 @@ describe("browser protocol", () => {
       timeline: [{ phase: "capability-detected", at: "2026-07-10T00:00:00.000Z" }, { phase: "waiting-report", at: "2026-07-10T00:01:00.000Z" }],
     });
     const encoded = JSON.stringify(snapshot);
-    for (const secret of ["/private/cwd", "/private/SKILL.md", "PRIVATE INSTRUCTION", "PRIVATE TRAILING", "PRIVATE MODEL", "PRIVATE TEAM", "private-job", "selectedAnnotationIds", "sha256", "baseDir", "digest", "token", "stack", "REPORT SECRET", "spawn_agent", "NONCE SECRET", "privateReport", "toolName", "teamName"]) expect(encoded).not.toContain(secret);
+    for (const secret of ["/private/cwd", "/private/SKILL.md", "PRIVATE INSTRUCTION", "PRIVATE TRAILING", "PRIVATE MODEL", "PRIVATE TEAM", "selectedAnnotationIds", "jobId", "sha256", "baseDir", "digest", "token", "stack", "REPORT SECRET", "spawn_agent", "NONCE SECRET", "privateReport", "toolName", "teamName"]) expect(encoded).not.toContain(secret);
     expect(encoded).not.toContain("targetSnapshot");
   });
 

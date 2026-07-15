@@ -41,7 +41,7 @@ export function writerQuestionsFilePath(rootDir: string, sessionId: string): str
   return join(planSessionDirectory(rootDir, sessionId), "questions.json");
 }
 
-/** Local writer draft path; canonical Grill state is repository-owned grill.json. */
+/** Local writer draft path; canonical Adversarial Review state is repository-owned grill.json. */
 export function writerGrillFilePath(rootDir: string, sessionId: string): string {
   return join(planSessionDirectory(rootDir, sessionId), "grill-result.json");
 }

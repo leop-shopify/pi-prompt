@@ -199,12 +199,12 @@ export class PlanController {
 
   async updateAnnotationBody(input: VersionedInput & { readonly annotationId: string; readonly body: string }): Promise<PlanControllerResult> {
     return this.#updateAnnotation(input, (annotation) => annotation.author === "grill"
-      ? failure("generated-annotation-immutable", "Generated Grill annotation bodies are immutable.")
+      ? failure("generated-annotation-immutable", "Generated Adversarial Review finding bodies are immutable.")
       : success({ ...annotation, body: normalizePlanText(input.body), updatedAt: this.#now() }));
   }
   async transitionAnnotation(input: VersionedInput & { readonly annotationId: string; readonly status: AnnotationStatus }): Promise<PlanControllerResult> {
     return this.#updateAnnotation(input, (annotation) => {
-      if (annotation.author === "grill" && !((annotation.status === "open" && input.status === "dismissed") || (annotation.status === "dismissed" && input.status === "open"))) return failure("generated-annotation-immutable", "Generated Grill annotations may only transition between open and dismissed.");
+      if (annotation.author === "grill" && !((annotation.status === "open" && input.status === "dismissed") || (annotation.status === "dismissed" && input.status === "open"))) return failure("generated-annotation-immutable", "Generated Adversarial Review findings may only transition between open and dismissed.");
       const changed = transitionAnnotationStatus(annotation, input.status, { actor: "user", now: this.#now() });
       return changed.ok ? success(changed.value) : validationFailure(changed.issues);
     });
@@ -339,7 +339,7 @@ export class PlanController {
       if (effectiveOperation !== operation) return failure("clarification-conflict", "The resumable clarification operation does not match this request.");
       if (operation === "initial" && (current.value.document || !["paused", "error"].includes(current.value.status))) return failure("invalid-status", "Initial generation requires an empty paused or error session.");
       if (operation === "revision" && (!current.value.document || !["ready", "error"].includes(current.value.status))) return failure("invalid-status", "Revision requires a materialized ready or error session.");
-      if (operation === "grill" && (!current.value.document || !["ready", "error"].includes(current.value.status))) return failure("invalid-status", "Grill requires a materialized ready or safely failed session.");
+      if (operation === "grill" && (!current.value.document || !["ready", "error"].includes(current.value.status))) return failure("invalid-status", "Adversarial Review requires a materialized ready or safely failed session.");
       if (new Set(effectiveSelectedIds).size !== effectiveSelectedIds.length || effectiveSelectedIds.some((id) => !current.value.annotations.some((annotation) => annotation.id === id))) return failure("invalid-annotations", "Selected annotation IDs must be unique and current.");
       const allocated = this.#allocateId(); if (!allocated.ok) return allocated;
       const runtime = { id: allocated.value, abort: new AbortController() };
@@ -388,17 +388,17 @@ export class PlanController {
     }
     const outcome = result.outcome;
     if (job.operation === "grill") {
-      if (outcome.kind !== "grill" || !state.document || outcome.basedOnDocumentRevision !== state.documentRevision) return this.#commitGenerationError(state, "invalid-grill-result", "The Grill critique could not be applied safely.");
+      if (outcome.kind !== "grill" || !state.document || outcome.basedOnDocumentRevision !== state.documentRevision) return this.#commitGenerationError(state, "invalid-grill-result", "The Adversarial Review result could not be applied safely.");
       const reserved = new Set(this.#reserved); const generated = []; const annotationIds: Record<string, string> = Object.create(null) as Record<string, string>;
       const projection = isMarkdownPlanProjection(state.document, state.documentRevision) && projectionMarkdown(state.document) === state.committedMarkdown;
       for (const [key, draft] of Object.entries(outcome.annotations)) {
-        const target = canonicalGrillTarget(state.document, draft.target); if (!target.ok) return this.#commitGenerationError(state, "invalid-grill-anchor", "A Grill annotation did not match the current plan.");
+        const target = canonicalGrillTarget(state.document, draft.target); if (!target.ok) return this.#commitGenerationError(state, "invalid-grill-anchor", "An Adversarial Review finding did not match the current plan.");
         const projectionId = projection ? this.#allocateId(reserved) : undefined;
-        if (projectionId && !projectionId.ok) return this.#commitGenerationError(state, "invalid-grill-anchor", "A Grill annotation ID could not be allocated safely.");
+        if (projectionId && !projectionId.ok) return this.#commitGenerationError(state, "invalid-grill-anchor", "An Adversarial Review finding ID could not be allocated safely.");
         const made = projection
           ? createProjectionAnnotation(state.document, state.documentRevision, target.value, draft.body, projectionId!.value, this.#now())
           : createAnnotation(state.document, state.documentRevision, target.value, draft.body, { idFactory: this.#options.idFactory, reservedIds: reserved, now: this.#now() });
-        if (!made.ok) return this.#commitGenerationError(state, "invalid-grill-anchor", "A Grill annotation did not match the current plan.");
+        if (!made.ok) return this.#commitGenerationError(state, "invalid-grill-anchor", "An Adversarial Review finding did not match the current plan.");
         reserved.add(made.value.id); annotationIds[key] = made.value.id; generated.push({ ...made.value, author: "grill" as const });
       }
       const artifact = { basedOnDocumentRevision: state.documentRevision, annotationIds: Object.fromEntries(Object.entries(annotationIds)), decisionTree: outcome.decisionTree, generatedAt: this.#now() };

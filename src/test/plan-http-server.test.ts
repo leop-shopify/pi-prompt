@@ -98,7 +98,7 @@ describe("secure plan HTTP host", () => {
     try {
       expect((await fetch(`${host.origin}/api/v1/plan`)).status).toBe(401);
       const response = await fetch(`${host.origin}/api/v1/plan`, { headers: auth(host) });
-      expect(response.status).toBe(200); expect(response.headers.get("content-type")).toContain("text/markdown");
+      expect(response.status).toBe(200); expect(response.headers.get("content-type")).toContain("text/markdown"); expect(response.headers.get("etag")).toBe('"pi-plan-state-3"');
       const decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await response.arrayBuffer());
       expect(decoded).toBe(markdown); expect(decoded.codePointAt(0)).toBe(0xfeff);
     } finally { await host.close(); }

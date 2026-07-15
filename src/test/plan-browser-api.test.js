@@ -47,7 +47,7 @@ describe("browser review capability", () => {
     const markdownResponse = (body, etag) => new Response(new TextEncoder().encode(body), { status: 200, headers: { "Content-Type": "text/markdown; charset=utf-8", ETag: etag } });
     const fetchImpl = vi.fn().mockResolvedValueOnce(markdownResponse(plan, '"pi-plan-state-3"')).mockResolvedValueOnce(markdownResponse(spec, '"pi-spec-state-7"'));
     const api = createPlanApi("a".repeat(43), fetchImpl);
-    expect(await api.plan()).toBe(plan); expect(await api.specMarkdown()).toBe(spec);
+    expect(await api.plan()).toEqual({ markdown: plan, etag: '"pi-plan-state-3"', stateVersion: 3 }); expect(await api.specMarkdown()).toBe(spec);
   });
 
   it("decodes Markdown as fatal UTF-8 without changing HTTP failure handling", async () => {
@@ -78,7 +78,17 @@ describe("browser review capability", () => {
       .mockResolvedValueOnce(response({ snapshot: { stateVersion: 7 } }, '"pi-spec-state-7"'))
       .mockResolvedValueOnce(response({ snapshot: { stateVersion: 4 } }, '"pi-plan-state-4"'))
       .mockResolvedValueOnce(response({ snapshot: { stateVersion: 8 } }, '"pi-spec-state-8"'));
-    const api = createPlanApi("a".repeat(43), fetchImpl); await api.snapshot(); await api.specSnapshot(); await api.mutate("/api/v1/grill-runs", "POST", { requestId: "request-id-plan-0001" }); await api.specMutate("/api/v1/spec/generations", "POST", { requestId: "request-id-spec-0001" });
+    const api = createPlanApi("a".repeat(43), fetchImpl); const plan = await api.snapshot(); const spec = await api.specSnapshot(); api.setVersion(plan.stateVersion); api.setSpecVersion(spec.stateVersion); await api.mutate("/api/v1/grill-runs", "POST", { requestId: "request-id-plan-0001" }); await api.specMutate("/api/v1/spec/generations", "POST", { requestId: "request-id-spec-0001" });
     expect(fetchImpl.mock.calls[2][1].headers["If-Match"]).toBe('"pi-plan-state-3"'); expect(fetchImpl.mock.calls[3][1].headers["If-Match"]).toBe('"pi-spec-state-7"');
+  });
+
+  it("reports a missing or malformed Plan state ETag as an incoherent Markdown version", async () => {
+    globalThis.window = { location: { origin: "http://127.0.0.1:4567" } };
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response("# Missing\n", { status: 200 }))
+      .mockResolvedValueOnce(new Response("# Weak\n", { status: 200, headers: { ETag: 'W/"pi-plan-state-4"' } }));
+    const api = createPlanApi("a".repeat(43), fetchImpl);
+    expect(await api.plan()).toEqual({ markdown: "# Missing\n", etag: null, stateVersion: null });
+    expect(await api.plan()).toEqual({ markdown: "# Weak\n", etag: 'W/"pi-plan-state-4"', stateVersion: null });
   });
 });
