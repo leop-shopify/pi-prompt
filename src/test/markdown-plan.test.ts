@@ -3,13 +3,12 @@ import { planOutcomeFromMarkdown } from "../plan/markdown-plan.js";
 import type { PlanSession } from "../plan/types.js";
 
 const session: PlanSession = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   id: "session",
   stateVersion: 2,
   documentRevision: 0,
   status: "generating",
-  source: { prompt: "Build it", cwd: "/repo", skills: [] },
-  execution: { kind: "normal" },
+  source: { prompt: "Build it", cwd: "/repo" },
   generation: { mode: "normal" },
   document: null,
   annotations: [],

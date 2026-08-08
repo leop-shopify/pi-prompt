@@ -6,9 +6,9 @@ import type { PlanController } from "../plan/controller.js";
 import type { PlanSession } from "../plan/types.js";
 import type { PromptEditorSubmission } from "../prompt-editor/types.js";
 
-const submission: PromptEditorSubmission = { text: "Build it", mode: "careful", execution: { kind: "normal" }, selectedSkills: [], saveAsTemplate: false };
+const submission: PromptEditorSubmission = { text: "Build it", mode: "careful", saveAsTemplate: false };
 function empty(status: "paused" | "generating" = "paused"): PlanSession {
-  return { schemaVersion: 1, id: "session", stateVersion: status === "paused" ? 1 : 2, documentRevision: 0, status, source: { prompt: "Build it", cwd: "/repo", skills: [] }, execution: { kind: "normal" }, generation: { mode: "careful" }, document: null, annotations: [], ...(status === "generating" ? { generationJob: { jobId: "job", operation: "initial" as const, baseDocumentRevision: 0, selectedAnnotationIds: [], startedAt: "2026-07-11T00:00:00.000Z" } } : {}) };
+  return { schemaVersion: 2, id: "session", stateVersion: status === "paused" ? 1 : 2, documentRevision: 0, status, source: { prompt: "Build it", cwd: "/repo" }, generation: { mode: "careful" }, document: null, annotations: [], ...(status === "generating" ? { generationJob: { jobId: "job", operation: "initial" as const, baseDocumentRevision: 0, selectedAnnotationIds: [], startedAt: "2026-07-11T00:00:00.000Z" } } : {}) };
 }
 function ready(): PlanSession { return { ...empty(), stateVersion: 3, documentRevision: 1, status: "ready", document: { id: "doc", title: { id: "title", kind: "title", body: "Plan", children: [] }, elements: [{ id: "execution", kind: "execution", body: "Normal", children: [] }] } }; }
 function context(): ExtensionContext { return { cwd: "/repo", mode: "tui", isIdle: () => true, ui: { notify: vi.fn(), confirm: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn(), setEditorText: vi.fn() }, sessionManager: { getBranch: () => [] } } as unknown as ExtensionContext; }
@@ -23,7 +23,7 @@ function controllerHarness() {
     generate: vi.fn(async () => { state = empty("generating"); return { ok: true, value: { jobId: "job", completion } }; }),
     dispatchGeneration: vi.fn(() => ({ ok: true, value: undefined })),
     pause: vi.fn(async () => { state = { ...state, stateVersion: state.stateVersion + 1, status: "paused", generationJob: undefined } as PlanSession; return { ok: true, value: undefined }; }),
-    verifySkills: vi.fn(async () => ({ ok: true, value: undefined })), resumeReview: vi.fn(async () => ({ ok: true, value: undefined })),
+    resumeReview: vi.fn(async () => ({ ok: true, value: undefined })),
     acceptedStagingPending: vi.fn(() => false), accept: vi.fn(), close: vi.fn(async () => undefined),
     setReady: () => { state = ready(); },
     cancelPlan: () => { state = { ...state, stateVersion: state.stateVersion + 1, status: "cancelled", generationJob: undefined } as PlanSession; for (const listener of listeners) listener({ kind: "cancelled", sessionId: state.id, status: "cancelled", stateVersion: state.stateVersion, documentRevision: state.documentRevision }); },
@@ -33,7 +33,7 @@ function controllerHarness() {
   return controller as unknown as PlanController & typeof controller;
 }
 function runtimeFor(controller: PlanController, review: any) {
-  const create = vi.fn(async () => ({ ok: true as const, value: { controller, loadedSkills: { references: [], contexts: [] } } }));
+  const create = vi.fn(async () => ({ ok: true as const, value: { controller } }));
   const recover = vi.fn(async () => ({ ok: true as const, value: { controller, state: controller.snapshot(), warnings: [], reservedIds: [] } }));
   const planDrafts = { upsert: vi.fn(async () => undefined), remove: vi.fn(async () => undefined) };
   return { runtime: createPromptExtensionRuntime({ controllers: { create, recover } as unknown as ControllerStackFactory, review, editor: { open: vi.fn() }, planDrafts }), create, recover, planDrafts };
@@ -104,10 +104,6 @@ describe("extension runtime", () => {
         state = { ...state, stateVersion: 9, status: "paused", generationJob: undefined } as PlanSession;
         return { ok: true, value: undefined };
       }),
-      verifySkills: vi.fn(async ({ expectedStateVersion }: { expectedStateVersion: number }) => {
-        expect(expectedStateVersion).toBe(9);
-        return { ok: true, value: undefined };
-      }),
       resumeReview: vi.fn(async ({ expectedStateVersion }: { expectedStateVersion: number }) => {
         expect(expectedStateVersion).toBe(9);
         state = { ...state, stateVersion: 10, status: "ready" } as PlanSession;
@@ -142,7 +138,6 @@ describe("extension runtime", () => {
     let state = interrupted; const completion = new Promise<any>(() => undefined);
     const controller = {
       snapshot: vi.fn(() => state), close: vi.fn(async () => undefined), acceptedStagingPending: vi.fn(() => false),
-      verifySkills: vi.fn(async () => ({ ok: true, value: undefined })),
       resumeClarification: vi.fn(async () => {
         expect(state.clarifications).toEqual(interrupted.clarifications);
         state = { ...state, status: "revising", stateVersion: 9, generationJob: { jobId: "continued-job", ...interrupted.clarifications!.origin!, startedAt: "2026-07-11T00:02:00.000Z" } } as PlanSession;

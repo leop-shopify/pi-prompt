@@ -102,24 +102,26 @@ describe("extension registration", () => {
     );
   });
 
-  it("moves shortcut text into the editor and preserves selected options on reopen", async () => {
+  it("moves shortcut text into the editor and preserves only generation mode on reopen", async () => {
     const { pi, commands, shortcuts } = makePi();
     const runtime = makeRuntime();
     const runEditor = vi.fn()
-      .mockResolvedValueOnce({ kind: "generate", submission: { text: "first", mode: "careful", execution: { kind: "loop" }, selectedSkills: ["test-expert"], saveAsTemplate: false } })
+      .mockResolvedValueOnce({ kind: "generate", submission: { text: "first", mode: "careful", saveAsTemplate: false } })
       .mockResolvedValueOnce({ kind: "exit" })
       .mockResolvedValueOnce({ kind: "exit" });
     registerPromptExtension(pi, { runtime, runEditor });
     const commandCtx = ctx();
     await commands.get("prompt").handler("", commandCtx);
-    expect(runtime.generate).toHaveBeenCalledWith(commandCtx, expect.objectContaining({ selectedSkills: ["test-expert"] }));
+    expect(runtime.generate).toHaveBeenCalledWith(commandCtx, { text: "first", mode: "careful", saveAsTemplate: false });
     await commands.get("prompt").handler("", commandCtx);
-    expect(runEditor.mock.calls[1]?.[2]).toMatchObject({ mode: "careful", execution: { kind: "loop" }, selectedSkills: ["test-expert"] });
+    expect(runEditor.mock.calls[1]?.[2]).toMatchObject({ mode: "careful" });
+    expect(runEditor.mock.calls[1]?.[2]).not.toHaveProperty("execution");
+    expect(runEditor.mock.calls[1]?.[2]).not.toHaveProperty("selectedSkills");
 
-    const shortcutCtx = ctx("half-written");
+    const shortcutCtx = ctx("half-written\nsecond line");
     await shortcuts.get("ctrl+alt+p").handler(shortcutCtx as unknown as ExtensionContext);
     expect(shortcutCtx.ui.setEditorText).toHaveBeenCalledWith("");
-    expect(runEditor.mock.calls[2]?.[2]).toMatchObject({ text: "half-written" });
+    expect(runEditor.mock.calls[2]?.[2]).toMatchObject({ text: "half-written\nsecond line" });
   });
 
   it("wires public lifecycle events to close before tree and rescan afterward", async () => {

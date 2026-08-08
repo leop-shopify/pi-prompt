@@ -1,16 +1,16 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { PlanController, type CreatePlanInput, type LoadedPrivateSkills, type PlanControllerStager } from "../plan/controller.js";
+import { PlanController, type CreatePlanInput, type PlanControllerStager } from "../plan/controller.js";
 import type { PlanBranchEntry } from "../plan/locator.js";
 import { recoverPlanFromBranch } from "../plan/recovery.js";
 import { createPlanRepository, type PlanRecoveryWarning } from "../plan/repository.js";
 import type { PlanSession, SafeError } from "../plan/types.js";
-import { captureSkills, createAppendLocator, createSkillPort, safeRuntimeId } from "./pi-adapters.js";
+import { createAppendLocator, safeRuntimeId } from "./pi-adapters.js";
 import { registerLivePlanActivity, updateLivePlanActivity, type MutableLivePlanActivity } from "./live-activity.js";
 import { showPlanProgress } from "./progress.js";
 import type { CurrentAgentPlanBridge } from "./current-agent-bridge.js";
 
-export interface NewControllerInput extends Omit<CreatePlanInput, "skills"> { readonly selectedSkillNames: readonly string[] }
-export interface CreatedControllerStack { readonly controller: PlanController; readonly loadedSkills: LoadedPrivateSkills }
+export type NewControllerInput = CreatePlanInput;
+export interface CreatedControllerStack { readonly controller: PlanController }
 export interface RecoveredControllerStack {
   readonly controller: PlanController | null; readonly state: PlanSession | null;
   readonly warnings: readonly PlanRecoveryWarning[]; readonly reservedIds: readonly string[];
@@ -32,22 +32,18 @@ export function createControllerStackFactory(pi: ExtensionAPI, bridge: CurrentAg
       });
     });
     return { activity, options: {
-      repository, generator, appendLocator: createAppendLocator(pi), skills: createSkillPort(pi),
+      repository, generator, appendLocator: createAppendLocator(pi),
       idFactory: safeRuntimeId, clock: () => new Date(), stager: createAcceptedPlanSubmitter(pi, ctx),
     } };
   };
   return {
     async create(ctx, input) {
-      const loaded = await captureSkills(pi, input.selectedSkillNames);
-      if (!loaded.ok) return failed("skill-context-unavailable", "Selected skill context is unavailable or changed.");
       const repository = createPlanRepository();
       const built = buildOptions(ctx, repository, input.prompt);
-      const controller = await PlanController.create(built.options, {
-        prompt: input.prompt, cwd: input.cwd, skills: loaded.value.references, execution: input.execution, mode: input.mode,
-      });
+      const controller = await PlanController.create(built.options, input);
       if (!controller.ok) { await built.options.generator.close(); await repository.close(); return controller; }
       registerLivePlanActivity(controller.value, built.activity);
-      return { ok: true, value: { controller: controller.value, loadedSkills: loaded.value } };
+      return { ok: true, value: { controller: controller.value } };
     },
     async recover(ctx) {
       const repository = createPlanRepository();

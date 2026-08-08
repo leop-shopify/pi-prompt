@@ -40,7 +40,7 @@ export interface PublicActivity {
 }
 export interface PublicSnapshot {
   readonly protocolVersion: 1; readonly id: string; readonly stateVersion: number; readonly documentRevision: number; readonly status: PlanSession["status"];
-  readonly execution: PlanSession["execution"]; readonly generation: PlanSession["generation"]; readonly originalPrompt: string; readonly promptPreview: string; readonly document: PublicPlanDocument | null;
+  readonly generation: PlanSession["generation"]; readonly originalPrompt: string; readonly promptPreview: string; readonly document: PublicPlanDocument | null;
   readonly annotations: readonly PublicAnnotation[];
   readonly grill?: PlanSession["grill"];
   readonly actions: PublicSnapshotActions;
@@ -70,7 +70,6 @@ export function toPublicSnapshot(session: PlanSession, actions: Partial<PublicSn
     stateVersion: session.stateVersion,
     documentRevision: session.documentRevision,
     status: session.status,
-    execution: Object.freeze({ kind: session.execution.kind }),
     generation: Object.freeze({ mode: session.generation.mode }),
     originalPrompt: session.source.prompt,
     promptPreview: boundedSummary(session.source.prompt),

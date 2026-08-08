@@ -5,7 +5,7 @@ import type {
   ClarificationQuestion, ClarificationTranscript, EmptyPlanSession, GrillAnnotationTargetDraft, GrillArtifact, GrillDecisionTreeDraft, GrillResultDraft,
   InitialPlanResultDraft, MaterializedPlanSession, ModelPlanDocumentDraft, ModelPlanElementDraft,
   ModelRevisionPlanDocumentDraft, ModelRevisionPlanElementDraft, PendingClarification, PlanDocument, PlanElement,
-  PlanOperation, PlanSession, RevisionPlanResultDraft, SkillReference, TextSelector,
+  PlanOperation, PlanSession, RevisionPlanResultDraft, TextSelector,
   ValidationIssue, ValidationResult,
 } from "./types.js";
 import { PLAN_ELEMENT_KINDS } from "./types.js";
@@ -26,10 +26,7 @@ export const PLAN_LIMITS = deepFreeze({
   history: 32,
   selectorExactCodePoints: 16_384,
   selectorContextCodePoints: 256,
-  skills: 32,
-  skillNameCodePoints: 128,
   pathCodePoints: 4_096,
-  baseDirCodePoints: 4_096,
   safeErrorCodeCodePoints: 64,
   safeErrorMessageCodePoints: 1_024,
   generationInstructionBytes: 16_384,
@@ -52,9 +49,6 @@ const stringSchema = { type: "string" } as const;
 const integerSchema = { type: "integer", minimum: 0 } as const;
 const idSchema = { type: "string", pattern: "^[!-~]{1,64}$", maxLength: PLAN_LIMITS.idAscii } as const;
 
-const executionKindSchema = {
-  oneOf: ["normal", "goal", "loop"].map((kind) => ({ type: "object", properties: { kind: { const: kind } }, required: ["kind"], additionalProperties: false })),
-} as const;
 const textSelectorSchema = {
   type: "object",
   properties: { field: { enum: ["title", "body"] }, start: integerSchema, end: integerSchema, exact: stringSchema, prefix: stringSchema, suffix: stringSchema },
@@ -105,8 +99,7 @@ const grillAnnotationDraftSchema = { type: "object", properties: { target: grill
 export const GRILL_RESULT_SCHEMA = { type: "object", properties: { kind: { const: "grill" }, basedOnDocumentRevision: { type: "integer", minimum: 1 }, annotations: { type: "object", propertyNames: idSchema, additionalProperties: grillAnnotationDraftSchema, maxProperties: PLAN_LIMITS.grillAnnotations }, decisionTree: grillDecisionTreeSchema }, required: ["kind", "basedOnDocumentRevision", "annotations", "decisionTree"], additionalProperties: false } as const;
 const grillArtifactSchema = { type: "object", properties: { basedOnDocumentRevision: { type: "integer", minimum: 1 }, annotationIds: { type: "object", propertyNames: idSchema, additionalProperties: idSchema, maxProperties: PLAN_LIMITS.grillAnnotations }, decisionTree: grillDecisionTreeSchema, generatedAt: stringSchema }, required: ["basedOnDocumentRevision", "annotationIds", "decisionTree", "generatedAt"], additionalProperties: false } as const;
 const generationSchema = { type: "object", properties: { mode: { enum: ["quick-win", "normal", "careful", "hard-thinker", "fully-orchestrated"] } }, required: ["mode"], additionalProperties: false } as const;
-const skillSchema = { type: "object", properties: { name: stringSchema, path: stringSchema, baseDir: stringSchema, sha256: stringSchema }, required: ["name", "path", "baseDir", "sha256"], additionalProperties: false } as const;
-const sourceSchema = { type: "object", properties: { prompt: stringSchema, cwd: stringSchema, skills: { type: "array", items: skillSchema, maxItems: PLAN_LIMITS.skills } }, required: ["prompt", "cwd", "skills"], additionalProperties: false } as const;
+const sourceSchema = { type: "object", properties: { prompt: stringSchema, cwd: stringSchema }, required: ["prompt", "cwd"], additionalProperties: false } as const;
 const safeErrorSchema = { type: "object", properties: { code: stringSchema, message: stringSchema }, required: ["code", "message"], additionalProperties: false } as const;
 const originProperties = {
   operation: { enum: ["initial", "revision"] }, baseDocumentRevision: integerSchema,
@@ -132,14 +125,14 @@ const generationJobSchema = {
 export const PLAN_SESSION_SCHEMA = {
   $schema: "https://json-schema.org/draft/2020-12/schema", $defs: { element: elementDefinition }, type: "object",
   properties: {
-    schemaVersion: { const: 1 }, id: idSchema, documentRevision: integerSchema, stateVersion: integerSchema,
-    status: { enum: ["generating", "ready", "revising", "grilling", "awaiting-clarification", "accepted", "paused", "cancelled", "error", "needs-input"] }, source: sourceSchema,
-    execution: executionKindSchema, generation: generationSchema, generationJob: generationJobSchema,
+    schemaVersion: { const: 2 }, id: idSchema, documentRevision: integerSchema, stateVersion: integerSchema,
+    status: { enum: ["generating", "ready", "revising", "grilling", "awaiting-clarification", "accepted", "paused", "cancelled", "error"] }, source: sourceSchema,
+    generation: generationSchema, generationJob: generationJobSchema,
     committedMarkdown: stringSchema, clarifications: clarificationTranscriptSchema, grill: grillArtifactSchema,
     document: { anyOf: [{ type: "null" }, { ...planDocumentSchema, $schema: undefined, $defs: undefined }] },
     annotations: { type: "array", items: annotationSchema, maxItems: PLAN_LIMITS.annotations }, lastError: safeErrorSchema,
   },
-  required: ["schemaVersion", "id", "documentRevision", "stateVersion", "status", "source", "execution", "generation", "document", "annotations"], additionalProperties: false,
+  required: ["schemaVersion", "id", "documentRevision", "stateVersion", "status", "source", "generation", "document", "annotations"], additionalProperties: false,
 } as const;
 
 function draftElementDefinition(revision: boolean) {
@@ -259,9 +252,9 @@ function validateSessionJsonSize(input: unknown): ValidationIssue | undefined {
 function normalizeSession(session: PlanSession): PlanSession {
   const projectionIds = markdownProjectionElementIds(session.document);
   const common = {
-    schemaVersion: 1 as const, id: session.id, documentRevision: session.documentRevision, stateVersion: session.stateVersion, status: session.status,
-    source: { prompt: normalizeCanonicalText(session.source.prompt), cwd: normalizeCanonicalText(session.source.cwd), skills: session.source.skills.map(normalizeSkill) },
-    execution: { kind: session.execution.kind }, generation: { mode: session.generation.mode },
+    schemaVersion: 2 as const, id: session.id, documentRevision: session.documentRevision, stateVersion: session.stateVersion, status: session.status,
+    source: { prompt: normalizeCanonicalText(session.source.prompt), cwd: normalizeCanonicalText(session.source.cwd) },
+    generation: { mode: session.generation.mode },
     document: session.document ? normalizeDocument(session.document, projectionIds.size > 0) : null, annotations: session.annotations.map((annotation) => normalizeAnnotation(annotation, projectionIds)),
     ...(session.generationJob ? { generationJob: normalizeGenerationOrigin(session.generationJob, { jobId: session.generationJob.jobId, startedAt: session.generationJob.startedAt }) } : {}),
     ...(session.committedMarkdown === undefined ? {} : { committedMarkdown: session.committedMarkdown }),
@@ -271,7 +264,6 @@ function normalizeSession(session: PlanSession): PlanSession {
   };
   return common as EmptyPlanSession | MaterializedPlanSession;
 }
-function normalizeSkill(skill: SkillReference): SkillReference { return { name: normalizeCanonicalText(skill.name), path: normalizeCanonicalText(skill.path), baseDir: normalizeCanonicalText(skill.baseDir), sha256: skill.sha256 }; }
 function normalizeDocument(document: PlanDocument, opaque = false): PlanDocument { return { id: document.id, title: normalizeElement(document.title, opaque), elements: document.elements.map((element) => normalizeElement(element, opaque)) }; }
 function normalizeElement(element: PlanElement, opaque: boolean): PlanElement { return { id: element.id, kind: element.kind, ...(element.title === undefined ? {} : { title: opaque ? element.title : normalizeCanonicalText(element.title) }), body: opaque ? element.body : normalizeCanonicalText(element.body), children: element.children.map((child) => normalizeElement(child, opaque)) }; }
 function normalizeSelector(selector: TextSelector, opaque = false): TextSelector { return { field: selector.field, start: selector.start, end: selector.end, exact: opaque ? selector.exact : normalizeCanonicalText(selector.exact), ...(selector.prefix === undefined ? {} : { prefix: opaque ? selector.prefix : normalizeCanonicalText(selector.prefix) }), ...(selector.suffix === undefined ? {} : { suffix: opaque ? selector.suffix : normalizeCanonicalText(selector.suffix) }) }; }
@@ -311,9 +303,6 @@ function validateSessionSemantics(session: PlanSession, issues: ValidationIssue[
   const linkedProjection = projection && session.committedMarkdown !== undefined && markdownProjectionText(session.document) === session.committedMarkdown;
   validateId(session.id, "$.id", issues); validateSafeInteger(session.stateVersion, "$.stateVersion", issues); validateSafeInteger(session.documentRevision, "$.documentRevision", issues);
   validateText(session.source.prompt, "$.source.prompt", PLAN_LIMITS.sourcePromptCodePoints, true, issues); validateText(session.source.cwd, "$.source.cwd", PLAN_LIMITS.pathCodePoints, true, issues);
-  const names: string[] = [], paths: string[] = [];
-  session.source.skills.forEach((skill, index) => { const path = `$.source.skills[${index}]`; names.push(skill.name); paths.push(skill.path); validateText(skill.name, `${path}.name`, PLAN_LIMITS.skillNameCodePoints, true, issues); validateText(skill.path, `${path}.path`, PLAN_LIMITS.pathCodePoints, true, issues); validateText(skill.baseDir, `${path}.baseDir`, PLAN_LIMITS.baseDirCodePoints, true, issues); if (!/^[a-f0-9]{64}$/.test(skill.sha256)) issues.push(issue(`${path}.sha256`, "invalid-digest", "Skill digest must be lowercase SHA-256.")); });
-  uniqueStrings(names, "$.source.skills.name", issues); uniqueStrings(paths, "$.source.skills.path", issues);
   if (session.lastError) { validateText(session.lastError.code, "$.lastError.code", PLAN_LIMITS.safeErrorCodeCodePoints, true, issues); if (!/^[a-z0-9][a-z0-9._-]*$/.test(session.lastError.code)) issues.push(issue("$.lastError.code", "invalid-error-code", "Safe error code must use lowercase ASCII tokens.")); validateText(session.lastError.message, "$.lastError.message", PLAN_LIMITS.safeErrorMessageCodePoints, true, issues); }
   if (session.generationJob) {
     const job = session.generationJob; validateId(job.jobId, "$.generationJob.jobId", issues); validateSafeInteger(job.baseDocumentRevision, "$.generationJob.baseDocumentRevision", issues);
@@ -333,7 +322,6 @@ function validateSessionSemantics(session: PlanSession, issues: ValidationIssue[
   validateClarificationTranscript(session.clarifications, session, issues);
   if (session.status === "awaiting-clarification" && !session.clarifications?.pending) issues.push(issue("$.clarifications.pending", "missing-clarification", "Awaiting clarification requires one pending round."));
   if (session.clarifications?.pending && session.status === "ready") issues.push(issue("$.status", "clarification-status", "A pending clarification cannot be ready for review."));
-  if (session.status === "needs-input" && session.lastError?.code !== "skill-context-changed") issues.push(issue("$.lastError", "missing-error", "Needs-input requires a skill-context-changed error."));
   if (session.document === null) {
     if (session.documentRevision !== 0) issues.push(issue("$.documentRevision", "empty-revision", "A session without a document must have revision 0."));
     if (session.annotations.length !== 0) issues.push(issue("$.annotations", "empty-annotations", "A session without a document cannot have annotations."));

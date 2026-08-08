@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { executionKindForTemplate, formatStagedPlan, normalizeExecutionInput, renderPlanMarkdown } from "../plan/classification.js";
+import { EXECUTION_LEADERSHIP_BOOTSTRAP, renderPlanMarkdown } from "../plan/classification.js";
 import type { PlanDocument } from "../plan/types.js";
 
 const document: PlanDocument = {
@@ -14,41 +14,7 @@ const document: PlanDocument = {
   ],
 };
 
-function expectNormalized(
-  input: string,
-  expectedKind: "normal" | "goal" | "loop",
-  expectedText: string,
-  selected: "normal" | "goal" | "loop" = "normal",
-): void {
-  const result = normalizeExecutionInput(input, selected);
-  expect(result.ok).toBe(true);
-  if (result.ok) expect(result.value).toEqual({ execution: { kind: expectedKind }, promptText: expectedText });
-}
-
-describe("execution classification", () => {
-  it("maps goal and loop templates to exclusive kinds", () => {
-    expect(executionKindForTemplate("goal")).toEqual({ kind: "goal" });
-    expect(executionKindForTemplate("loop")).toEqual({ kind: "loop" });
-  });
-
-  it("consumes every consecutive exact leading command and deduplicates one kind", () => {
-    expectNormalized("/goal /goal\nBuild it", "goal", "Build it");
-    expectNormalized("  /loop\t/loop Run it", "loop", "Run it");
-    expectNormalized("/goalie remains text", "normal", "/goalie remains text");
-    expectNormalized("/create-goalie remains text", "normal", "/create-goalie remains text");
-    expectNormalized("/goal-not-a-command", "normal", "/goal-not-a-command");
-  });
-
-  it("rejects mixed typed kinds and typed-vs-selected conflicts", () => {
-    expect(normalizeExecutionInput("/goal /loop Build").ok).toBe(false);
-    expect(normalizeExecutionInput("/loop Build", "goal").ok).toBe(false);
-    expectNormalized("/loop Build", "loop", "Build", "normal");
-    expectNormalized("/goal Build", "goal", "Build", "goal");
-    expectNormalized("/create-goal Build", "normal", "/create-goal Build");
-  });
-});
-
-describe("plan Markdown and final staging", () => {
+describe("plan Markdown", () => {
   it("renders every semantic element deterministically", () => {
     const first = renderPlanMarkdown(document);
     const second = renderPlanMarkdown(document);
@@ -61,20 +27,8 @@ describe("plan Markdown and final staging", () => {
     expect(first).toContain("Revert the focused change.");
   });
 
-  it("stages exact normal, goal, and loop strings without an invented skills label", () => {
-    const skills = ["<skill>A</skill>", "<skill>B</skill>"];
-    const plan = "# Plan\n\nBody";
-    expect(formatStagedPlan(plan, { kind: "normal" }, skills)).toBe("<skill>A</skill>\n\n<skill>B</skill>\n\n# Plan\n\nBody");
-    expect(formatStagedPlan(plan, { kind: "goal" }, skills)).toBe("/goal <skill>A</skill>\n\n<skill>B</skill>\n\n# Plan\n\nBody");
-    expect(formatStagedPlan(plan, { kind: "loop" }, skills)).toBe("/loop <skill>A</skill>\n\n<skill>B</skill>\n\n# Plan\n\nBody");
-    expect(formatStagedPlan(plan, { kind: "normal" }, skills)).not.toContain("Selected skills:");
-  });
-
-  it("strips accidental prefixes and applies at most one controlled first-token prefix", () => {
-    expect(formatStagedPlan("/goal /loop\n# Plan", { kind: "goal" })).toBe("/goal # Plan");
-    expect(formatStagedPlan("/loop /loop # Plan", { kind: "loop" }).match(/\/(?:goal|loop)/g)).toHaveLength(1);
-    expect(formatStagedPlan("/goal /loop # Plan", { kind: "loop" })).toBe("/loop # Plan");
-    expect(formatStagedPlan("/create-goal # Plan", { kind: "normal" })).toBe("/create-goal # Plan");
-    expect(formatStagedPlan(document, { kind: "goal" }, ["<skill>A</skill>"]).startsWith("/goal <skill>A</skill>\n\n# Ship the feature")).toBe(true);
+  it("keeps the fixed execution-leadership prelude independent of selected context", () => {
+    expect(EXECUTION_LEADERSHIP_BOOTSTRAP).toContain("## Execution leadership");
+    expect(EXECUTION_LEADERSHIP_BOOTSTRAP).not.toContain("<skill");
   });
 });

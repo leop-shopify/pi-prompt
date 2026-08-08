@@ -1,15 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { PlanController, type LoadedPrivateSkills, type PlanControllerOptions, type PlanControllerRepository } from "../plan/controller.js";
+import { PlanController, type PlanControllerOptions, type PlanControllerRepository } from "../plan/controller.js";
 import type { PlanGeneratorInput, PlanGeneratorResult, WriterSubmissionInput } from "../plan/generator.js";
 import type { CommitAcceptedPlanInput, CommitPlanInput, CommittedPlanState, RecoveredPlanState } from "../plan/repository.js";
 import type { PlanBranchLocator } from "../plan/locator.js";
 import { PLAN_LIMITS, validateGrillResult, validatePlanSession } from "../plan/schema.js";
-import type { ExecutionKind, PlanElement, PlanSession, SkillReference, ValidationResult } from "../plan/types.js";
+import type { PlanElement, PlanSession } from "../plan/types.js";
 import { liveGrillResultFixture } from "./fixtures/grill-result-shorthand.js";
 
 const NOW = "2026-07-10T12:00:00.000Z";
-const reference: SkillReference = { name: "testing", path: "/private/testing/SKILL.md", baseDir: "/private/testing", sha256: "a".repeat(64) };
-const loaded: LoadedPrivateSkills = { references: [reference], contexts: [{ name: "testing", body: "PRIVATE BODY" }] };
 const initial = { kind: "plan" as const, document: { title: { kind: "title" as const, body: "Ship", children: [] }, elements: [{ kind: "execution" as const, body: "Run", children: [] }, { kind: "step" as const, title: "Build", body: "Old", children: [] }] } };
 
 class FakeRepository implements PlanControllerRepository {
@@ -40,15 +38,15 @@ class FakeGenerator {
   finish(value: PlanGeneratorResult): void { const resolve = this.pending.shift(); if (!resolve) throw new Error("no job"); resolve(value); }
 }
 function locator(state: PlanSession): PlanBranchLocator { return { schemaVersion: 1, sessionId: state.id, artifactPath: `/tmp/${state.id}`, status: state.status, stateVersion: state.stateVersion, documentRevision: state.documentRevision, stateSha256: "b".repeat(64), committedAt: NOW }; }
-function harness(execution: ExecutionKind["kind"] = "normal") {
+function harness() {
   const repository = new FakeRepository(); const generator = new FakeGenerator(); const staged: string[] = []; const locators: PlanBranchLocator[] = [];
-  let id = 0; let stageFailures = 0; let skillResult: ValidationResult<LoadedPrivateSkills> = { ok: true, value: loaded };
-  const options: PlanControllerOptions = { repository, generator, appendLocator: (value) => locators.push(value), skills: { reload: async () => skillResult, refresh: async () => skillResult }, idFactory: () => `id-${++id}`, clock: () => NOW, stager: { stage: (value) => { if (stageFailures > 0) { stageFailures -= 1; throw new Error("editor"); } staged.push(value); } } };
-  return { repository, generator, staged, locators, options, setStageFailures: (count: number) => { stageFailures = count; }, setSkillResult: (value: ValidationResult<LoadedPrivateSkills>) => { skillResult = value; }, create: () => PlanController.create(options, { prompt: "Build it", cwd: "/repo", skills: [reference], execution: { kind: execution }, mode: "normal" }) };
+  let id = 0; let stageFailures = 0;
+  const options: PlanControllerOptions = { repository, generator, appendLocator: (value) => locators.push(value), idFactory: () => `id-${++id}`, clock: () => NOW, stager: { stage: (value) => { if (stageFailures > 0) { stageFailures -= 1; throw new Error("editor"); } staged.push(value); } } };
+  return { repository, generator, staged, locators, options, setStageFailures: (count: number) => { stageFailures = count; }, create: () => PlanController.create(options, { prompt: "Build it", cwd: "/repo", mode: "normal" }) };
 }
 
-async function readyController(execution: ExecutionKind["kind"] = "normal") {
-  const h = harness(execution); const made = await h.create(); if (!made.ok) throw new Error(made.error.code); const controller = made.value;
+async function readyController() {
+  const h = harness(); const made = await h.create(); if (!made.ok) throw new Error(made.error.code); const controller = made.value;
   const started = await controller.generate({ expectedStateVersion: 1 }); if (!started.ok) throw new Error(started.error.code);
   expect(controller.dispatchGeneration(started.value.jobId).ok).toBe(true);
   h.generator.finish({ ok: true, outcome: initial }); expect((await started.value.completion).ok).toBe(true);
@@ -319,14 +317,12 @@ describe("PlanController", () => {
     h.generator.finish({ ok: true, outcome: { kind: "grill", basedOnDocumentRevision: before.documentRevision, annotations: {}, decisionTree: { nodes: [] } } }); expect((await retry.value.completion).ok).toBe(true);
   });
 
-  it.each(["normal", "goal", "loop"] as const)("atomically accepts and stages %s exactly once", async (execution) => {
-    const h = await readyController(execution); const state = h.controller.snapshot(); if (!state) return;
+  it("atomically accepts and stages the exact plan once with the fixed leadership prelude", async () => {
+    const h = await readyController(); const state = h.controller.snapshot(); if (!state) return;
     expect((await h.controller.accept({ expectedStateVersion: state.stateVersion, documentRevision: state.documentRevision, confirmed: false })).ok).toBe(false);
     expect((await h.controller.accept({ expectedStateVersion: state.stateVersion, documentRevision: state.documentRevision, confirmed: true })).ok).toBe(true);
     expect(h.repository.accepted).toHaveLength(1); expect(h.staged).toHaveLength(1);
     expect(h.repository.accepted[0]?.finalPlan).toContain("# Ship");
-    expect(h.repository.accepted[0]?.finalPlan).not.toContain("PRIVATE BODY");
-    expect(h.repository.accepted[0]?.finalPlan).not.toContain("/private/testing");
     expect(h.staged[0]?.match(/## Execution leadership/g)).toHaveLength(1);
     expect(h.staged[0]).toContain("receiving lead must inspect the leadership and orchestration skills available in the current session and preload the best fit");
     expect(h.staged[0]).toContain("Do not assume or hard-code a tool or skill name; use the available task and agent capabilities.");
@@ -335,9 +331,8 @@ describe("PlanController", () => {
     expect(h.staged[0]).toContain("Keep a sole execution lane with the lead.");
     expect(h.staged[0]).toContain("Delegate only genuinely independent, bounded lanes");
     expect(h.staged[0]).toContain("the lead retains integration, cross-lane decisions, and final verification.");
-    expect(h.staged[0]).not.toContain('<skill name="team-leader"');
-    expect(h.staged[0]).toContain('<skill name="testing" baseDir="/private/testing">\nPRIVATE BODY\n</skill>');
-    expect(h.staged[0]?.match(/\/(?:goal|loop)/g)?.length ?? 0).toBe(execution === "normal" ? 0 : 1);
+    expect(h.staged[0]).not.toContain("<skill");
+    expect(h.staged[0]).not.toMatch(/^\s*\/(?:goal|loop)(?=$|\s)/u);
   });
 
   it("commits byte-identical revision Markdown and advances exactly once while clearing feedback", async () => {
@@ -462,52 +457,6 @@ describe("PlanController", () => {
     expect(h.controller.snapshot()?.status).toBe("ready"); expect(h.staged).toHaveLength(0); expect(events).toHaveLength(0);
     expect((await h.controller.accept({ expectedStateVersion: state.stateVersion, documentRevision: state.documentRevision, confirmed: true })).ok).toBe(true);
     expect(events).toEqual(["accepted:1"]);
-  });
-
-  it("verifies captured skills without mutation and durably fails closed without adopting changed refs", async () => {
-    const h = await readyController(); const before = h.controller.snapshot()!; const commitsBefore = h.repository.commits.length;
-    expect((await h.controller.verifySkills({ expectedStateVersion: before.stateVersion })).ok).toBe(true);
-    expect(h.controller.snapshot()).toEqual(before); expect(h.repository.commits).toHaveLength(commitsBefore);
-
-    const changedReference = { ...reference, sha256: "c".repeat(64) };
-    h.setSkillResult({ ok: true, value: { references: [changedReference], contexts: loaded.contexts } });
-    expect(await h.controller.verifySkills({ expectedStateVersion: before.stateVersion })).toMatchObject({ ok: true });
-    expect(h.controller.snapshot()).toMatchObject({ status: "needs-input", stateVersion: before.stateVersion + 1, lastError: { code: "skill-context-changed" }, source: { skills: [reference] } });
-    expect(h.repository.commits.at(-1)?.eventKind).toBe("skill-check-failed");
-  });
-
-  it("keeps skill verification stale/job-active/persistence failures race-safe and supports recovered jobs", async () => {
-    const stale = await readyController(); const state = stale.controller.snapshot()!;
-    expect(await stale.controller.verifySkills({ expectedStateVersion: state.stateVersion - 1 })).toMatchObject({ ok: false, error: { code: "state-conflict" } });
-
-    const active = harness(); const made = await active.create(); if (!made.ok) return;
-    const job = await made.value.generate({ expectedStateVersion: 1 }); if (!job.ok) return;
-    expect(await made.value.verifySkills({ expectedStateVersion: 2 })).toMatchObject({ ok: false, error: { code: "job-active" } });
-
-    const recoveredState = made.value.snapshot(); if (!recoveredState) return;
-    const recovered = PlanController.fromRecovered(active.options, recoveredState, ["historical-id"]); if (!recovered.ok) return;
-    active.setSkillResult({ ok: false, issues: [{ path: "$", code: "missing", message: "missing" }] });
-    active.repository.failNextCommit = true;
-    expect(await recovered.value.verifySkills({ expectedStateVersion: 2 })).toMatchObject({ ok: false, error: { code: "persistence-failed" } });
-    expect(recovered.value.snapshot()).toMatchObject({ status: "generating", stateVersion: 2, generationJob: { jobId: job.value.jobId } });
-    expect(await recovered.value.verifySkills({ expectedStateVersion: 2 })).toMatchObject({ ok: true });
-    expect(recovered.value.snapshot()).toMatchObject({ status: "needs-input", stateVersion: 3, lastError: { code: "skill-context-changed" } });
-    expect(recovered.value.snapshot()).not.toHaveProperty("generationJob");
-  });
-
-  it("persists skill failure before abort and supports explicit refresh recovery", async () => {
-    const h = harness(); const made = await h.create(); if (!made.ok) return; const job = await made.value.generate({ expectedStateVersion: 1 }); if (!job.ok) return;
-    const signal = h.generator.calls[0]!.signal; h.repository.failNextCommit = true;
-    h.generator.finish({ ok: false, error: { code: "skill-context-changed", message: "safe" } });
-    expect(await job.value.completion).toMatchObject({ ok: false, error: { code: "persistence-failed" } });
-    expect(signal.aborted).toBe(false); expect(made.value.snapshot()?.status).toBe("generating");
-    expect((await made.value.pause({ expectedStateVersion: 2 })).ok).toBe(true);
-    h.setSkillResult({ ok: false, issues: [{ path: "$", code: "changed", message: "changed" }] });
-    expect(await made.value.refreshSkills({ expectedStateVersion: 3, selectedNames: ["testing"], discovered: [] })).toMatchObject({ ok: true });
-    expect(made.value.snapshot()?.status).toBe("needs-input");
-    h.setSkillResult({ ok: true, value: loaded });
-    expect((await made.value.refreshSkills({ expectedStateVersion: 4, selectedNames: ["testing"], discovered: [] })).ok).toBe(true);
-    expect(made.value.snapshot()).toMatchObject({ status: "paused", stateVersion: 5 });
   });
 
   it("reserves recovered session, active job, document, annotation, and caller historical IDs", async () => {

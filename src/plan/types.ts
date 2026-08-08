@@ -5,20 +5,9 @@ export type GenerationMode =
   | "hard-thinker"
   | "fully-orchestrated";
 
-export type ExecutionKind =
-  | { readonly kind: "normal" }
-  | { readonly kind: "goal" }
-  | { readonly kind: "loop" };
-export type PlanSessionStatus = "generating" | "ready" | "revising" | "grilling" | "awaiting-clarification" | "accepted" | "paused" | "cancelled" | "error" | "needs-input";
+export type PlanSessionStatus = "generating" | "ready" | "revising" | "grilling" | "awaiting-clarification" | "accepted" | "paused" | "cancelled" | "error";
 
-/** Private generation input. It must never be copied into a browser snapshot. */
-export interface SkillReference {
-  readonly name: string;
-  readonly path: string;
-  readonly baseDir: string;
-  readonly sha256: string;
-}
-export interface PlanSource { readonly prompt: string; readonly cwd: string; readonly skills: readonly SkillReference[] }
+export interface PlanSource { readonly prompt: string; readonly cwd: string }
 export interface SafeError { readonly code: string; readonly message: string }
 
 export type PlanOperation = "initial" | "revision" | "grill";
@@ -164,12 +153,11 @@ export interface Annotation {
 }
 
 interface PlanSessionBase {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly id: string;
   readonly stateVersion: number;
   readonly status: PlanSessionStatus;
   readonly source: PlanSource;
-  readonly execution: ExecutionKind;
   readonly generation: { readonly mode: GenerationMode };
   readonly generationJob?: GenerationJob;
   /** Exact writer-authored Markdown for the committed document. Never derive acceptance from mutable plan.md. */

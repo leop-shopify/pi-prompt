@@ -5,7 +5,7 @@ import { dispatchDirectSend } from "../prompt-editor/direct-send.js";
 import { chooseDraft, choosePromptTemplate, preloadPromptFile } from "../prompt-editor/sources.js";
 import { runPromptEditor } from "../prompt-editor/tui.js";
 import type { PromptEditorInitialState, PromptEditorOutcome } from "../prompt-editor/types.js";
-import { captureSkills, safeNonce, skillBlocks } from "./pi-adapters.js";
+import { safeNonce } from "./pi-adapters.js";
 import { CurrentAgentPlanBridge } from "./current-agent-bridge.js";
 import { createControllerStackFactory } from "./controller-factory.js";
 import { defaultBrowserPlanReviewPort } from "./browser-review-port.js";
@@ -30,17 +30,11 @@ export function registerPromptExtension(pi: ExtensionAPI, options: RegisterPromp
     const merged: PromptEditorInitialState = {
       ...initial,
       mode: initial.mode ?? lastEditorOptions.mode,
-      execution: initial.execution ?? lastEditorOptions.execution,
-      selectedSkills: initial.selectedSkills ?? lastEditorOptions.selectedSkills,
     };
     const outcome = await editorRunner(pi, ctx, merged);
     await handleEditorOutcome(pi, ctx, outcome, runtime);
     if (outcome.kind === "generate" || outcome.kind === "direct-send") {
-      lastEditorOptions = {
-        mode: outcome.submission.mode,
-        execution: outcome.submission.execution,
-        selectedSkills: outcome.submission.selectedSkills,
-      };
+      lastEditorOptions = { mode: outcome.submission.mode };
     }
   };
 
@@ -118,7 +112,6 @@ async function handleEditorOutcome(
   pi: ExtensionAPI, ctx: ExtensionContext, outcome: PromptEditorOutcome, runtime: PromptExtensionRuntime,
 ): Promise<void> {
   if (outcome.kind === "exit") return;
-  if (outcome.kind === "stash") { if (outcome.text.length > 0) ctx.ui.setEditorText(outcome.text); return; }
   if (outcome.kind === "keep-draft") {
     await saveDraft(outcome.text, outcome.draftId);
     ctx.ui.notify("Draft saved. Reopen with /prompt drafts", "info");
@@ -127,15 +120,12 @@ async function handleEditorOutcome(
   const submission = outcome.submission;
   if (submission.saveAsTemplate) await persistTemplate(ctx, submission.text);
   if (outcome.kind === "generate") { await runtime.generate(ctx, submission); return; }
-  const loaded = await captureSkills(pi, submission.selectedSkills);
-  if (!loaded.ok) { ctx.ui.notify("Selected skill context is unavailable or changed.", "error"); return; }
-  const dispatched = dispatchDirectSend({
+  dispatchDirectSend({
     sendUserMessage: pi.sendUserMessage.bind(pi),
     setEditorText: ctx.ui.setEditorText.bind(ctx.ui),
     isIdle: ctx.isIdle.bind(ctx),
     notify: ctx.ui.notify.bind(ctx.ui),
-  }, { text: submission.text, execution: submission.execution, skillBlocks: skillBlocks(loaded.value) });
-  if (!dispatched.ok) ctx.ui.notify(dispatched.issues[0]?.message ?? "The prompt could not be sent.", "error");
+  }, { text: submission.text });
 }
 
 async function persistTemplate(ctx: ExtensionContext, text: string): Promise<void> {

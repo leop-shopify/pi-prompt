@@ -11,8 +11,8 @@ import { createBrowserPlanReviewPort } from "../extension/browser-review-port.js
 
 function generatingState(id: string): PlanSession {
   return {
-    schemaVersion: 1, id, stateVersion: 1, documentRevision: 0, status: "generating",
-    source: { prompt: `Prompt ${id}`, cwd: "/private", skills: [] }, execution: { kind: "normal" }, generation: { mode: "normal" },
+    schemaVersion: 2, id, stateVersion: 1, documentRevision: 0, status: "generating",
+    source: { prompt: `Prompt ${id}`, cwd: "/private" }, generation: { mode: "normal" },
     document: null, annotations: [],
     generationJob: { jobId: `job-${id}`, operation: "initial", baseDocumentRevision: 0, selectedAnnotationIds: [], startedAt: "2026-07-14T00:00:00.000Z" },
   };

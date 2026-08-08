@@ -29,6 +29,7 @@ describe("plan branch locators", () => {
     const base = await root();
     expect(validatePlanBranchLocator({ ...locator(base), status: "grilling" }, base)).toMatchObject({ status: "grilling" });
     expect(validatePlanBranchLocator({ ...locator(base), status: "awaiting-clarification" }, base)).toMatchObject({ status: "awaiting-clarification" });
+    expect(validatePlanBranchLocator({ ...locator(base), status: "needs-input" }, base)).toBeNull();
   });
 
   it("rejects missing, extra, traversal, unsafe hashes and timestamps", async () => {

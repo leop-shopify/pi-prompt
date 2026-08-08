@@ -212,8 +212,6 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
         const created = await options.controllers.create(ctx, {
           prompt: submission.text,
           cwd: ctx.cwd,
-          selectedSkillNames: submission.selectedSkills,
-          execution: submission.execution,
           mode: submission.mode,
         });
         if (runtimeEpoch !== epoch) {
@@ -276,14 +274,6 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
         if (!paused.ok) { notifyOwned(ctx, controller, epoch, paused.error.message, "error"); return; }
         state = controller.snapshot() ?? state;
       }
-      if (state.status !== "accepted" && state.status !== "cancelled") {
-        const verified = await controller.verifySkills({ expectedStateVersion: state.stateVersion });
-        if (!owns(controller, epoch)) return;
-        if (!verified.ok && verified.error.code !== "skill-context-changed") {
-          notifyOwned(ctx, controller, epoch, verified.error.message, "error"); return;
-        }
-        state = controller.snapshot() ?? state;
-      }
       if (["paused", "error"].includes(state.status) && state.clarifications?.origin && !state.clarifications.pending) {
         const started = await controller.resumeClarification({ expectedStateVersion: state.stateVersion });
         if (!owns(controller, epoch)) return;
@@ -336,8 +326,6 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
         await options.editor.open(ctx, {
           text: state.source.prompt,
           mode: state.generation.mode,
-          execution: state.execution,
-          selectedSkills: state.source.skills.map((skill) => skill.name),
         });
         if (!owns(controller, epoch)) return;
         return;
@@ -358,8 +346,6 @@ export function createPromptExtensionRuntime(options: PromptExtensionRuntimeOpti
         notifyOwned(ctx, controller, epoch, staged.ok ? "The accepted plan was sent to the agent." : staged.error.message, staged.ok ? "info" : "error");
       } else if (state.status === "cancelled") {
         notifyOwned(ctx, controller, epoch, "The saved plan was cancelled and cannot be reviewed.", "info");
-      } else if (state.status === "needs-input") {
-        notifyOwned(ctx, controller, epoch, "Selected skill context changed. Reopen the prompt to refresh selected skills.", "warning");
       } else {
         notifyOwned(ctx, controller, epoch, state.lastError?.message ?? "The saved plan is not ready for review.", "warning");
       }

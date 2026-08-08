@@ -21,27 +21,27 @@ const spawnTool = { name: "spawn_agent", description: "spawn", sourceInfo, param
 const malformedSpawnTool = { ...spawnTool, parameters: { type: "object", properties: { prompt: { type: "string" } } } } as ToolInfo;
 
 function initialSession(prompt = "Build it", id = "session", jobId = "job"): PlanSession {
-  return { schemaVersion: 1, id, stateVersion: 2, documentRevision: 0, status: "generating", source: { prompt, cwd: "/repo", skills: [] }, execution: { kind: "normal" }, generation: { mode: "normal" }, document: null, annotations: [], generationJob: { jobId, operation: "initial", baseDocumentRevision: 0, selectedAnnotationIds: [], startedAt: "2026-07-11T00:00:00.000Z" } };
+  return { schemaVersion: 2, id, stateVersion: 2, documentRevision: 0, status: "generating", source: { prompt, cwd: "/repo" }, generation: { mode: "normal" }, document: null, annotations: [], generationJob: { jobId, operation: "initial", baseDocumentRevision: 0, selectedAnnotationIds: [], startedAt: "2026-07-11T00:00:00.000Z" } };
 }
 function input(prompt = "Build it", signal = new AbortController().signal, id = "session", jobId = "job"): PlanGeneratorInput {
   const session = initialSession(prompt, id, jobId);
-  return { session, jobId, operation: "initial", selectedAnnotationIds: [], loadSkills: async () => ({ ok: true, value: [{ name: "private-skill", body: "PRIVATE SKILL BODY THAT MUST STAY PRIVATE" }] }), signal };
+  return { session, jobId, operation: "initial", selectedAnnotationIds: [], signal };
 }
 function submission(attemptId: string, kind: "plan" | "clarification" | "grill", body: Buffer): WriterSubmissionInput {
   return { sessionId: "session", jobId: "job", operation: "initial", baseDocumentRevision: 0, attemptId, kind, body };
 }
 function revisionInput(signal = new AbortController().signal): PlanGeneratorInput {
   const document = { id: "document", title: { id: "title", kind: "title" as const, body: "Existing plan", children: [] }, elements: [{ id: "execution", kind: "execution" as const, body: "Normal", children: [] }, { id: "step", kind: "step" as const, body: "Old contents", children: [] }] };
-  const session: PlanSession = { schemaVersion: 1, id: "session", stateVersion: 4, documentRevision: 1, status: "revising", source: { prompt: "Original\nrequest unchanged", cwd: "/repo", skills: [{ name: "private-skill", path: "/private/skills/private-skill/SKILL.md", baseDir: "/private/skills/private-skill", sha256: "a".repeat(64) }] }, execution: { kind: "normal" }, generation: { mode: "normal" }, document, annotations: [], generationJob: { jobId: "revision-job", operation: "revision", baseDocumentRevision: 1, selectedAnnotationIds: [], instruction: "Replace it freely", startedAt: "2026-07-11T00:00:00.000Z" } };
-  return { session, jobId: "revision-job", operation: "revision", selectedAnnotationIds: [], instruction: "Replace it freely", loadSkills: async () => ({ ok: true, value: [{ name: "private-skill", body: "PRIVATE SKILL BODY THAT MUST STAY PRIVATE" }] }), signal };
+  const session: PlanSession = { schemaVersion: 2, id: "session", stateVersion: 4, documentRevision: 1, status: "revising", source: { prompt: "Original\nrequest unchanged", cwd: "/repo" }, generation: { mode: "normal" }, document, annotations: [], generationJob: { jobId: "revision-job", operation: "revision", baseDocumentRevision: 1, selectedAnnotationIds: [], instruction: "Replace it freely", startedAt: "2026-07-11T00:00:00.000Z" } };
+  return { session, jobId: "revision-job", operation: "revision", selectedAnnotationIds: [], instruction: "Replace it freely", signal };
 }
 function revisionSubmission(attemptId: string, body: Buffer, overrides: Partial<WriterSubmissionInput> = {}): WriterSubmissionInput {
   return { sessionId: "session", jobId: "revision-job", operation: "revision", baseDocumentRevision: 1, attemptId, kind: "plan", body, ...overrides };
 }
 function grillInput(signal = new AbortController().signal): PlanGeneratorInput {
   const document = { id: "markdown-document-1", title: { id: "markdown-title-1", kind: "title" as const, body: "Plan", children: [] }, elements: [{ id: "markdown-chunk-1-0", kind: "execution" as const, body: "Normal 😀", children: [{ id: "markdown-chunk-1-1", kind: "step" as const, body: "Build", children: [] }] }] };
-  const session: PlanSession = { schemaVersion: 1, id: "session", stateVersion: 4, documentRevision: 1, status: "grilling", source: { prompt: "PRIVATE SOURCE PROMPT THAT MUST STAY PRIVATE", cwd: "/repo", skills: [] }, execution: { kind: "normal" }, generation: { mode: "normal" }, document, annotations: [], generationJob: { jobId: "job", operation: "grill", baseDocumentRevision: 1, selectedAnnotationIds: [], startedAt: "2026-07-11T00:00:00.000Z" } };
-  return { session, jobId: "job", operation: "grill", selectedAnnotationIds: [], loadSkills: async () => ({ ok: true, value: [{ name: "private-skill", body: "PRIVATE SKILL BODY THAT MUST STAY PRIVATE" }] }), signal };
+  const session: PlanSession = { schemaVersion: 2, id: "session", stateVersion: 4, documentRevision: 1, status: "grilling", source: { prompt: "PRIVATE SOURCE PROMPT THAT MUST STAY PRIVATE", cwd: "/repo" }, generation: { mode: "normal" }, document, annotations: [], generationJob: { jobId: "job", operation: "grill", baseDocumentRevision: 1, selectedAnnotationIds: [], startedAt: "2026-07-11T00:00:00.000Z" } };
+  return { session, jobId: "job", operation: "grill", selectedAnnotationIds: [], signal };
 }
 function initialSpecInput(signal = new AbortController().signal): SpecGeneratorInput {
   const source = capturedSpec();
@@ -294,7 +294,7 @@ describe("current-agent authenticated writer handoff", () => {
     expect(mission).toContain("risk-, ambiguity-, missing-decision-, contradiction-, test-gap-, adr-candidate-, or glossary-"); expect(mission).toContain("Do not add a classification field or any other result field");
     expect(mission).toContain("options array may be empty or contain a single option"); expect(mission).toContain("never fabricate alternatives to satisfy a cardinality"); expect(mission).toContain('"options":[]');
     expect(mission).toContain("not adoption of Open GSD's planning system"); expect(mission).toContain("Do not create or require .planning directories"); expect(mission).toContain("must_haves"); expect(mission).toContain("GSD report format"); expect(mission).toContain("Do not reveal chain-of-thought");
-    expect(mission).toContain("grill-result.json"); expect(mission).toContain("X-Pi-Prompt-Result: grill"); expect(mission).toContain('"kind":"grill"'); expect(mission).toContain("adding no fields"); expect(mission).toContain("Unicode code points"); expect(mission).toContain('{"kind":"range","elementId":"anchor-id","field":"body","start":0,"end":4}'); expect(mission).toContain("Do not copy quoted exact/prefix/suffix"); expect(mission).not.toContain("PRIVATE SOURCE PROMPT"); expect(mission).not.toContain("PRIVATE SKILL BODY");
+    expect(mission).toContain("grill-result.json"); expect(mission).toContain("X-Pi-Prompt-Result: grill"); expect(mission).toContain('"kind":"grill"'); expect(mission).toContain("adding no fields"); expect(mission).toContain("Unicode code points"); expect(mission).toContain('{"kind":"range","elementId":"anchor-id","field":"body","start":0,"end":4}'); expect(mission).toContain("Do not copy quoted exact/prefix/suffix"); expect(mission).not.toContain("PRIVATE SOURCE PROMPT");
     const anchorJson = mission.match(/Canonical public anchor map \(the complete current document projection, including revision chunks\):\n([^\n]+)/)?.[1];
     expect(anchorJson).toBeDefined(); const anchorMap = JSON.parse(anchorJson!) as {
       documentRevision: number;
@@ -336,7 +336,8 @@ describe("current-agent authenticated writer handoff", () => {
     expect(h.agentContext).toContain("Plan session ID: session"); expect(h.agentContext).toContain("Operation: initial");
     expect(h.agentContext).toContain("Original prompt: Build it");
     expect(h.agentContext).toContain(teams ? "A dedicated planner agent is starting to build this plan." : "The current agent is starting to build this plan directly.");
-    if (teams) expect(h.agentContext).not.toContain("PRIVATE SKILL BODY");
+    expect(h.mission).not.toContain("Execution kind:");
+    expect(h.mission).not.toContain("Selected private skill context");
     expect(h.mission).toContain(endpoint); expect(h.mission).toContain("Authorization: Bearer attempt_identity_0001");
     expect(h.mission).toContain("--data-binary '@/private/plans/session/plan.md'");
     expect(h.mission).toContain("X-Pi-Prompt-Result: clarification");
@@ -407,18 +408,6 @@ describe("current-agent authenticated writer handoff", () => {
     expect(h.pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
-  it.each([
-    ["loaded skill body", "PRIVATE SKILL BODY THAT MUST STAY PRIVATE"],
-    ["selected skill path", "/private/skills/private-skill/SKILL.md"],
-    ["selected skill baseDir", "/private/skills/private-skill"],
-  ])("rejects revision exposure of the literal %s before bridge success", async (_label, exposed) => {
-    const h = harness(); h.generator.configureWriterEndpoint(endpoint); const completion = h.generator.generate(revisionInput()); h.generator.dispatch("revision-job");
-    await vi.waitFor(() => expect(h.pi.sendUserMessage).toHaveBeenCalledOnce()); const marker = vi.mocked(h.pi.sendUserMessage).mock.calls[0]![0] as string;
-    h.handlers.get("input")!(inputEvent(marker)); h.handlers.get("before_agent_start")!(before(marker));
-    await expect(h.generator.submitWriterResult(revisionSubmission("attempt_identity_0001", Buffer.from(`ordinary prefix\r\n${exposed}\r\n`, "utf8")))).resolves.toMatchObject({ ok: false, error: { code: "private-output-exposure" } });
-    await expect(completion).resolves.toMatchObject({ ok: false, error: { code: "private-output-exposure" } });
-    expect(h.pi.sendMessage).not.toHaveBeenCalled();
-  });
 
   it("rejects invalid revision UTF-8 directly without correction", async () => {
     const h = harness(); h.generator.configureWriterEndpoint(endpoint); const completion = h.generator.generate(revisionInput()); h.generator.dispatch("revision-job");
@@ -439,7 +428,7 @@ describe("current-agent authenticated writer handoff", () => {
     await expect(h.generator.submitWriterResult(submission("attempt_identity_0001", "plan", uploaded))).resolves.toMatchObject({ ok: false, error: { code: "writer-attempt-rejected" } });
   });
 
-  it("accepts a strict clarification upload and rejects malformed or private clarification content", async () => {
+  it("accepts a strict clarification upload and rejects malformed clarification content", async () => {
     const accepted = await dispatched(true);
     const questions = Buffer.from(JSON.stringify({ questions: [{ id: "question-1", prompt: "Which target?", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] }] }));
     await expect(accepted.generator.submitWriterResult(submission("attempt_identity_0001", "clarification", questions))).resolves.toMatchObject({ ok: true });
@@ -449,10 +438,6 @@ describe("current-agent authenticated writer handoff", () => {
     await expect(malformed.generator.submitWriterResult(submission("attempt_identity_0001", "clarification", Buffer.from('{"questions":[],"extra":true}')))).resolves.toMatchObject({ ok: false, error: { code: "invalid-clarification" } });
     await expect(malformed.completion).resolves.toMatchObject({ ok: false, error: { code: "invalid-writer-result" } });
 
-    const privateSubmission = await dispatched(true);
-    const privateBody = Buffer.from(JSON.stringify({ questions: [{ id: "question-2", prompt: "PRIVATE SKILL BODY THAT MUST STAY PRIVATE", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] }] }));
-    await expect(privateSubmission.generator.submitWriterResult(submission("attempt_identity_0001", "clarification", privateBody))).resolves.toMatchObject({ ok: false, error: { code: "private-output-exposure" } });
-    await expect(privateSubmission.completion).resolves.toMatchObject({ ok: false, error: { code: "invalid-writer-result" } });
   });
 
   it("rotates one correction bearer, rejects the old token, and settles only correction bytes", async () => {

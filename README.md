@@ -20,8 +20,7 @@ The editor starts in **No plan** with focus in the prompt:
 - `Ctrl+C` copies a selection and `Ctrl+X` cuts it;
 - `Tab` and `Shift+Tab` move among controls;
 - `Escape` opens the keep-draft/discard choice;
-- `Ctrl+Alt+P` returns the text to Pi's main input;
-- the **skills** field is optional: type a skill name and press Enter/comma to add it, Backspace removes chips, and `none` clears the selection. These are task-context skills; after the exact accepted Spec is sent, the receiving agent chooses execution leadership from the available leadership/orchestration skills.
+- `Ctrl+Alt+P` returns the text to Pi's main input.
 
 There is no external-editor handoff.
 
@@ -43,7 +42,7 @@ The displayed budgets are advisory: crossing one marks progress as over budget b
 
 The packaged instructions live in `plans-mode/*.md` and remain the qualitative planning source of truth. Before each job starts, pi-prompt validates active `pi-extended-teams` capability through Pi's public tool catalog, parameter schema, and provenance metadata. When available, the adapter launches exactly one private write-capable planner using the selected level's semantic writer slot; no swarm or helper is allowed. If teams is unavailable before start, the current agent follows the same plan-file contract directly.
 
-Each session owns `~/.pi/agent/pi-prompt/plans/<session-id>/plan.md`, `annotations.json`, `clarifications.json`, and—after Adversarial Review—`grill.json`. The independent Spec sidecar lives under `<session-id>/spec/` with `spec.md`, `comments.json`, and, after acceptance, `final-spec.md`. The compatibility-named `grill.json` contains generated Adversarial Review metadata and the decision tree used as Spec input; the decision tree is not itself the Spec. Transient writer drafts such as `questions.json`, `grill-result.json`, and `spec-result.md` are not canonical artifacts.
+Each session owns `~/.pi/agent/pi-prompt/plans/<session-id>/plan.md`, `annotations.json`, `clarifications.json`, and—after Adversarial Review—`grill.json`. Plan Markdown retains exactly one semantic `## Execution` section as part of its artifact contract; it is not an editor control or direct-send prefix. The independent Spec sidecar lives under `<session-id>/spec/` with `spec.md`, `comments.json`, and, after acceptance, `final-spec.md`. The compatibility-named `grill.json` contains generated Adversarial Review metadata and the decision tree used as Spec input; the decision tree is not itself the Spec. Transient writer drafts such as `questions.json`, `grill-result.json`, and `spec-result.md` are not canonical artifacts.
 
 The writer may inspect repository evidence only when the selected planning policy and request justify it. It uploads exact result bytes to a private authenticated loopback endpoint. Initial Plan, Adversarial Review, and Spec operations apply their operation-specific contracts. A Plan revision is deliberately simpler: matching active session/job/attempt IDs route the returned Markdown, which atomically replaces the authoritative `plan.md` without semantic re-grading or retained-element reconciliation. Spec generation separately enforces source freshness.
 
@@ -74,19 +73,13 @@ The dark review page follows three explicit stages:
 
 Color is not the only provenance signal: comment controls and previews identify **Your comment** or **Adversarial Review finding**. **Accept & send Spec** atomically stores the exact accepted revision in `final-spec.md`, then dispatches an explicit implement-now instruction to the current Pi agent. Plan and Adversarial Review source references precede the exact accepted Spec Markdown, which remains unchanged as the trailing payload.
 
-The server binds only to `127.0.0.1` on an operating-system port. A 256-bit fragment capability is copied into that tab's per-origin `sessionStorage` and removed from browser history. Because the port is part of the origin, separate review servers remain isolated and refresh works in the original tab. Browser API requests require the browser bearer and exact origin headers; the separate writer POST accepts only the current writer bearer, exact Host, supported result/content-type headers, and a bounded body. Snapshots are explicit allowlists: selected skill bodies, paths, cwd, nonces, controller/agent/team identity, tool arguments/results, report content, provenance metadata, and injected instructions are not exposed.
+The server binds only to `127.0.0.1` on an operating-system port. A 256-bit fragment capability is copied into that tab's per-origin `sessionStorage` and removed from browser history. Because the port is part of the origin, separate review servers remain isolated and refresh works in the original tab. Browser API requests require the browser bearer and exact origin headers; the separate writer POST accepts only the current writer bearer, exact Host, supported result/content-type headers, and a bounded body. Snapshots are explicit allowlists: private paths, cwd, nonces, controller/agent/team identity, tool arguments/results, report content, provenance metadata, and injected instructions are not exposed.
 
 The browser loads exact committed Plan and Spec Markdown through authenticated endpoints. Plan/Adversarial Review Unicode-range comments are projected to `annotations.json`; Spec Unicode-range comments are projected to `spec/comments.json`. A Plan replacement clears its consumed comments and Adversarial Review output. Spec revisions safely re-anchor surviving Spec comments. The browser also keeps separate optimistic Plan and Spec ETags, replay-safe mutations, bounded authenticated long polling, and pause/cancel/reopen flows. Pi's terminal shows only one compact generation status beside the normal footer telemetry.
 
-## Execution kind
+## Accepted Spec dispatch
 
-Normal, Goal, and Loop control direct/no-plan sends:
-
-- **Normal** sends the prompt without an execution prefix;
-- **Goal** stages exactly one `/goal ` prefix;
-- **Loop** stages exactly one `/loop ` prefix.
-
-Typed leading `/goal` or `/loop` input is normalized into the same exclusive field. These direct-send choices do not alter accepted Spec dispatch. **Accept & send Spec** instructs the current agent to implement the authoritative Spec now in the current repository and continue through verification—not merely acknowledge it, report readiness, or rewrite it into another plan. The wrapper preserves normal current permissions and instructions: acceptance does not create `/create-goal` or issue-tracker items, nor does it silently commit, push, deploy, install dependencies, or start services.
+**Accept & send Spec** instructs the current agent to implement the authoritative Spec now in the current repository and continue through verification—not merely acknowledge it, report readiness, or rewrite it into another plan. The wrapper preserves normal current permissions and instructions: acceptance does not create `/create-goal` or issue-tracker items, nor does it silently commit, push, deploy, install dependencies, or start services.
 
 ## Verification
 

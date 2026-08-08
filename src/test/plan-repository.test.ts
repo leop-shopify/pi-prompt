@@ -14,9 +14,8 @@ afterEach(async () => { await Promise.all(roots.splice(0).map((path) => rm(path,
 async function root(): Promise<string> { const value = await mkdtemp(join(tmpdir(), "plan-repo-")); roots.push(value); return value; }
 function session(overrides: Partial<PlanSession> = {}): PlanSession {
   return {
-    schemaVersion: 1, id: "session-1", stateVersion: 1, documentRevision: 1, status: "ready",
-    source: { prompt: "private prompt", cwd: "/private/work", skills: [{ name: "secret-skill", path: "/private/SKILL.md", baseDir: "/private", sha256: "a".repeat(64) }] },
-    execution: { kind: "normal" }, generation: { mode: "careful" },
+    schemaVersion: 2, id: "session-1", stateVersion: 1, documentRevision: 1, status: "ready",
+    source: { prompt: "private prompt", cwd: "/private/work" }, generation: { mode: "careful" },
     document: { id: "doc", title: { id: "title", kind: "title", body: "Plan", children: [] }, elements: [{ id: "execution", kind: "execution", body: "Normal", children: [] }] }, annotations: [],
     ...overrides,
   } as PlanSession;
@@ -41,8 +40,10 @@ describe("private plan repository", () => {
     expect(await readFile(join(artifact, "revisions", `1-${documentSha}.plan.json`), "utf8")).toBe(documentBytes);
     expect((await stat(artifact)).mode & 0o777).toBe(0o700); expect((await stat(join(artifact, "plan.json"))).mode & 0o777).toBe(0o600);
     const metadata = await readFile(join(artifact, "metadata.json"), "utf8");
-    expect(metadata).not.toContain("private prompt"); expect(metadata).not.toContain("secret-skill"); expect(metadata).not.toContain("/private");
+    expect(metadata).not.toContain("private prompt"); expect(metadata).not.toContain("/private");
     expect(metadata).not.toContain(createHash("sha256").update("private prompt").digest("hex"));
+    expect(JSON.parse(metadata)).not.toHaveProperty("execution");
+    expect(JSON.parse(metadata)).not.toHaveProperty("skillCount");
     expect(locators).toHaveLength(1);
   });
 
@@ -171,7 +172,7 @@ describe("private plan repository", () => {
     await writeFile(join(base, first.id, "events.jsonl"), `${Array.from({ length: 256 }, () => event).join("\n")}\n`);
     const second = session({ stateVersion: 2 }); await repo.commit({ session: second, previous: first, eventKind: "updated", appendLocator: () => undefined });
     const events = await readFile(join(base, first.id, "events.jsonl"), "utf8");
-    expect(events.trimEnd().split("\n")).toHaveLength(256); expect(events).not.toContain("private prompt"); expect(events).not.toContain("secret-skill");
+    expect(events.trimEnd().split("\n")).toHaveLength(256); expect(events).not.toContain("private prompt");
   });
 
   it("commits final text in the accepted transaction before locator append and closes idempotently", async () => {

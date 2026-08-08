@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { deletePlanDraft, listDrafts, PLAN_DRAFT_TAG, saveDraft, savePlanDraft } from "../drafts.js";
 import { applyPromptTemplateVariables, extractPromptTemplateVariables } from "../prompt-templates.js";
-import { normalizeEditorSource, preloadPromptFile } from "../prompt-editor/sources.js";
+import { preloadPromptFile } from "../prompt-editor/sources.js";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const tempPaths: string[] = [];
@@ -17,7 +17,7 @@ afterEach(async () => {
 async function tempDir(prefix: string): Promise<string> { const path = await mkdtemp(join(tmpdir(), prefix)); tempPaths.push(path); return path; }
 
 describe("prompt editor sources", () => {
-  it("preloads relative files without changing their text", async () => {
+  it("preloads relative files, including slash-leading content, without changing their text", async () => {
     const cwd = await tempDir("pi-prompt-source-");
     await writeFile(join(cwd, "request.md"), "/goal\r\nBuild this\n", "utf8");
     await expect(preloadPromptFile(cwd, "@request.md")).resolves.toEqual({ path: join(cwd, "request.md"), text: "/goal\r\nBuild this\n" });
@@ -46,15 +46,4 @@ describe("prompt editor sources", () => {
     expect(applyPromptTemplateVariables(source, { feature: "search", repo: "app" })).toBe("Build search in app then verify search");
   });
 
-  it("normalizes matching template and typed execution without preserving the controlled prefix", () => {
-    expect(normalizeEditorSource("/goal\nBuild it", { kind: "goal" })).toEqual({
-      ok: true, value: { promptText: "Build it", execution: { kind: "goal" } },
-    });
-    expect(normalizeEditorSource("/create-goalie Build it")).toEqual({
-      ok: true, value: { promptText: "/create-goalie Build it", execution: { kind: "normal" } },
-    });
-    expect(normalizeEditorSource("/loop /goal Build it", { kind: "loop" })).toMatchObject({ ok: false });
-    expect(normalizeEditorSource("/create-goal Build it")).toEqual({ ok: true, value: { promptText: "/create-goal Build it", execution: { kind: "normal" } } });
-    expect(normalizeEditorSource("/goal Build it", { kind: "loop" })).toMatchObject({ ok: false });
-  });
 });

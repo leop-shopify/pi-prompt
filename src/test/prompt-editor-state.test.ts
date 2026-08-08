@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { GENERATION_MODE_ORDER, GENERATION_PROFILES } from "../plan/modes.js";
 import {
-  EXECUTION_KIND_ORDER, PROMPT_FIELD_FOCUS_ORDER, PROMPT_PLANNING_MODE_ORDER, createPromptEditorState, cycleExecutionKind,
-  cycleGenerationMode, generationModeHelp, skillSuggestions,
+  PROMPT_FIELD_FOCUS_ORDER, PROMPT_PLANNING_MODE_ORDER, createPromptEditorState,
+  cycleGenerationMode, generationModeHelp,
 } from "../prompt-editor/state.js";
 
 describe("prompt editor state", () => {
@@ -25,24 +25,12 @@ describe("prompt editor state", () => {
     expect(cycleGenerationMode("no-plan", 1)).toBe("quick-win");
   });
 
-  it("keeps exclusive execution separate from skills", () => {
-    const state = createPromptEditorState({ execution: { kind: "goal" }, selectedSkills: ["test-expert"] });
-    expect(EXECUTION_KIND_ORDER).toEqual(["normal", "goal", "loop"]);
-    expect(cycleExecutionKind(state.execution, 1)).toEqual({ kind: "loop" });
-    expect(cycleExecutionKind({ kind: "normal" }, 1)).toEqual({ kind: "goal" });
-    expect(cycleExecutionKind({ kind: "loop" }, 1)).toEqual({ kind: "normal" });
-    expect(state.selectedSkills).toEqual(["test-expert"]);
-    expect(state.selectedSkills).not.toContain("/goal");
-  });
-
-  it("uses the exact required focus order", () => {
-    expect(PROMPT_FIELD_FOCUS_ORDER).toEqual(["mode", "execution", "editor", "skills", "saveAsTemplate"]);
-  });
-
-  it("preserves unique selected skills and suggests skills only", () => {
-    const state = createPromptEditorState({ selectedSkills: ["security-expert", "security-expert"] });
-    expect(state.selectedSkills).toEqual(["security-expert"]);
-    expect(skillSuggestions(["security-expert", "test-expert"], "expert", state.selectedSkills)).toEqual(["test-expert"]);
+  it("uses only the remaining prompt controls in the focus order and state", () => {
+    const state = createPromptEditorState();
+    expect(PROMPT_FIELD_FOCUS_ORDER).toEqual(["mode", "editor", "saveAsTemplate"]);
+    expect(state).not.toHaveProperty("execution");
+    expect(state).not.toHaveProperty("selectedSkills");
+    expect(state).not.toHaveProperty("skillQuery");
   });
 
   it("renders help directly from immutable profile data", () => {

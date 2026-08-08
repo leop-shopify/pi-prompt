@@ -16,9 +16,8 @@ const annotationId = "an_comment001";
 
 const execution = (): PlanElement => ({ id: executionId, kind: "execution", body: "Run this plan normally.", children: [] });
 const validSession = (): PlanSession => ({
-  schemaVersion: 1, id: sessionId, documentRevision: 1, stateVersion: 1, status: "ready",
-  source: { prompt: "Build it", cwd: "/workspace", skills: [{ name: "test-expert", path: "/skills/test/SKILL.md", baseDir: "/skills/test", sha256: "a".repeat(64) }] },
-  execution: { kind: "normal" }, generation: { mode: "normal" },
+  schemaVersion: 2, id: sessionId, documentRevision: 1, stateVersion: 1, status: "ready",
+  source: { prompt: "Build it", cwd: "/workspace" }, generation: { mode: "normal" },
   document: {
     id: documentId,
     title: { id: titleId, kind: "title", body: "Canonical plan", children: [] },
@@ -64,9 +63,11 @@ describe("canonical plan validation", () => {
     expectInvalid({ ...linked, documentRevision: 3 }, "projection-revision");
   });
 
-  it("rejects removed and unknown execution kinds", () => {
-    expectInvalid({ ...validSession(), execution: { kind: "create-goal" } }, "invalid-structure");
-    expectInvalid({ ...validSession(), execution: { kind: "create-goalie" } }, "invalid-structure");
+  it("accepts only the v2 session shape without legacy Skills or Execution fields", () => {
+    expect(validatePlanSession(validSession()).ok).toBe(true);
+    expectInvalid({ ...validSession(), schemaVersion: 1 }, "invalid-structure");
+    expectInvalid({ ...validSession(), source: { ...validSession().source, skills: [] } }, "invalid-structure");
+    expectInvalid({ ...validSession(), execution: { kind: "normal" } }, "invalid-structure");
   });
 
   it("enforces empty/materialized revision invariants", () => {
@@ -82,9 +83,6 @@ describe("canonical plan validation", () => {
     expectInvalid({ ...generating, generationJob: { ...generating.generationJob, extra: true } }, "invalid-structure");
     expectInvalid({ ...generating, generationJob: { ...generating.generationJob, instruction: "x".repeat(PLAN_LIMITS.generationInstructionBytes + 1) } }, "too-long");
     expectInvalid({ ...validSession(), generationJob: { ...generating.generationJob, operation: "revision", baseDocumentRevision: 1 } }, "job-status");
-    const needsInput = { ...generating, status: "needs-input", generationJob: undefined, lastError: { code: "skill-context-changed", message: "Selected skill context changed." } };
-    expect(validatePlanSession(needsInput).ok).toBe(true);
-    expectInvalid({ ...needsInput, lastError: undefined }, "missing-error");
   });
 
   it("enforces bounded clarification rounds, questions, options, origins, and exact answers", () => {
@@ -124,10 +122,7 @@ describe("canonical plan validation", () => {
     const tooMuchContext = `${context}x`; const invalidContext = structuredClone(exactContext); (invalidContext.target as { selector: { prefix: string } }).selector.prefix = tooMuchContext; (invalidContext.targetSnapshot.target as { selector: { prefix: string } }).selector.prefix = tooMuchContext; expectInvalid(withAnnotations(contextSession, [invalidContext]), "too-long");
   });
 
-  it("enforces exact/+1 skill and annotation collection caps", () => {
-    const skill = validSession().source.skills[0];
-    const exactSkills = { ...validSession(), source: { ...validSession().source, skills: Array.from({ length: PLAN_LIMITS.skills }, (_, index) => ({ ...skill, name: `skill-${index}`, path: `/skill/${index}` })) } }; expect(validatePlanSession(exactSkills).ok).toBe(true);
-    expectInvalid({ ...exactSkills, source: { ...exactSkills.source, skills: [...exactSkills.source.skills, { ...skill, name: "extra", path: "/extra" }] } }, "invalid-structure");
+  it("enforces exact/+1 annotation collection caps", () => {
     const annotations = Array.from({ length: PLAN_LIMITS.annotations }, (_, index) => rangeAnnotation({ id: `an_${String(index).padStart(8, "0")}` })); expect(validatePlanSession(withAnnotations(validSession(), annotations)).ok).toBe(true);
     expectInvalid(withAnnotations(validSession(), [...annotations, rangeAnnotation({ id: "an_extra0001" })]), "invalid-structure");
   });

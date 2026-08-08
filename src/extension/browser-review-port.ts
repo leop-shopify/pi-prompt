@@ -52,8 +52,6 @@ export function createBrowserPlanReviewPort(options: BrowserReviewPortOptions): 
         await options.reopen(input.ctx, {
           text: state.source.prompt,
           mode: state.generation.mode,
-          execution: state.execution,
-          selectedSkills: state.source.skills.map((skill) => skill.name),
         });
       },
     });

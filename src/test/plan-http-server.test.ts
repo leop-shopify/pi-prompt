@@ -9,9 +9,8 @@ import type { PlanSession } from "../plan/types.js";
 
 function readyState(overrides: Partial<PlanSession> = {}): PlanSession {
   return {
-    schemaVersion: 1, id: "session", stateVersion: 3, documentRevision: 1, status: "ready",
-    source: { prompt: "PRIVATE SOURCE", cwd: "/private/cwd", skills: [{ name: "private", path: "/private/SKILL.md", baseDir: "/private", sha256: "a".repeat(64) }] },
-    execution: { kind: "normal" }, generation: { mode: "normal" },
+    schemaVersion: 2, id: "session", stateVersion: 3, documentRevision: 1, status: "ready",
+    source: { prompt: "PRIVATE SOURCE", cwd: "/private/cwd" }, generation: { mode: "normal" },
     document: { id: "document", title: { id: "title", kind: "title", body: "Hostile </script><img onerror=1>", children: [] }, elements: [{ id: "execution", kind: "execution", body: "Normal, staged only", children: [] }, { id: "step", kind: "step", title: "Build", body: "Do it", children: [] }] }, annotations: [], ...overrides,
   } as PlanSession;
 }
@@ -199,7 +198,7 @@ describe("secure plan HTTP host", () => {
     const fake = fakeController(); const host = await startPlanHttpHost({ controller: fake.controller, reopenInPi: vi.fn(), longPollMs: 20 });
     try {
       const snapshotResponse = await fetch(`${host.origin}/api/v1/snapshot`, { headers: auth(host) });
-      expect(snapshotResponse.headers.get("etag")).toBe('"pi-plan-state-3"'); const snapshot = await json(snapshotResponse); expect(snapshot.snapshot.promptPreview).toBe("PRIVATE SOURCE"); expect(JSON.stringify(snapshot)).not.toContain("/private/SKILL.md");
+      expect(snapshotResponse.headers.get("etag")).toBe('"pi-plan-state-3"'); const snapshot = await json(snapshotResponse); expect(snapshot.snapshot.promptPreview).toBe("PRIVATE SOURCE");
       const createBody = { requestId: "request-id-00000001", target: { kind: "element", elementId: "step" }, body: "literal <script>x</script>" };
       const [first, duplicate] = await Promise.all([1, 2].map(() => fetch(`${host.origin}/api/v1/annotations`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body: JSON.stringify(createBody) })));
       expect(first.status).toBe(200); expect(duplicate.status).toBe(200); expect(fake.raw.addAnnotation).toHaveBeenCalledTimes(1);

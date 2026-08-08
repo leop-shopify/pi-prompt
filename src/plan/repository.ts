@@ -13,7 +13,7 @@ import { defaultPlanRoot } from "./session-files.js";
 
 export const PLAN_EVENT_LIMIT = 256;
 
-export type PlanAuditKind = "created" | "updated" | "state-changed" | "revision-committed" | "accepted" | "paused" | "cancelled" | "skill-check-failed" | "recovered";
+export type PlanAuditKind = "created" | "updated" | "state-changed" | "revision-committed" | "accepted" | "paused" | "cancelled" | "recovered";
 export type PlanRecoveryWarning = "invalid-locator" | "invalid-state" | "invalid-revision" | "plan-rebuilt" | "metadata-rebuilt" | "events-rebuilt";
 
 export interface CommittedPlanState {
@@ -204,8 +204,8 @@ function canonicalNow(clock: () => Date | string): string {
 interface Metadata {
   readonly schemaVersion: 1; readonly id: string; readonly status: PlanSession["status"];
   readonly stateVersion: number; readonly documentRevision: number; readonly generationMode: PlanSession["generation"]["mode"];
-  readonly execution: PlanSession["execution"]; readonly createdAt: string; readonly committedAt: string;
-  readonly prompt: { readonly bytes: number; readonly codePoints: number }; readonly skillCount: number;
+  readonly createdAt: string; readonly committedAt: string;
+  readonly prompt: { readonly bytes: number; readonly codePoints: number };
 }
 async function metadataFor(session: PlanSession, committedAt: string, artifactPath: string): Promise<Metadata> {
   let createdAt = committedAt;
@@ -216,9 +216,8 @@ async function metadataFor(session: PlanSession, committedAt: string, artifactPa
   const promptBytes = Buffer.from(session.source.prompt, "utf8");
   return {
     schemaVersion: 1, id: session.id, status: session.status, stateVersion: session.stateVersion,
-    documentRevision: session.documentRevision, generationMode: session.generation.mode, execution: { kind: session.execution.kind },
+    documentRevision: session.documentRevision, generationMode: session.generation.mode,
     createdAt, committedAt, prompt: { bytes: promptBytes.byteLength, codePoints: [...session.source.prompt].length },
-    skillCount: session.source.skills.length,
   };
 }
 interface AuditEvent { readonly kind: PlanAuditKind; readonly at: string; readonly id: string; readonly status: PlanSession["status"]; readonly stateVersion: number; readonly documentRevision: number; readonly errorCode?: string }
@@ -253,7 +252,7 @@ function isAuditEvent(value: unknown): value is AuditEvent {
   if (!isRecord(value)) return false;
   const keys = Object.keys(value); const allowed = new Set(["kind", "at", "id", "status", "stateVersion", "documentRevision", "errorCode"]);
   return keys.every((key) => allowed.has(key)) && (keys.length === 6 || keys.length === 7)
-    && ["created", "updated", "state-changed", "revision-committed", "accepted", "paused", "cancelled", "skill-check-failed", "recovered"].includes(String(value.kind))
+    && ["created", "updated", "state-changed", "revision-committed", "accepted", "paused", "cancelled", "recovered"].includes(String(value.kind))
     && typeof value.at === "string" && isCanonicalTimestamp(value.at) && typeof value.id === "string" && typeof value.status === "string"
     && Number.isSafeInteger(value.stateVersion) && Number.isSafeInteger(value.documentRevision)
     && (value.errorCode === undefined || (typeof value.errorCode === "string" && /^[a-z0-9][a-z0-9._-]*$/.test(value.errorCode)));

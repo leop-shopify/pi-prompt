@@ -4,9 +4,9 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
-  validateClarificationSubmission, validateGeneratorInput, validateGeneratorSubmission, validateGrillSubmission, validateRevisionMarkdownPrivacy,
+  validateClarificationSubmission, validateGeneratorInput, validateGeneratorSubmission, validateGrillSubmission, validateRevisionMarkdown,
   type DispatchablePlanGenerator, type PlanDispatchResult, type PlanGeneratorInput, type PlanGeneratorResult,
-  type PrivateSkillContent, type WriterSubmissionInput,
+  type WriterSubmissionInput,
 } from "../plan/generator.js";
 import { GENERATION_PROFILES, loadPlanLevel } from "../plan/modes.js";
 import { planOutcomeFromMarkdown } from "../plan/markdown-plan.js";
@@ -83,7 +83,6 @@ interface Gate {
   dispatchRequested: boolean;
   pendingIdle?: () => boolean;
   levelMarkdown?: string;
-  skills?: readonly PrivateSkillContent[];
   teams?: TeamsPlanningAdapter;
   stopReportObservation?: () => void;
   privateReport?: string;
@@ -183,7 +182,7 @@ export class CurrentAgentPlanBridge {
       return { message: { customType: "pi-prompt-spec-request", content, display: false } };
     }
     const gate = this.#active;
-    if (!this.#isOpen(gate) || !gate.levelMarkdown || !gate.skills) return;
+    if (!this.#isOpen(gate) || !gate.levelMarkdown) return;
     if (event.prompt !== gate.marker || gate.queuedRun !== gate.sentRun || !gate.sentRun) return;
     const run = gate.sentRun;
     gate.activeRun = run;
@@ -447,11 +446,9 @@ export class CurrentAgentPlanBridge {
 
   async #prepare(gate: Gate): Promise<void> {
     try {
-      const [levelMarkdown, loaded] = await Promise.all([this.#loadLevel(gate.input.session.generation.mode), gate.input.loadSkills()]);
+      const levelMarkdown = await this.#loadLevel(gate.input.session.generation.mode);
       if (this.#active !== gate || gate.state === "closed" || gate.state === "settled") return;
-      if (!loaded.ok) { this.#settle(gate, failed("skill-context-changed", "Private skill context changed during generation.")); return; }
       gate.levelMarkdown = levelMarkdown;
-      gate.skills = loaded.value;
       this.#prepareReadyGate(gate);
     } catch {
       if (this.#active === gate) this.#settle(gate, failed("plan-level-unavailable", "The selected planning level could not be loaded."));
@@ -471,7 +468,7 @@ export class CurrentAgentPlanBridge {
   }
 
   #prepareReadyGate(gate: Gate): void {
-    if (!this.#isOpen(gate) || !gate.levelMarkdown || !gate.skills || !gate.writerEndpoint || gate.state !== "preparing") return;
+    if (!this.#isOpen(gate) || !gate.levelMarkdown || !gate.writerEndpoint || gate.state !== "preparing") return;
     if (gate.teams && !gate.teams.setMission(this.#childMission(gate))) {
       this.#settle(gate, failed("delegation-mission-unavailable", "The private primary planner mission could not be prepared."));
       return;
@@ -529,7 +526,7 @@ export class CurrentAgentPlanBridge {
 
   async #submitWriterResult(owner: symbol, input: WriterSubmissionInput): Promise<PlanDispatchResult> {
     const gate = this.#active; const job = gate?.input.session.generationJob;
-    if (!gate || gate.owner !== owner || !this.#isOpen(gate) || !gate.skills || !job
+    if (!gate || gate.owner !== owner || !this.#isOpen(gate) || !job
       || input.sessionId !== gate.input.session.id || input.jobId !== gate.input.jobId
       || input.operation !== gate.input.operation || input.baseDocumentRevision !== job.baseDocumentRevision
       || input.attemptId !== gate.activeAttempt || !this.#submissionRunActive(gate)) {
@@ -545,7 +542,7 @@ export class CurrentAgentPlanBridge {
         this.#settle(gate, invalid);
         return dispatchFailed(invalid.error.code, invalid.error.message);
       }
-      const result = validateRevisionMarkdownPrivacy(markdown, gate.input.session, gate.skills);
+      const result = validateRevisionMarkdown(markdown);
       if (!result.ok) {
         this.#settle(gate, result);
         return dispatchFailed(result.error.code, result.error.message);
@@ -561,7 +558,7 @@ export class CurrentAgentPlanBridge {
       catch { return this.#rejectWriterResult(gate, failed("invalid-utf8", "The plan submission must be valid UTF-8.")); }
       const parsed = planOutcomeFromMarkdown(markdown, gate.input.operation, gate.input.session, gate.input.selectedAnnotationIds);
       validated = parsed.ok
-        ? validateGeneratorSubmission(parsed.value, gate.input.operation, gate.input.session, gate.skills)
+        ? validateGeneratorSubmission(parsed.value, gate.input.operation, gate.input.session)
         : failed("invalid-plan-file", parsed.issues.map((issue) => `${issue.path} [${issue.code}] ${issue.message}`).join("; "));
       if (validated.ok && validated.outcome.kind !== "clarification" && validated.outcome.kind !== "grill") validated = { ok: true, outcome: { ...validated.outcome, markdown } };
     } else {
@@ -574,7 +571,7 @@ export class CurrentAgentPlanBridge {
       }
       const parsed = parseStrictJsonObject(text, { maxBytes: input.kind === "grill" ? MAX_GRILL_RESULT_BYTES : MAX_WRITER_RESULT_BYTES, maxDepth: 14 });
       validated = parsed.ok
-        ? input.kind === "grill" ? validateGrillSubmission(parsed.value, gate.input.session, gate.skills) : validateClarificationSubmission(parsed.value, gate.input.session, gate.skills)
+        ? input.kind === "grill" ? validateGrillSubmission(parsed.value, gate.input.session) : validateClarificationSubmission(parsed.value)
         : failed(input.kind === "grill" ? "invalid-grill" : "invalid-clarification", parsed.issues.map((issue) => `${issue.code}: ${issue.message}`).join("; "));
     }
     if (!validated.ok) {
@@ -620,7 +617,7 @@ export class CurrentAgentPlanBridge {
   }
 
   #primaryReport(gate: Gate, report: string): void {
-    if (!this.#isOpen(gate) || gate.privateReport !== undefined || !gate.skills) return;
+    if (!this.#isOpen(gate) || gate.privateReport !== undefined) return;
     gate.privateReport = report; // Cleanup/advisory signal only; correlated HTTP bytes are sole result authority.
     this.#activity(gate, "report-received", "report-received");
     this.#beginCorrection(gate);
@@ -804,8 +801,6 @@ export class CurrentAgentPlanBridge {
       "## Supplemental controller metadata — not user scope",
       "These values support planning and storage only. They do not add goals, affected areas, or permission to inspect anything.",
       `Working directory (ambient only; a cwd is not authorization to inspect it):\n${gate.input.session.source.cwd}`,
-      `Execution kind:\n${gate.input.session.execution.kind}`,
-      `Selected private skill context (apply only when relevant; never copy private instructions or paths into the result):\n${JSON.stringify(gate.skills)}`,
     ].join("\n\n");
   }
 

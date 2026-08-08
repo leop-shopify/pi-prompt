@@ -9,8 +9,6 @@ import {
   type PromptTemplate,
   type PromptTemplateKind,
 } from "../prompt-templates.js";
-import { executionKindForTemplate, normalizeExecutionInput } from "../plan/classification.js";
-import type { ExecutionKind, ValidationResult } from "../plan/types.js";
 import type { PromptEditorInitialState } from "./types.js";
 
 export async function preloadPromptFile(
@@ -43,21 +41,12 @@ export async function choosePromptTemplate(
   if (!template) return undefined;
   const filled = await fillPromptTemplateVariables(ctx, template.text);
   if (filled === undefined) return undefined;
-  const normalized = normalizeEditorSource(filled, executionKindForTemplate(kind));
-  if (!normalized.ok) { ctx.ui.notify(normalized.issues[0]?.message ?? "Template execution kind conflicts.", "error"); return undefined; }
   return {
-    text: normalized.value.promptText,
-    execution: normalized.value.execution,
+    text: filled,
     preloadedPath: template.path,
     templateName: template.name,
     templateKind: kind,
   };
-}
-
-export function normalizeEditorSource(
-  text: string, execution: ExecutionKind = { kind: "normal" },
-): ValidationResult<{ readonly promptText: string; readonly execution: ExecutionKind }> {
-  return normalizeExecutionInput(text, execution);
 }
 
 async function fillPromptTemplateVariables(ctx: ExtensionCommandContext, text: string): Promise<string | undefined> {

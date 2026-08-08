@@ -10,9 +10,8 @@ import type { PlanSession } from "../plan/types.js";
 
 const browserFiles = ["app.js", "api.js", "store.js", "dom.js", "components.js", "range.js"];
 const state: PlanSession = {
-  schemaVersion: 1, id: "session", stateVersion: 3, documentRevision: 1, status: "ready",
-  source: { prompt: "ORIGINAL PRIVATE SOURCE", cwd: "/private", skills: [{ name: "security", path: "/private/SKILL.md", baseDir: "/private", sha256: "a".repeat(64) }] },
-  execution: { kind: "loop" }, generation: { mode: "careful" },
+  schemaVersion: 2, id: "session", stateVersion: 3, documentRevision: 1, status: "ready",
+  source: { prompt: "ORIGINAL PRIVATE SOURCE", cwd: "/private" }, generation: { mode: "careful" },
   document: { id: "document", title: { id: "title", kind: "title", body: "Review", children: [] }, elements: [{ id: "execution", kind: "execution", body: "Read only", children: [] }] }, annotations: [],
 };
 
@@ -194,11 +193,11 @@ describe("browser review client", () => {
     const publicBody = await snapshot.json() as { snapshot: Record<string, unknown> };
     expect(publicBody.snapshot.promptPreview).toBe("ORIGINAL PRIVATE SOURCE");
     expect(publicBody.snapshot).not.toHaveProperty("source");
-    expect(JSON.stringify(publicBody)).not.toContain("/private/SKILL.md"); expect(JSON.stringify(publicBody)).not.toContain('"cwd"'); expect(JSON.stringify(publicBody)).not.toContain("nonce_");
+    expect(JSON.stringify(publicBody)).not.toContain('"cwd"'); expect(JSON.stringify(publicBody)).not.toContain("nonce_");
     const reopenResponse = await fetch(`${origin}/api/v1/reopen-in-pi`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "X-Pi-Prompt-Origin": origin, Origin: origin, "Content-Type": "application/json", "If-Match": '"pi-plan-state-3"' }, body: JSON.stringify({ requestId: "request-id-reopen-001" }) });
     expect(reopenResponse.status).toBe(200);
     await port.close?.(); await Promise.resolve();
-    expect(reopen).toHaveBeenCalledWith(ctx, { text: "ORIGINAL PRIVATE SOURCE", mode: "careful", execution: { kind: "loop" }, selectedSkills: ["security"] });
+    expect(reopen).toHaveBeenCalledWith(ctx, { text: "ORIGINAL PRIVATE SOURCE", mode: "careful" });
     expect(listeners.size).toBe(0);
   });
 });
