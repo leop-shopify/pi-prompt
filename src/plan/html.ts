@@ -3,7 +3,7 @@ export const PLAN_REVIEW_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Plan review · Plan → Adversarial Review → To Spec · Pi Prompt</title>
+<title>Plan review · Plan → Optional Adversarial Review → Optional To Spec · Pi Prompt</title>
 <link rel="stylesheet" href="/browser/styles.css">
 <script type="module" src="/browser/app.js"></script>
 </head>
@@ -19,9 +19,9 @@ export const PLAN_REVIEW_HTML = `<!doctype html>
     <ol>
       <li><button id="stage-plan" type="button" data-stage="plan" aria-current="step"><span class="stage-number">1</span><span><strong>Plan</strong><small id="stage-plan-state">Current</small></span></button></li>
       <li aria-hidden="true" class="stage-arrow">→</li>
-      <li><button id="stage-grill" type="button" data-stage="grill" disabled><span class="stage-number">2</span><span><strong>Adversarial Review</strong><small id="stage-grill-state">Unavailable</small></span></button></li>
+      <li><button id="stage-grill" type="button" data-stage="grill" disabled><span class="stage-number">2</span><span><strong>Adversarial Review</strong><small id="stage-grill-state">Optional</small></span></button></li>
       <li aria-hidden="true" class="stage-arrow">→</li>
-      <li><button id="stage-spec" type="button" data-stage="spec" disabled><span class="stage-number">3</span><span><strong>To Spec</strong><small id="stage-spec-state">Unavailable</small></span></button></li>
+      <li><button id="stage-spec" type="button" data-stage="spec" disabled><span class="stage-number">3</span><span><strong>To Spec</strong><small id="stage-spec-state">Optional</small></span></button></li>
     </ol>
   </nav>
 
@@ -51,8 +51,9 @@ export const PLAN_REVIEW_HTML = `<!doctype html>
 
 <footer id="action-bar" class="action-bar" hidden>
   <div id="plan-lifecycle-actions"><button id="reopen-button" type="button" class="quiet">Reopen in Pi</button><button id="pause-button" type="button" class="quiet">Pause Plan</button><button id="cancel-button" type="button" class="danger quiet">Cancel Plan</button></div>
-  <div id="plan-stage-actions"><button id="retry-generation-button" type="button" class="primary" hidden>Retry Plan generation</button><button id="revise-button" type="button">Revise Plan from comments</button><button id="run-grill-button" type="button" class="primary">Run Adversarial Review</button><button id="to-spec-button" type="button" class="primary" hidden>Continue to To Spec</button></div>
+  <div id="plan-stage-actions"><button id="retry-generation-button" type="button" class="primary" hidden>Retry Plan generation</button><button id="revise-button" type="button">Revise Plan from comments</button><button id="run-grill-button" type="button" class="primary">Run Adversarial Review</button><button id="to-spec-button" type="button" class="primary" hidden>Skip to Spec</button><button id="review-plan-with-feedback-button" type="button" class="primary" hidden>Review plan with feedback</button></div>
   <div id="spec-stage-actions" hidden><button id="spec-pause-button" type="button" class="quiet">Pause Spec</button><button id="spec-cancel-button" type="button" class="danger quiet">Cancel Spec</button><button id="spec-generate-button" type="button">Generate Spec</button><button id="spec-revise-button" type="button">Revise Spec from comments</button><button id="spec-retry-stage-button" type="button" class="primary" hidden>Retry Spec send</button><button id="spec-accept-button" type="button" class="primary">Accept &amp; send Spec</button></div>
+  <div id="submit-plan-actions" hidden><button id="submit-plan-button" type="button" class="primary">Submit Plan as-is</button></div>
 </footer>
 <dialog id="dialog" aria-labelledby="dialog-title" aria-describedby="dialog-body"><form method="dialog"><h2 id="dialog-title"></h2><p id="dialog-body"></p><div class="dialog-actions"><button value="cancel" class="quiet">Go back</button><button id="dialog-confirm" value="confirm" class="primary">Confirm</button></div></form></dialog>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>

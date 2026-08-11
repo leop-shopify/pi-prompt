@@ -32,6 +32,12 @@ describe("browser review client", () => {
     expect(sources[0]).toContain("retry-generation-button"); expect(sources[0]).toContain("/api/v1/generation-retries");
     expect(sources[0]).toContain("spec-retry-stage-button"); expect(sources[0]).toContain("Retry Spec revision"); expect(sources[0]).toContain("Revise Plan from comments");
     expect(sources[0]).toContain("Accept & send Spec"); expect(sources[0]).not.toContain("It will not execute until you press Enter");
+    expect(sources[0]).toContain("canSubmitPlan"); expect(sources[0]).toContain('mutatePlan("/api/v1/accept"');
+    expect(sources[0]).toContain('byId("submit-plan-actions").hidden = !planSubmissionAvailable');
+    expect(sources[0]).toContain('submitPlanButton.disabled = busy || !canSubmitPlan(snapshot, specSnapshot)'); expect(sources[0]).toContain('retryPlanStage ? "Retry Plan send" : "Submit Plan as-is"'); expect(sources[0]).toContain('"Submit this Plan as-is?"');
+    const submitPlanStart = sources[0].indexOf("const submitPlan ="); const submitPlanSource = sources[0].slice(submitPlanStart, sources[0].indexOf('byId("submit-plan-button")', submitPlanStart));
+    expect(submitPlanSource).toMatch(/await mutatePlan\("\/api\/v1\/accept"[\s\S]*finishReview\(\);[\s\S]*toast\("The authoritative Plan was sent to the agent\."\)/u);
+    expect(submitPlanSource).not.toMatch(/finishReview\(\);[\s\S]*await mutatePlan/u);
     const acceptSpecStart = sources[0].indexOf("const acceptSpec = (retry"); const acceptSpecSource = sources[0].slice(acceptSpecStart, sources[0].indexOf('byId("spec-accept-button")', acceptSpecStart));
     expect(acceptSpecSource).toMatch(/await mutateSpec\("\/api\/v1\/spec\/accept"[\s\S]*finishReview\(\);[\s\S]*toast\("The exact Spec revision was sent to the agent\."\)/u);
     expect(acceptSpecSource).not.toMatch(/finishReview\(\);[\s\S]*await mutateSpec/u);
@@ -46,11 +52,17 @@ describe("browser review client", () => {
     expect(sources[0]).toContain("selection-composer"); expect(sources[0]).toContain("composerState"); expect(sources[0]).toContain("clarificationDraft");
     expect(sources[0]).toContain("isAwaitingClarification"); expect(sources[0]).toContain('revise.hidden = activeStage !== "plan" || awaiting'); expect(sources[0]).toContain("spec-accept-button");
     expect(sources[0]).toContain("Boolean(item?.locked)"); expect(sources[0]).toContain("selectedGrillAnnotationIds"); expect(sources[0]).toContain('revisionRequestPayload(selected, byId("grill-revision-instruction").value)');
+    expect(sources[0]).toContain("const addressGrillFeedback =");
+    expect(sources[0]).toContain('byId("address-grill-feedback").addEventListener("click", addressGrillFeedback)');
+    expect(sources[0]).toContain('byId("review-plan-with-feedback-button").addEventListener("click", addressGrillFeedback)');
+    expect(sources[0]).toContain('reviewPlanFeedback.hidden = activeStage !== "grill" || selectedGrill.length === 0');
     expect(sources[0]).toMatch(/const openComposer = [\s\S]*?positionComposer\(anchor\); syncComposer\(current\); byId\("selection-comment"\)\.focus/);
     expect(sources[0]).toContain('stage !== "spec" && isAwaitingClarification(snapshot)');
     expect(sources[0]).not.toMatch(/sidebar[^\n]*(message|chat|agent)/i);
     expect(sources[2]).toContain("canRetryGeneration"); expect(sources[2]).toContain("canRetryStaging"); expect(sources[2]).toContain("canGenerateFreshSpec"); expect(sources[2]).toContain("specIsStale(snapshot, specSnapshot)");
     expect(sources[0]).toContain("canRunGrill(snapshot, specSnapshot)"); expect(sources[0]).toContain('snapshot.grill || snapshot.status === "error" ? "Retry Adversarial Review" : "Run Adversarial Review"');
+    expect(sources[0]).toContain('activeStage === "plan" && !currentGrill ? "Skip to Spec" : "Continue to To Spec"'); expect(sources[0]).toContain('reviewSkipped ? "Skipped"');
+    expect(sources[2]).toContain('["ready", "error"].includes(snapshot?.status)'); expect(sources[2]).toContain("source.planStateVersion !== planSnapshot.stateVersion");
     expect(sources[4]).toContain("note.locked"); expect(sources[4]).toContain("annotation-badge"); expect(sources[4]).toContain("snapshot.planMarkdown"); expect(sources[4]).toContain("projectPlanAnnotations");
     expect(sources[4]).toContain("target.selector.end"); expect(sources[4]).toContain("[...String(text)]");
     expect(sources[4]).toContain('element("button"'); expect(sources[4]).toContain("annotation-fallback"); expect(sources[4]).toContain('role: "checkbox"'); expect(sources[4]).toContain('"aria-checked"'); expect(sources[4]).toContain("Generated text is read-only");
@@ -67,9 +79,12 @@ describe("browser review client", () => {
     expect(mainStart).toBeGreaterThan(-1); expect(detail).toBeGreaterThan(mainStart); expect(detail).toBeLessThan(plan); expect(plan).toBeLessThan(mainEnd);
     expect(shell).toContain('id="original-prompt"'); expect(shell).toContain('id="plan-context"'); expect(shell).toContain('id="selection-composer"'); expect(shell).toContain('id="clarification-section"'); expect(shell).toContain('id="retry-generation-button"');
     expect(shell).toContain('aria-label="Plan workflow stages"'); expect(shell).toContain('id="stage-grill"'); expect(shell).toContain('<strong>Adversarial Review</strong>'); expect(shell).toContain('id="stage-spec"'); expect(shell).toContain('rows="5"');
+    expect(shell).toContain("Optional Adversarial Review → Optional To Spec"); expect(shell).toContain('<button id="to-spec-button" type="button" class="primary" hidden>Skip to Spec</button>');
     expect(shell).toContain('<button id="selection-cancel" type="button" class="quiet">Close</button>');
     expect(shell).toContain('id="document-surface"'); expect(shell).toMatch(/id="document-surface"[^\n]*id="plan-tree"[^\n]*id="spec-tree"[^\n]*id="agent-work-overlay"/u); expect(shell).toContain('role="status" aria-live="polite" hidden'); expect(shell).toContain('id="agent-work-label"'); expect(shell).toContain("Agent working…");
     expect(shell).toContain('id="grill-select-all"'); expect(shell).toContain('id="grill-clear-selection"'); expect(shell).toContain('id="grill-revision-instruction"'); expect(shell).toContain('id="address-grill-feedback"'); expect(shell).toContain("Address selected feedback");
+    expect(shell).toContain('id="review-plan-with-feedback-button"'); expect(shell).toContain("Review plan with feedback");
+    expect(shell).toContain('id="submit-plan-actions"'); expect(shell).toContain('id="submit-plan-button"'); expect(shell).toContain("Submit Plan as-is");
     expect(shell).not.toContain('id="annotation-list"'); expect(shell).not.toContain('id="notes-section"');
     expect(shell).not.toContain("<aside"); expect(shell).not.toContain('id="root-comment"'); expect(shell).not.toContain("Drawing index"); expect(shell).not.toContain("Markup rail");
     const shellIds = [...shell.matchAll(/\bid="([^"]+)"/gu)].map((match) => match[1]); expect(new Set(shellIds).size).toBe(shellIds.length);
@@ -101,7 +116,7 @@ describe("browser review client", () => {
     const activity = {}; updateLivePlanActivity(activity, {
       phase: "waiting-report", adapter: "delegated", primaryCount: 1, primaryStatus: "waiting",
       startedAt: "2026-07-11T13:00:00.000Z", updatedAt: "2026-07-11T13:01:00.000Z", budgetMinutes: 20,
-      model: { slot: "writing-hard", model: "openai/gpt-planner", thinking: "xhigh" },
+      model: { slot: "write-system", model: "openai/gpt-planner", thinking: "xhigh" },
       progress: { summary: "Reviewing focused tests", updatedAt: "2026-07-11T13:00:30.000Z" },
     }); registerLivePlanActivity(controller, activity);
     const port = createBrowserPlanReviewPort({ launcher: { open: async (url) => { launchUrl = url; } }, reopen: vi.fn() });
@@ -115,7 +130,7 @@ describe("browser review client", () => {
       activity: {
         phase: "waiting-report", headline: "Waiting for the primary report", summary: "One primary planner is working independently.",
         progress: { summary: "Reviewing focused tests", updatedAt: "2026-07-11T13:00:30.000Z" },
-        budgetMinutes: 20, adapter: "delegated", model: { slot: "writing-hard", model: "openai/gpt-planner", thinking: "xhigh" }, primary: { count: 1, status: "waiting" }, helpers: { supported: false, active: 0 },
+        budgetMinutes: 20, adapter: "delegated", model: { slot: "write-system", model: "openai/gpt-planner", thinking: "xhigh" }, primary: { count: 1, status: "waiting" }, helpers: { supported: false, active: 0 },
       },
       job: { startedAt: "2026-07-11T13:00:00.000Z" },
     });

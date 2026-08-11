@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseSpecIfMatch, parseSpecMutation, specStateEtag, toPublicSpecSnapshot } from "../spec/protocol.js";
-import { session } from "./spec-fixtures.js";
+import { planOnlySource, session } from "./spec-fixtures.js";
 
 describe("isolated Spec protocol", () => {
   const requestId = "request-id-spec-0001";
@@ -24,5 +24,7 @@ describe("isolated Spec protocol", () => {
     expect(snapshot.job).toEqual({ id: "opaque-spec-job", operation: "revision", baseSpecRevision: 1, startedAt: "2026-07-12T00:00:00.000Z" });
     expect(Object.keys(snapshot.job!)).toEqual(["id", "operation", "baseSpecRevision", "startedAt"]);
     expect(serialized).not.toContain("/tmp/"); expect(serialized).not.toContain("Sha256"); expect(serialized).not.toContain("PRIVATE INSTRUCTION"); expect(serialized).not.toContain("private-comment"); expect(serialized).not.toContain("jobId");
+    const planOnly = toPublicSpecSnapshot(session({ source: planOnlySource() }));
+    expect(planOnly.source).toEqual({ planDocumentRevision: 1, planStateVersion: 4 }); expect(JSON.stringify(planOnly)).not.toContain("grill");
   });
 });

@@ -4,8 +4,8 @@ export type SpecStatus = "paused" | "generating" | "ready" | "revising" | "accep
 export type SpecOperation = "initial" | "revision";
 export type SpecCommentStatus = "open" | "addressed" | "dismissed" | "orphaned";
 
-/** Immutable reference to the exact durable Plan and Adversarial Review projections used by Spec. */
-export interface SpecSourceReference {
+/** Immutable reference to the exact durable Plan projection used by Spec. */
+interface BaseSpecSourceReference {
   readonly planSessionId: string;
   readonly planArtifactPath: string;
   readonly planMarkdownPath: string;
@@ -14,20 +14,36 @@ export interface SpecSourceReference {
   readonly planStateVersion: number;
   readonly planMarkdownSha256: string;
   readonly annotationsSha256: string;
+}
+export interface PlanOnlySpecSourceReference extends BaseSpecSourceReference {
+  readonly grillPath?: never;
+  readonly grillPointer?: never;
+  readonly grillBasedOnDocumentRevision?: never;
+  readonly grillStateVersion?: never;
+  readonly grillDecisionTreeSha256?: never;
+}
+export interface ReviewedSpecSourceReference extends BaseSpecSourceReference {
   readonly grillPath: string;
   readonly grillPointer: "#/decisionTree";
   readonly grillBasedOnDocumentRevision: number;
   readonly grillStateVersion: number;
   readonly grillDecisionTreeSha256: string;
 }
+export type SpecSourceReference = PlanOnlySpecSourceReference | ReviewedSpecSourceReference;
 
 /** Private immutable generation input. Only the reference is persisted in Spec state. */
-export interface CapturedSpecSource {
-  readonly reference: SpecSourceReference;
+export interface PlanOnlyCapturedSpecSource {
+  readonly reference: PlanOnlySpecSourceReference;
+  readonly planMarkdown: string;
+  readonly annotations: readonly unknown[];
+}
+export interface ReviewedCapturedSpecSource {
+  readonly reference: ReviewedSpecSourceReference;
   readonly planMarkdown: string;
   readonly annotations: readonly unknown[];
   readonly decisionTree: unknown;
 }
+export type CapturedSpecSource = PlanOnlyCapturedSpecSource | ReviewedCapturedSpecSource;
 
 /** All offsets use Unicode code points, never UTF-16 code units or bytes. */
 export interface SpecRangeTarget {
@@ -97,7 +113,7 @@ export interface AcceptedSpecPayload {
     readonly documentRevision: number;
     readonly stateVersion: number;
   };
-  readonly grill: {
+  readonly grill?: {
     readonly path: string;
     readonly pointer: "#/decisionTree";
     readonly basedOnDocumentRevision: number;

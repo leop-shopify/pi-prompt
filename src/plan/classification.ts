@@ -1,5 +1,13 @@
 import type { PlanDocument, PlanElement } from "./types.js";
 
+export const ACCEPTED_PLAN_IMPLEMENTATION = [
+  "## Accepted Plan implementation",
+  "IMPLEMENT the accepted Plan now in the current repository and continue through verification.",
+  "Do not merely acknowledge it or rewrite it into another plan.",
+  "The exact accepted Plan Markdown at the end of this message is authoritative. Follow it without replacing it with a new planning artifact.",
+  "Do not create /create-goal or issue-tracker artifacts. Do not commit, push, deploy, install dependencies, or start services unless separately authorized.",
+].join("\n\n");
+
 export const EXECUTION_LEADERSHIP_BOOTSTRAP = [
   "## Execution leadership",
   "Before implementation, the receiving lead must inspect the leadership and orchestration skills available in the current session and preload the best fit. Do not assume or hard-code a tool or skill name; use the available task and agent capabilities.",

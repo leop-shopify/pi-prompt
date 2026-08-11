@@ -8,7 +8,7 @@ import { PLAN_LIMITS } from "../plan/schema.js";
 import type { PlanSession } from "../plan/types.js";
 import { TEAMS_REPORT_CHANNEL } from "../extension/teams-planning-adapter.js";
 import type { SpecGeneratorInput, SpecWriterSubmission } from "../spec/generator.js";
-import { captured as capturedSpec } from "./spec-fixtures.js";
+import { captured as capturedSpec, planOnlyCaptured } from "./spec-fixtures.js";
 import { liveGrillResultFixture } from "./fixtures/grill-result-shorthand.js";
 
 const endpoint = "http://127.0.0.1:43210/api/v1/writer-results";
@@ -16,7 +16,7 @@ const taskBody = "Scope: src/a.ts\nTest first: Add a failing test.\nImplement: M
 const markdown = `# Plan\r\n\r\n## Execution\r\nNormal\r\n\r\n## Implementation Tasks\r\nTasks\r\n\r\n### Build\r\n${taskBody.replaceAll("\n", "\r\n")}\r\n`;
 const sourceInfo = { path: "/packages/pi-extended-teams/extensions/index.ts", source: "npm:pi-extended-teams@2.0.0", scope: "user" as const, origin: "package" as const };
 const spawnTool = { name: "spawn_agent", description: "spawn", sourceInfo, parameters: { type: "object", required: ["prompt", "model_slot"], properties: {
-  prompt: { type: "string" }, model_slot: { type: "string", enum: ["writing-basic", "writing-hard"] }, name: { type: "string" }, cwd: { type: "string" }, metadata: { type: "object" },
+  prompt: { type: "string" }, model_slot: { type: "string", enum: ["write-feature", "write-system"] }, name: { type: "string" }, cwd: { type: "string" }, metadata: { type: "object" },
 } } } as ToolInfo;
 const malformedSpawnTool = { ...spawnTool, parameters: { type: "object", properties: { prompt: { type: "string" } } } } as ToolInfo;
 
@@ -45,6 +45,11 @@ function grillInput(signal = new AbortController().signal): PlanGeneratorInput {
 }
 function initialSpecInput(signal = new AbortController().signal): SpecGeneratorInput {
   const source = capturedSpec();
+  const session = { schemaVersion: 1 as const, planSessionId: "plan-session", stateVersion: 2, specRevision: 0, status: "generating" as const, source: source.reference, markdown: null, comments: [], generationJob: { jobId: "spec-job", operation: "initial" as const, baseSpecRevision: 0, selectedCommentIds: [], source: source.reference, startedAt: "2026-07-12T00:00:00.000Z" } };
+  return { session, source, jobId: "spec-job", operation: "initial", selectedCommentIds: [], signal };
+}
+function planOnlySpecInput(signal = new AbortController().signal): SpecGeneratorInput {
+  const source = planOnlyCaptured();
   const session = { schemaVersion: 1 as const, planSessionId: "plan-session", stateVersion: 2, specRevision: 0, status: "generating" as const, source: source.reference, markdown: null, comments: [], generationJob: { jobId: "spec-job", operation: "initial" as const, baseSpecRevision: 0, selectedCommentIds: [], source: source.reference, startedAt: "2026-07-12T00:00:00.000Z" } };
   return { session, source, jobId: "spec-job", operation: "initial", selectedCommentIds: [], signal };
 }
@@ -77,11 +82,12 @@ const toolCall = (): ToolCallEvent => ({ type: "tool_call", toolCallId: "spawn-c
 const spawnResult = (): ToolResultEvent => ({ type: "tool_result", toolCallId: "spawn-call", toolName: "spawn_agent", input: {}, content: [], details: { name: "planner-private123", session: "private" }, isError: false }) as ToolResultEvent;
 const endEvent = { type: "agent_end", messages: [] } as AgentEndEvent;
 
-async function dispatched(teams: boolean, prompt = "Build it") {
+async function dispatched(teams: boolean, promptOrInput: string | PlanGeneratorInput = "Build it") {
+  const planInput = typeof promptOrInput === "string" ? input(promptOrInput) : promptOrInput;
   const h = harness({ teams });
   expect(h.generator.configureWriterEndpoint(endpoint)).toMatchObject({ ok: true });
-  const completion = h.generator.generate(input(prompt));
-  expect(h.generator.dispatch("job")).toMatchObject({ ok: true });
+  const completion = h.generator.generate(planInput);
+  expect(h.generator.dispatch(planInput.jobId)).toMatchObject({ ok: true });
   await vi.waitFor(() => expect(h.pi.sendUserMessage).toHaveBeenCalledTimes(1));
   const marker = vi.mocked(h.pi.sendUserMessage).mock.calls[0]![0] as string;
   h.handlers.get("input")!(inputEvent(marker)); const started = h.handlers.get("before_agent_start")!(before(marker));
@@ -138,6 +144,12 @@ describe("current-agent authenticated writer handoff", () => {
     expect(h.pi.sendUserMessage).toHaveBeenCalledOnce(); expect(h.pi.sendMessage).not.toHaveBeenCalled();
   });
 
+  it("records skipped Adversarial Review without inventing review inputs", async () => {
+    const h = await dispatchedSpec({}, planOnlySpecInput());
+    expect(h.mission).toContain("Adversarial Review: skipped by user"); expect(h.mission).toContain("state that Adversarial Review was skipped by the user"); expect(h.mission).not.toContain("grill.json"); expect(h.mission).not.toContain("decision tree:");
+    const body = Buffer.from("# Plan-only Spec\n\nBuild directly from the Plan.\n"); expect(await h.generator.submitWriterResult(specSubmission(body))).toMatchObject({ ok: true }); h.handlers.get("agent_end")!(endEvent); await expect(h.completion).resolves.toMatchObject({ ok: true });
+  });
+
   it("delegates initial Spec writing to one canonical helper and keeps the parent waiting for authenticated bytes", async () => {
     const h = await dispatchedSpec({ teams: true });
     expect(h.agentContext).toContain("You are orchestration-only");
@@ -145,7 +157,7 @@ describe("current-agent authenticated writer handoff", () => {
     expect(h.agentContext).toContain("Do not inspect or write the Spec");
     expect(h.agentContext).not.toContain(endpoint); expect(h.agentContext).not.toContain("attempt_identity");
     expect(h.spawnInput).toMatchObject({
-      model_slot: "writing-hard", name: "planner-private123", cwd: "/tmp/pi-prompt-plans/plan-session",
+      model_slot: "write-system", name: "planner-private123", cwd: "/tmp/pi-prompt-plans/plan-session",
       metadata: { piPromptPlanning: { version: 1, correlation: "correlation-private123" } },
     });
     expect(h.mission).toContain("one dedicated Spec writer");
@@ -178,12 +190,21 @@ describe("current-agent authenticated writer handoff", () => {
     expect(h.mission).toContain("Existing Spec input: /tmp/pi-prompt-plans/plan-session/spec/spec.md");
     expect(h.mission).toContain("Revision instruction: Tighten the API section");
     expect(h.mission).toContain("transient writer draft /tmp/pi-prompt-plans/plan-session/spec/spec-result.md");
-    expect(h.spawnInput).toMatchObject({ model_slot: "writing-hard", name: "planner-private123" });
+    expect(h.spawnInput).toMatchObject({ model_slot: "write-system", name: "planner-private123" });
     h.handlers.get("agent_end")!(endEvent);
     const body = Buffer.from("# Revised Delegated Spec\n\n## API\nTightened.\n");
     await expect(h.generator.submitWriterResult(specSubmission(body, { jobId: "spec-revision-job", operation: "revision", baseSpecRevision: 1 }))).resolves.toMatchObject({ ok: true });
     await expect(h.completion).resolves.toMatchObject({ ok: true, markdown: body.toString("utf8") });
     expect(h.reportHandlers.size).toBe(0);
+  });
+
+  it("uses write-feature for normal initial, revision, and Adversarial Review planners", async () => {
+    for (const planInput of [input(), revisionInput(), grillInput()]) {
+      const h = await dispatched(true, planInput);
+      expect(h.spawnInput).toMatchObject({ model_slot: "write-feature", name: "planner-private123" });
+      await h.generator.close();
+      await expect(h.completion).resolves.toMatchObject({ ok: false, error: { code: "generation-cancelled" } });
+    }
   });
 
   it("falls back to direct Spec writing when teams capability is absent or malformed", async () => {
@@ -211,6 +232,35 @@ describe("current-agent authenticated writer handoff", () => {
     await expect(h.generator.submitWriterResult(specSubmission(Buffer.from("# Late Spec\n")))).resolves.toMatchObject({ ok: false, error: { code: "writer-attempt-rejected" } });
     h.pi.events.emit(TEAMS_REPORT_CHANNEL, { teamName: "private", name: "planner-private123", ok: true, report: "late" });
     expect(h.pi.sendUserMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces a failed delegated Spec writer without mislabeling it as a missing submission", async () => {
+    const h = await dispatchedSpec({ teams: true });
+    h.handlers.get("agent_end")!(endEvent);
+    h.pi.events.emit(TEAMS_REPORT_CHANNEL, {
+      teamName: "private", name: "planner-private123", ok: false,
+      report: 'Edit agent planner-private123 failed: Read agent model "vendor/model-x" is not available.',
+    });
+    await expect(h.completion).resolves.toMatchObject({ ok: false, error: { code: "delegation-failed" } });
+    expect(h.reportHandlers.size).toBe(0);
+    const followUp = vi.mocked(h.pi.sendUserMessage).mock.calls[1]![0] as string;
+    expect(followUp).toContain("Error code: delegation-failed");
+    expect(followUp).toContain("write-system");
+    expect(followUp).not.toContain("vendor/model-x");
+    expect(followUp).not.toContain(endpoint);
+    expect(followUp).not.toContain("attempt_identity");
+  });
+
+  it("settles a delegated Plan when its primary writer reports failure", async () => {
+    const h = await dispatched(true);
+    h.handlers.get("agent_end")!(endEvent);
+    h.pi.events.emit(TEAMS_REPORT_CHANNEL, {
+      teamName: "private", name: "planner-private123", ok: false,
+      report: 'Edit agent planner-private123 failed: Read agent model "vendor/model-x" is not available.',
+    });
+    await expect(h.completion).resolves.toMatchObject({ ok: false, error: { code: "delegation-failed" } });
+    expect(h.reportHandlers.size).toBe(0);
+    expect(h.pi.sendMessage).not.toHaveBeenCalled();
   });
 
   it("keeps an invalid Spec upload pending and accepts corrected bytes from the same attempt", async () => {

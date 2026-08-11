@@ -317,12 +317,22 @@ describe("PlanController", () => {
     h.generator.finish({ ok: true, outcome: { kind: "grill", basedOnDocumentRevision: before.documentRevision, annotations: {}, decisionTree: { nodes: [] } } }); expect((await retry.value.completion).ok).toBe(true);
   });
 
+  it("submits the unchanged durable Plan after optional Adversarial Review fails", async () => {
+    const h = await readyController(); const before = h.controller.snapshot(); if (!before) return;
+    const grill = await h.controller.grill({ expectedStateVersion: before.stateVersion }); if (!grill.ok) return; h.generator.finish({ ok: false, error: { code: "generation-failed", message: "Optional review failed safely." } }); await grill.value.completion;
+    const errored = h.controller.snapshot(); expect(errored).toMatchObject({ status: "error", documentRevision: before.documentRevision, document: before.document, committedMarkdown: before.committedMarkdown }); if (!errored) return;
+    expect((await h.controller.accept({ expectedStateVersion: errored.stateVersion, documentRevision: errored.documentRevision, confirmed: true })).ok).toBe(true);
+    expect(h.controller.snapshot()).toMatchObject({ status: "accepted", documentRevision: before.documentRevision, document: before.document }); expect(h.repository.accepted.at(-1)?.finalPlan).toBe(before.committedMarkdown); expect(h.staged).toHaveLength(1);
+  });
+
   it("atomically accepts and stages the exact plan once with the fixed leadership prelude", async () => {
     const h = await readyController(); const state = h.controller.snapshot(); if (!state) return;
     expect((await h.controller.accept({ expectedStateVersion: state.stateVersion, documentRevision: state.documentRevision, confirmed: false })).ok).toBe(false);
     expect((await h.controller.accept({ expectedStateVersion: state.stateVersion, documentRevision: state.documentRevision, confirmed: true })).ok).toBe(true);
     expect(h.repository.accepted).toHaveLength(1); expect(h.staged).toHaveLength(1);
-    expect(h.repository.accepted[0]?.finalPlan).toContain("# Ship");
+    const finalPlan = h.repository.accepted[0]?.finalPlan ?? "";
+    expect(finalPlan).toContain("# Ship");
+    expect(h.staged[0]?.endsWith(finalPlan.trim())).toBe(true);
     expect(h.staged[0]?.match(/## Execution leadership/g)).toHaveLength(1);
     expect(h.staged[0]).toContain("receiving lead must inspect the leadership and orchestration skills available in the current session and preload the best fit");
     expect(h.staged[0]).toContain("Do not assume or hard-code a tool or skill name; use the available task and agent capabilities.");

@@ -33,7 +33,7 @@ export interface PublicActivity {
   readonly progress?: { readonly summary: string; readonly updatedAt: string };
   readonly startedAt: string; readonly updatedAt: string; readonly budgetMinutes: number; readonly overBudget: boolean;
   readonly adapter: "delegated" | "direct";
-  readonly model: { readonly slot: "writing-basic" | "writing-hard"; readonly model?: string; readonly thinking?: string };
+  readonly model: { readonly slot: "write-feature" | "write-system"; readonly model?: string; readonly thinking?: string };
   readonly primary: { readonly count: 0 | 1; readonly status: PublicPrimaryStatus };
   readonly helpers: { readonly supported: false; readonly active: 0 };
   readonly timeline: readonly { readonly phase: PublicActivityPhase; readonly at: string }[];

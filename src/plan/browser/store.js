@@ -23,7 +23,8 @@ export function stageAvailability(snapshot) {
   const documentReady = Boolean(snapshot?.document);
   const grilling = snapshot?.job?.operation === "grill";
   const grilled = Boolean(snapshot?.grill && snapshot.grill.basedOnDocumentRevision === snapshot.documentRevision);
-  return Object.freeze({ plan: true, grill: documentReady && (grilling || grilled), spec: grilled && snapshot.status === "ready" && !snapshot.job });
+  const specReady = documentReady && ["ready", "error"].includes(snapshot?.status) && !snapshot?.job && !snapshot?.clarification;
+  return Object.freeze({ plan: true, grill: documentReady && (grilling || grilled), spec: specReady });
 }
 export function availableStage(requested, snapshot) {
   const available = stageAvailability(snapshot);
@@ -46,8 +47,12 @@ export function revisionRequestPayload(selectedAnnotationIds, instruction) {
   const trimmed = instruction.trim(); return { selectedAnnotationIds: [...selectedAnnotationIds], ...(trimmed ? { instruction: trimmed } : {}) };
 }
 export function canRevise(snapshot) { return ["ready", "error"].includes(snapshot.status) && snapshot.document !== null && !snapshot.job && (snapshot.status === "error" || openAnnotations(snapshot).length > 0); }
-export function canAccept(snapshot) { return snapshot.status === "ready" && !snapshot.job && snapshot.document !== null; }
+export function canAccept(snapshot) { return ["ready", "error"].includes(snapshot.status) && !snapshot.job && snapshot.document !== null; }
 export function canRetryStaging(snapshot) { return snapshot.status === "accepted" && snapshot.actions?.canRetryStaging === true && !snapshot.job && !snapshot.clarification; }
+export function canSubmitPlan(snapshot, specSnapshot) {
+  const specBusy = Boolean(specSnapshot?.job || ["generating", "revising"].includes(specSnapshot?.status));
+  return !specBusy && (canAccept(snapshot) || canRetryStaging(snapshot));
+}
 export function canRunGrill(snapshot, specSnapshot) {
   return Boolean(snapshot && ["ready", "error"].includes(snapshot.status) && snapshot.document && !snapshot.job && !snapshot.clarification
     && (!snapshot.grill || snapshot.status === "error" || specIsStale(snapshot, specSnapshot)));
@@ -61,8 +66,12 @@ export function canReviseSpec(snapshot) { return Boolean(snapshot && !snapshot.j
 export function canAcceptSpec(snapshot) { return Boolean(snapshot && snapshot.status === "ready" && snapshot.markdown !== null && !snapshot.job); }
 export function canRetrySpecStaging(snapshot) { return Boolean(snapshot && snapshot.status === "accepted" && snapshot.actions?.canRetryStaging && !snapshot.job); }
 export function specIsStale(planSnapshot, specSnapshot) {
-  if (!planSnapshot?.grill || !specSnapshot?.source) return false;
-  return specSnapshot.source.planDocumentRevision !== planSnapshot.documentRevision
-    || specSnapshot.source.grillBasedOnDocumentRevision !== planSnapshot.grill.basedOnDocumentRevision
-    || specSnapshot.source.grillStateVersion !== planSnapshot.stateVersion;
+  if (!planSnapshot?.document || !specSnapshot?.source) return false;
+  const source = specSnapshot.source;
+  const currentGrill = planSnapshot.grill?.basedOnDocumentRevision === planSnapshot.documentRevision;
+  const sourceGrill = source.grillBasedOnDocumentRevision !== undefined;
+  return source.planDocumentRevision !== planSnapshot.documentRevision
+    || source.planStateVersion !== planSnapshot.stateVersion
+    || currentGrill !== sourceGrill
+    || sourceGrill && source.grillBasedOnDocumentRevision !== planSnapshot.grill?.basedOnDocumentRevision;
 }

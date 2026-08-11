@@ -12,8 +12,14 @@ describe("Spec source capture", () => {
     expect(verifyFreshSpecSource(captured.value, plan(), "/tmp/pi-prompt-plans/plan-session").ok).toBe(true);
     expect(verifyFreshSpecSource(captured.value, plan({ annotations: [{ changed: true }] as never }), "/tmp/pi-prompt-plans/plan-session")).toMatchObject({ ok: false, issues: [{ code: "stale-spec-source" }] });
   });
-  it("requires a ready exact committed Plan and current Grill", () => {
+  it("captures a durable Plan without Adversarial Review and detects later review provenance", () => {
+    const skipped = plan({ status: "error", grill: undefined }); const captured = captureSpecSource(skipped, "/tmp/pi-prompt-plans/plan-session"); expect(captured.ok).toBe(true); if (!captured.ok) return;
+    expect(captured.value.reference).not.toHaveProperty("grillPath"); expect(captured.value).not.toHaveProperty("decisionTree"); expect(validateSpecSourceReference(captured.value.reference).ok).toBe(true);
+    expect(verifyFreshSpecSource(captured.value, skipped, "/tmp/pi-prompt-plans/plan-session").ok).toBe(true);
+    expect(verifyFreshSpecSource(captured.value, plan(), "/tmp/pi-prompt-plans/plan-session")).toMatchObject({ ok: false, issues: [{ code: "stale-spec-source" }] });
+  });
+  it("requires exact committed Plan bytes with no active job", () => {
     expect(captureSpecSource(plan({ committedMarkdown: undefined }), "/tmp/x").ok).toBe(false);
-    expect(captureSpecSource(plan({ grill: undefined }), "/tmp/x").ok).toBe(false);
+    expect(captureSpecSource(plan({ status: "grilling", generationJob: { operation: "grill" } as never }), "/tmp/x").ok).toBe(false);
   });
 });

@@ -15,7 +15,7 @@ describe("browser protocol", () => {
     const snapshot = toPublicSnapshot(privateState, {}, {
       phase: "waiting-report", headline: "Waiting for the primary report", summary: "One primary planner is working independently.",
       startedAt: "2026-07-10T00:00:00.000Z", updatedAt: "2026-07-10T00:01:00.000Z", budgetMinutes: 10, overBudget: true,
-      adapter: "delegated", model: { slot: "reading-default", model: "provider/planner", thinking: "high" }, primary: { count: 1, status: "waiting" }, helpers: { supported: false, active: 0 },
+      adapter: "delegated", model: { slot: "write-feature", model: "provider/planner", thinking: "high" }, primary: { count: 1, status: "waiting" }, helpers: { supported: false, active: 0 },
       progress: { summary: `  ${"p".repeat(130)}\nPRIVATE TRAILING  `, updatedAt: "2026-07-10T00:00:30.000Z", model: "PRIVATE MODEL", teamName: "PRIVATE TEAM" },
       timeline: [{ phase: "capability-detected", at: "2026-07-10T00:00:00.000Z" }, { phase: "waiting-report", at: "2026-07-10T00:01:00.000Z" }],
       privateReport: "REPORT SECRET", toolName: "spawn_agent", nonce: "NONCE SECRET",
@@ -32,7 +32,7 @@ describe("browser protocol", () => {
     expect(snapshot.activity).toEqual({
       phase: "waiting-report", headline: "Waiting for the primary report", summary: "One primary planner is working independently.",
       startedAt: "2026-07-10T00:00:00.000Z", updatedAt: "2026-07-10T00:01:00.000Z", budgetMinutes: 10, overBudget: true,
-      adapter: "delegated", model: { slot: "reading-default", model: "provider/planner", thinking: "high" }, primary: { count: 1, status: "waiting" }, helpers: { supported: false, active: 0 },
+      adapter: "delegated", model: { slot: "write-feature", model: "provider/planner", thinking: "high" }, primary: { count: 1, status: "waiting" }, helpers: { supported: false, active: 0 },
       progress: { summary: "p".repeat(120), updatedAt: "2026-07-10T00:00:30.000Z" },
       timeline: [{ phase: "capability-detected", at: "2026-07-10T00:00:00.000Z" }, { phase: "waiting-report", at: "2026-07-10T00:01:00.000Z" }],
     });

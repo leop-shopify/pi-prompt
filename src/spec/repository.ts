@@ -4,6 +4,7 @@ import { chmod, lstat, mkdir, open, readFile, realpath, rename, unlink } from "n
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { validateSpecBranchLocator, type SpecLocatorScan } from "./locator.js";
 import { validateSpecSession } from "./schema.js";
+import { hasAdversarialReview } from "./source.js";
 import type { AcceptedSpecPayload, AppendSpecBranchLocator, SpecBranchLocator, SpecSession } from "./types.js";
 
 export type SpecAuditKind = "created" | "rebased" | "state-changed" | "revision-committed" | "accepted" | "paused" | "cancelled";
@@ -58,7 +59,7 @@ export function createSpecRepository(options: { readonly rootDir: string; readon
 }
 export function acceptedSpecPayload(session: SpecSession): AcceptedSpecPayload {
   if (session.status !== "accepted" || session.markdown === null) throw error("not-accepted", "Spec is not accepted."); const source = session.source;
-  return Object.freeze({ kind: "spec", plan: { sessionId: source.planSessionId, artifactPath: source.planArtifactPath, planMarkdownPath: source.planMarkdownPath, annotationsPath: source.annotationsPath, documentRevision: source.planDocumentRevision, stateVersion: source.planStateVersion }, grill: { path: source.grillPath, pointer: source.grillPointer, basedOnDocumentRevision: source.grillBasedOnDocumentRevision, stateVersion: source.grillStateVersion }, markdown: session.markdown });
+  return Object.freeze({ kind: "spec", plan: { sessionId: source.planSessionId, artifactPath: source.planArtifactPath, planMarkdownPath: source.planMarkdownPath, annotationsPath: source.annotationsPath, documentRevision: source.planDocumentRevision, stateVersion: source.planStateVersion }, ...(hasAdversarialReview(source) ? { grill: { path: source.grillPath, pointer: source.grillPointer, basedOnDocumentRevision: source.grillBasedOnDocumentRevision, stateVersion: source.grillStateVersion } } : {}), markdown: session.markdown });
 }
 function validated(session: SpecSession): SpecSession { const result = validateSpecSession(session); if (!result.ok) throw error("invalid-session", "Spec session validation failed."); return result.value; }
 function transition(next: SpecSession, previous: SpecSession | null, eventKind: SpecAuditKind): void {

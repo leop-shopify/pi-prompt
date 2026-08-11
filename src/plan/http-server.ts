@@ -47,7 +47,7 @@ export interface PlanHttpHostOptions {
   readonly planRoot?: string;
   /** Optional independent sidecar. No Spec result is ever routed through the Plan controller. */
   readonly specController?: SpecController;
-  /** Lazily creates the sidecar after the current Plan has an Adversarial Review artifact. */
+  /** Lazily creates the sidecar from the current durable Plan and optional Adversarial Review. */
   readonly createSpecController?: () => Promise<SpecController | null>;
   /** Runs exactly once after a scheduled terminal close completes. Manual, idle, and reopen closes do not notify. */
   readonly onTerminalClose?: (host: PlanHttpHost) => void | Promise<void>;
@@ -342,7 +342,7 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
     if (closing) { send(response, closingRecord()); return; }
     const controller = await ensureSpecController();
     if (closing) { send(response, closingRecord()); return; }
-    if (!controller) { send(response, { status: 404, body: errorBody("spec-unavailable", "The Spec sidecar is unavailable until the current Plan has completed Adversarial Review.") }); return; }
+    if (!controller) { send(response, { status: 404, body: errorBody("spec-unavailable", "The Spec sidecar is unavailable for the current Plan source.") }); return; }
     const method = request.method ?? "";
     if (pathname === "/api/v1/spec/snapshot") {
       if (method !== "GET") { methodNotAllowed(response, ["GET"]); return; }
@@ -444,6 +444,8 @@ export async function startPlanHttpHost(options: PlanHttpHostOptions): Promise<P
       const dispatched = options.controller.dispatchGeneration(started.value.jobId); if (!dispatched.ok) return controllerFailure(dispatched);
       return withSnapshot(202, { accepted: true, job: { operation: state.clarifications.pending.operation, status: state.clarifications.pending.operation === "initial" ? "generating" : "revising" } });
     } else if (kind === "accept" && "documentRevision" in body && "confirmed" in body) {
+      const spec = activeSpecController?.snapshot();
+      if (spec && (spec.generationJob || ["generating", "revising"].includes(spec.status))) return { status: 409, body: errorBody("spec-job-active", "The Plan cannot be submitted while Spec generation is active.") };
       result = await options.controller.accept({ expectedStateVersion: expected, documentRevision: body.documentRevision, confirmed: body.confirmed });
       if (!result.ok) return result.error.code === "stage-failed"
         ? withSnapshot(503, { error: { code: result.error.code, message: result.error.message }, accepted: true })

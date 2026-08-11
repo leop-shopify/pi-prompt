@@ -102,7 +102,7 @@ describe("extension registration", () => {
     );
   });
 
-  it("moves shortcut text into the editor and preserves only generation mode on reopen", async () => {
+  it("does not carry a prior planning choice into new prompts or shortcut opens", async () => {
     const { pi, commands, shortcuts } = makePi();
     const runtime = makeRuntime();
     const runEditor = vi.fn()
@@ -114,14 +114,12 @@ describe("extension registration", () => {
     await commands.get("prompt").handler("", commandCtx);
     expect(runtime.generate).toHaveBeenCalledWith(commandCtx, { text: "first", mode: "careful", saveAsTemplate: false });
     await commands.get("prompt").handler("", commandCtx);
-    expect(runEditor.mock.calls[1]?.[2]).toMatchObject({ mode: "careful" });
-    expect(runEditor.mock.calls[1]?.[2]).not.toHaveProperty("execution");
-    expect(runEditor.mock.calls[1]?.[2]).not.toHaveProperty("selectedSkills");
+    expect(runEditor.mock.calls[1]?.[2]).toEqual({});
 
     const shortcutCtx = ctx("half-written\nsecond line");
     await shortcuts.get("ctrl+alt+p").handler(shortcutCtx as unknown as ExtensionContext);
     expect(shortcutCtx.ui.setEditorText).toHaveBeenCalledWith("");
-    expect(runEditor.mock.calls[2]?.[2]).toMatchObject({ text: "half-written\nsecond line" });
+    expect(runEditor.mock.calls[2]?.[2]).toEqual({ text: "half-written\nsecond line" });
   });
 
   it("wires public lifecycle events to close before tree and rescan afterward", async () => {

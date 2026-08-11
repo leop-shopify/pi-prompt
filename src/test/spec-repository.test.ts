@@ -2,14 +2,18 @@ import { mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createSpecRepository } from "../spec/repository.js";
+import { acceptedSpecPayload, createSpecRepository } from "../spec/repository.js";
 import { sha256Text } from "../spec/schema.js";
 import type { SpecBranchLocator, SpecSession } from "../spec/types.js";
-import { MARKDOWN, NOW, source } from "./spec-fixtures.js";
+import { MARKDOWN, NOW, planOnlySource, session, source } from "./spec-fixtures.js";
 
 const roots: string[] = []; async function root() { const value = await mkdtemp(join(tmpdir(), "spec-repo-")); roots.push(value); return value; }
 afterEach(async () => { await Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true }))); });
 describe("durable Spec repository", () => {
+  it("preserves reviewed provenance and omits it when the user skipped review", () => {
+    expect(acceptedSpecPayload(session({ status: "accepted" })).grill).toEqual({ path: "/tmp/pi-prompt-plans/plan-session/grill.json", pointer: "#/decisionTree", basedOnDocumentRevision: 1, stateVersion: 4 });
+    const skipped = acceptedSpecPayload(session({ status: "accepted", source: planOnlySource() })); expect(skipped).not.toHaveProperty("grill"); expect(skipped.plan.stateVersion).toBe(4);
+  });
   it("commits independent immutable states/revisions, projections, atomic final, and recovery", async () => {
     const base = await root(); const repo = createSpecRepository({ rootDir: base, clock: () => NOW }); const locators: SpecBranchLocator[] = [];
     const initial: SpecSession = { schemaVersion: 1, planSessionId: "plan-session", stateVersion: 1, specRevision: 0, status: "paused", source: source(base), markdown: null, comments: [] };
@@ -66,7 +70,7 @@ describe("durable Spec repository", () => {
     await repo.commit({ session: initial, previous: null, eventKind: "created", appendLocator: (locator) => locators.unshift(locator) }); const ready: SpecSession = { ...initial, stateVersion: 2, specRevision: 1, status: "ready", markdown: MARKDOWN };
     await repo.commit({ session: ready, previous: initial, eventKind: "revision-committed", appendLocator: (locator) => locators.unshift(locator) }); const accepted: SpecSession = { ...ready, stateVersion: 3, status: "accepted" };
     await repo.commitAccepted({ session: accepted, previous: ready, eventKind: "accepted", finalMarkdown: MARKDOWN, appendLocator: (locator) => locators.unshift(locator) });
-    const tampered: SpecSession = { ...accepted, source: { ...accepted.source, planArtifactPath: outside, planMarkdownPath: join(outside, "plan.md"), annotationsPath: join(outside, "annotations.json"), grillPath: join(outside, "grill.json") } };
+    const tampered: SpecSession = { ...accepted, source: { ...source(base), planArtifactPath: outside, planMarkdownPath: join(outside, "plan.md"), annotationsPath: join(outside, "annotations.json"), grillPath: join(outside, "grill.json") } };
     const bytes = `${JSON.stringify(tampered, null, 2)}\n`; const stateSha256 = sha256Text(bytes); const artifact = join(base, "plan-session", "spec");
     await writeFile(join(artifact, "states", `3-${stateSha256}.spec.json`), bytes); const locator = { ...locators[0]!, stateSha256 };
     await Promise.all(["spec.json", "comments.json", "spec.md", "final-spec.md"].map((name) => unlink(join(artifact, name))));

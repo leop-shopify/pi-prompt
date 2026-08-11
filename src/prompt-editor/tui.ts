@@ -1,6 +1,7 @@
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { decodeKittyPrintable, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { readClipboardPaste } from "./clipboard.js";
 import { TextArea } from "../textarea.js";
 import { buildShortcutBar, frameChromeHeight, frameContentWidth, renderFrame, statusNote } from "../ui.js";
 import { GENERATION_PROFILES } from "../plan/modes.js";
@@ -21,8 +22,8 @@ const EXIT_CHOICES = [
 export function runPromptEditor(
   _pi: ExtensionAPI, ctx: ExtensionContext, initial: PromptEditorInitialState = {},
 ): Promise<PromptEditorOutcome> {
-  return ctx.ui.custom<PromptEditorOutcome>((tui, theme, _keybindings, done) =>
-    createPromptEditorComponent({ tui, theme, initial, done, returnToInput: ctx.ui.setEditorText.bind(ctx.ui) }), {
+  return ctx.ui.custom<PromptEditorOutcome>((tui, theme, keybindings, done) =>
+    createPromptEditorComponent({ tui, theme, keybindings, initial, done, returnToInput: ctx.ui.setEditorText.bind(ctx.ui) }), {
       overlay: true,
       overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%", minWidth: 40, margin: 1 },
     });
@@ -31,17 +32,21 @@ export function runPromptEditor(
 export interface PromptEditorComponentOptions {
   readonly tui: Pick<TUI, "terminal" | "requestRender">;
   readonly theme: Theme;
+  readonly keybindings: Pick<KeybindingsManager, "matches">;
   readonly initial?: PromptEditorInitialState;
   readonly done: (outcome: PromptEditorOutcome) => void;
   readonly returnToInput: (text: string) => void;
+  readonly readClipboardPaste?: () => Promise<string | null>;
 }
 
 export function createPromptEditorComponent(options: PromptEditorComponentOptions): Component {
-  const { tui, theme, done, returnToInput } = options;
+  const { tui, theme, keybindings, done, returnToInput } = options;
   const initial = options.initial ?? {};
+  const pasteFromClipboard = options.readClipboardPaste ?? readClipboardPaste;
   const state = createPromptEditorState(initial);
   let overlayMode: "edit" | "confirm-exit" = "edit";
   let selectionInfo = "";
+  let active = true;
 
   const finish = (kind: "generate" | "direct-send"): void => {
     const text = textarea.getText();
@@ -76,7 +81,7 @@ export function createPromptEditorComponent(options: PromptEditorComponentOption
   });
   textarea.setText(initial.text ?? "");
 
-  const component: Component = {
+  const component: Component & { dispose(): void } = {
     render(width: number): string[] {
       const height = Math.max(18, tui.terminal.rows - 2);
       const contentWidth = frameContentWidth(width);
@@ -103,9 +108,19 @@ export function createPromptEditorComponent(options: PromptEditorComponentOption
       ];
     },
     invalidate(): void { textarea.invalidate(); },
+    dispose(): void { active = false; },
     handleInput(data: string): void {
       if (overlayMode === "confirm-exit") { handleExitChoice(data); return; }
       selectionInfo = "";
+      if (keybindings.matches(data, "app.clipboard.pasteImage")) {
+        state.focus = "editor";
+        tui.requestRender();
+        void pasteFromClipboard().then((text) => {
+          if (!active || !text) return;
+          textarea.handleInput(`\x1b[200~${text}\x1b[201~`);
+        }).catch(() => undefined);
+        return;
+      }
       if (matchesKey(data, "ctrl+shift+enter") || matchesKey(data, "ctrl+shift+return")) { finish("direct-send"); return; }
       if (matchesKey(data, "ctrl+enter") || matchesKey(data, "ctrl+return")) { primaryAction(); return; }
       if (matchesKey(data, "ctrl+alt+p")) { moveToInput(textarea.getText()); return; }

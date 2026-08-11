@@ -1,18 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
 import { SpecController, formatAcceptedSpec, type SpecControllerOptions } from "../spec/controller.js";
 import type { SpecGeneratorResult } from "../spec/generator.js";
-import type { SpecSession } from "../spec/types.js";
+import type { CapturedSpecSource, SpecSession } from "../spec/types.js";
 import { SPEC_LIMITS, validateSpecMarkdown } from "../spec/schema.js";
-import { captured, MARKDOWN, NOW, session } from "./spec-fixtures.js";
+import { captured, MARKDOWN, NOW, planOnlyCaptured, session } from "./spec-fixtures.js";
 
 function harness() {
-  let state: SpecSession; let finish!: (result: SpecGeneratorResult) => void; let nextId = 0; let currentSource = captured(); const staged: string[] = [];
+  let state: SpecSession; let finish!: (result: SpecGeneratorResult) => void; let nextId = 0; let currentSource: CapturedSpecSource = captured(); const staged: string[] = [];
   const repository = { commit: vi.fn(async ({ session }: any) => { state = session; return { state: session }; }), commitAccepted: vi.fn(async ({ session }: any) => { state = session; return { state: session }; }), close: vi.fn() };
   const generator = { generate: vi.fn(() => new Promise<SpecGeneratorResult>((resolve) => { finish = resolve; })), configureWriterEndpoint: vi.fn(() => ({ ok: true as const, value: undefined })), submitWriterResult: vi.fn(async () => ({ ok: true as const, value: undefined })), dispatch: vi.fn(() => ({ ok: true as const, value: undefined })), close: vi.fn() };
   const sourceFresh = vi.fn(async () => ({ ok: true as const, value: currentSource }));
   const stage = vi.fn((payload: string) => { staged.push(payload); });
   const options: SpecControllerOptions = { repository, generator, appendLocator: () => undefined, source: { fresh: sourceFresh }, idFactory: () => `id-${++nextId}`, clock: () => NOW, stager: { stage } };
-  return { options, repository, generator, sourceFresh, stage, staged, finish: (result: SpecGeneratorResult) => finish(result), setSource: (value: ReturnType<typeof captured>) => { currentSource = value; }, state: () => state! };
+  return { options, repository, generator, sourceFresh, stage, staged, finish: (result: SpecGeneratorResult) => finish(result), setSource: (value: CapturedSpecSource) => { currentSource = value; }, state: () => state! };
 }
 describe("SpecController", () => {
   it("generates exact Markdown, comments by code point, revises, and addresses only after success", async () => {
@@ -24,6 +24,12 @@ describe("SpecController", () => {
   it("freshness-checks acceptance, commits once, then stages explicit source metadata and exact Markdown", async () => {
     const h = harness(); const created = await SpecController.create(h.options, captured()); if (!created.ok) return; const initial = await created.value.generate({ expectedStateVersion: 1 }); if (!initial.ok) return; h.finish({ ok: true, markdown: MARKDOWN }); await initial.value.completion; const state = created.value.snapshot(); h.sourceFresh.mockClear(); expect((await created.value.accept({ expectedStateVersion: state.stateVersion, specRevision: 1, confirmed: true })).ok).toBe(true);
     expect(h.sourceFresh).toHaveBeenCalledOnce(); expect(h.repository.commitAccepted).toHaveBeenCalledOnce(); expect(h.stage).toHaveBeenCalledOnce(); expect(h.repository.commitAccepted.mock.invocationCallOrder[0]).toBeLessThan(h.stage.mock.invocationCallOrder[0]!); expect(h.staged[0]).toBe(formatAcceptedSpec(created.value.snapshot())); expect(h.staged[0]!.endsWith(MARKDOWN)).toBe(true); expect(h.staged[0]).toContain("Plan annotations: /tmp/pi-prompt-plans/plan-session/annotations.json"); expect(h.staged[0]).toContain("Adversarial Review: /tmp/pi-prompt-plans/plan-session/grill.json#/decisionTree"); expect(h.staged[0]).not.toMatch(/^\/(?:goal|loop) /u);
+  });
+  it("stages explicit skipped-review provenance for a plan-only Spec", async () => {
+    const h = harness(); const source = planOnlyCaptured(); h.setSource(source); const created = await SpecController.create(h.options, source); if (!created.ok) return;
+    const initial = await created.value.generate({ expectedStateVersion: 1 }); if (!initial.ok) return; h.finish({ ok: true, markdown: MARKDOWN }); await initial.value.completion; const ready = created.value.snapshot();
+    expect((await created.value.accept({ expectedStateVersion: ready.stateVersion, specRevision: ready.specRevision, confirmed: true })).ok).toBe(true);
+    expect(h.staged[0]).toContain("Adversarial Review: Skipped by user"); expect(h.staged[0]).not.toContain("grill.json"); expect(h.staged[0]).not.toContain("Adversarial Review based-on revision");
   });
   it("dispatches immediate implementation so the agent prompt cannot reasonably be read as acknowledgement-only", () => {
     const payload = formatAcceptedSpec(session({ status: "accepted" })); const markdownStart = payload.length - MARKDOWN.length;

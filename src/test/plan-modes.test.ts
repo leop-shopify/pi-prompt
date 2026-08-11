@@ -32,8 +32,8 @@ describe("packaged planning levels", () => {
     expect(Object.isFrozen(GENERATION_MODE_ORDER)).toBe(true);
     expect(Object.isFrozen(GENERATION_PROFILES)).toBe(true);
     expect(Object.fromEntries(GENERATION_MODE_ORDER.map((mode) => [mode, GENERATION_PROFILES[mode].modelSlot]))).toEqual({
-      "quick-win": "writing-basic", normal: "writing-basic", careful: "writing-basic",
-      "hard-thinker": "writing-hard", "fully-orchestrated": "writing-hard",
+      "quick-win": "write-feature", normal: "write-feature", careful: "write-feature",
+      "hard-thinker": "write-system", "fully-orchestrated": "write-system",
     });
     for (const definition of Object.values(GENERATION_PROFILES)) {
       expect(Object.isFrozen(definition)).toBe(true);

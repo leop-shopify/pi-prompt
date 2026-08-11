@@ -30,7 +30,7 @@ export interface TeamsPlanningAdapterOptions {
   readonly mission: string;
   readonly modelSlot: PlanningModelSlot;
   readonly onPhase: (phase: TeamsAdapterPhase) => void;
-  readonly onReport: (report: string) => void;
+  readonly onReport: (report: string, ok: boolean) => void;
   readonly onProgress: (status: string, updatedAt: number) => void;
   readonly onModel?: (model: PlanningModelInfo) => void;
   readonly now?: () => number;
@@ -38,7 +38,7 @@ export interface TeamsPlanningAdapterOptions {
 }
 
 /** Detects the supported teams tool by active state, schema, and Pi-owned provenance metadata. */
-export function detectTeamsPlanningCapability(catalog: TeamsCapabilityCatalog, requiredSlot: PlanningModelSlot = "writing-hard"): boolean {
+export function detectTeamsPlanningCapability(catalog: TeamsCapabilityCatalog, requiredSlot: PlanningModelSlot = "write-system"): boolean {
   try {
     if (!catalog.getActiveTools().includes(TEAMS_SPAWN_TOOL)) return false;
     const candidates = catalog.getAllTools().filter((candidate) => candidate.name === TEAMS_SPAWN_TOOL);
@@ -149,7 +149,7 @@ export class TeamsPlanningAdapter {
     this.#acceptedReport = report.report;
     this.#primaryStatus = "report-received";
     this.#options.onPhase("report-received");
-    this.#options.onReport(report.report);
+    this.#options.onReport(report.report, report.ok);
     return true;
   }
 

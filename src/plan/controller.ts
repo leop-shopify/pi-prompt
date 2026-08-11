@@ -218,9 +218,9 @@ export class PlanController {
     const observed = this.#state;
     const acceptedRetry = observed?.status === "accepted" && !observed.generationJob && observed.document !== null
       && observed.documentRevision === input.documentRevision && observed.stateVersion === input.expectedStateVersion;
-    const ready = observed?.status === "ready" && !observed.generationJob && observed.document !== null
-      && observed.stateVersion === input.expectedStateVersion && observed.documentRevision === input.documentRevision;
-    if ((!ready && !acceptedRetry) || !observed?.document) return Promise.resolve(failure("state-conflict", "The plan is not ready at the expected version."));
+    const acceptable = ["ready", "error"].includes(observed?.status ?? "") && !observed?.generationJob && observed?.document !== null
+      && observed?.stateVersion === input.expectedStateVersion && observed?.documentRevision === input.documentRevision;
+    if ((!acceptable && !acceptedRetry) || !observed?.document) return Promise.resolve(failure("state-conflict", "The durable plan is not available at the expected version."));
     if (acceptedRetry && this.#acceptedStaged) return Promise.resolve(success(undefined));
     const operation = this.#performAccept(input, observed, acceptedRetry);
     this.#acceptInFlight = operation;
@@ -237,7 +237,7 @@ export class PlanController {
     if (!acceptedRetry) {
       const committed = await this.#enqueue(async () => {
         const current = this.#mutableState(input.expectedStateVersion); if (!current.ok) return current;
-        if (current.value.status !== "ready" || current.value.documentRevision !== input.documentRevision || !current.value.document || current.value.generationJob) return failure("state-conflict", "The plan is not ready at the expected version.");
+        if (!["ready", "error"].includes(current.value.status) || current.value.documentRevision !== input.documentRevision || !current.value.document || current.value.generationJob) return failure("state-conflict", "The durable plan is not available at the expected version.");
         const next = { ...current.value, stateVersion: current.value.stateVersion + 1, status: "accepted", lastError: undefined } as PlanSession;
         return this.#commitAccepted(next, current.value, markdown);
       });

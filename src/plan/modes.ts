@@ -3,7 +3,7 @@ import { relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { GenerationMode } from "./types.js";
 
-export type PlanningModelSlot = "writing-basic" | "writing-hard";
+export type PlanningModelSlot = "write-feature" | "write-system";
 export interface PlanLevelDefinition {
   readonly mode: GenerationMode;
   readonly label: string;
@@ -19,11 +19,11 @@ export const GENERATION_MODE_ORDER: readonly GenerationMode[] = Object.freeze([
 ]);
 
 export const GENERATION_PROFILES: Readonly<Record<GenerationMode, PlanLevelDefinition>> = Object.freeze({
-  "quick-win": level("quick-win", "Quick win", "Fast planning for one bounded, low-risk change.", "A small change with obvious scope and verification.", 5, "writing-basic"),
-  normal: level("normal", "Normal plan", "Balanced planning for ordinary features and fixes.", "Most repository work that needs a concrete implementation sequence.", 10, "writing-basic"),
-  careful: level("careful", "Careful", "Risk-first planning with extra attention to failure paths and reversibility.", "State, persistence, security, compatibility, or release-sensitive work.", 15, "writing-basic"),
-  "hard-thinker": level("hard-thinker", "Hard thinker", "Architecture-first planning for difficult boundaries and tradeoffs.", "Protocols, ownership, migrations, and consequential design choices.", 20, "writing-hard"),
-  "fully-orchestrated": level("fully-orchestrated", "Fully orchestrated", "Broad planning across complex domains.", "Complex work spanning independent domains or repositories.", 30, "writing-hard"),
+  "quick-win": level("quick-win", "Quick win", "Fast planning for one bounded, low-risk change.", "A small change with obvious scope and verification.", 5, "write-feature"),
+  normal: level("normal", "Normal plan", "Balanced planning for ordinary features and fixes.", "Most repository work that needs a concrete implementation sequence.", 10, "write-feature"),
+  careful: level("careful", "Careful", "Risk-first planning with extra attention to failure paths and reversibility.", "State, persistence, security, compatibility, or release-sensitive work.", 15, "write-feature"),
+  "hard-thinker": level("hard-thinker", "Hard thinker", "Architecture-first planning for difficult boundaries and tradeoffs.", "Protocols, ownership, migrations, and consequential design choices.", 20, "write-system"),
+  "fully-orchestrated": level("fully-orchestrated", "Fully orchestrated", "Broad planning across complex domains.", "Complex work spanning independent domains or repositories.", 30, "write-system"),
 });
 
 const packagedRoot = fileURLToPath(new URL("../../plans-mode/", import.meta.url));

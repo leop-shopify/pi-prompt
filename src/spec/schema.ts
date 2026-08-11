@@ -8,6 +8,8 @@ export const SPEC_LIMITS = Object.freeze({
 });
 const STATUSES = new Set(["paused", "generating", "ready", "revising", "accepted", "cancelled", "error"]);
 const COMMENT_STATUSES = new Set(["open", "addressed", "dismissed", "orphaned"]);
+const PLAN_SOURCE_KEYS = ["planSessionId", "planArtifactPath", "planMarkdownPath", "annotationsPath", "planDocumentRevision", "planStateVersion", "planMarkdownSha256", "annotationsSha256"];
+const GRILL_SOURCE_KEYS = ["grillPath", "grillPointer", "grillBasedOnDocumentRevision", "grillStateVersion", "grillDecisionTreeSha256"];
 
 export type SpecSchemaResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly issues: readonly { readonly path: string; readonly code: string; readonly message: string }[] };
 
@@ -20,14 +22,18 @@ export function validateSpecMarkdown(value: unknown): SpecSchemaResult<string> {
 }
 
 export function validateSpecSourceReference(value: unknown): SpecSchemaResult<SpecSourceReference> {
-  if (!record(value) || !exactKeys(value, ["planSessionId", "planArtifactPath", "planMarkdownPath", "annotationsPath", "planDocumentRevision", "planStateVersion", "planMarkdownSha256", "annotationsSha256", "grillPath", "grillPointer", "grillBasedOnDocumentRevision", "grillStateVersion", "grillDecisionTreeSha256"])) return invalid("invalid-source", "Spec source reference shape is invalid.");
+  if (!record(value)) return invalid("invalid-source", "Spec source reference shape is invalid.");
+  const reviewed = GRILL_SOURCE_KEYS.some((key) => Object.hasOwn(value, key));
+  if (!exactKeys(value, reviewed ? [...PLAN_SOURCE_KEYS, ...GRILL_SOURCE_KEYS] : PLAN_SOURCE_KEYS)) return invalid("invalid-source", "Spec source reference shape is invalid.");
   if (!id(value.planSessionId) || !absolute(value.planArtifactPath)
     || value.planMarkdownPath !== resolve(value.planArtifactPath, "plan.md")
     || value.annotationsPath !== resolve(value.planArtifactPath, "annotations.json")
-    || value.grillPath !== resolve(value.planArtifactPath, "grill.json")
-    || !positive(value.planDocumentRevision) || !positive(value.planStateVersion) || !positive(value.grillBasedOnDocumentRevision) || !positive(value.grillStateVersion)
+    || !positive(value.planDocumentRevision) || !positive(value.planStateVersion)
+    || !hash(value.planMarkdownSha256) || !hash(value.annotationsSha256)) return invalid("invalid-source", "Spec source reference values are invalid.");
+  if (reviewed && (value.grillPath !== resolve(value.planArtifactPath, "grill.json")
+    || !positive(value.grillBasedOnDocumentRevision) || !positive(value.grillStateVersion)
     || value.grillBasedOnDocumentRevision !== value.planDocumentRevision || value.grillPointer !== "#/decisionTree"
-    || !hash(value.planMarkdownSha256) || !hash(value.annotationsSha256) || !hash(value.grillDecisionTreeSha256)) return invalid("invalid-source", "Spec source reference values are invalid.");
+    || !hash(value.grillDecisionTreeSha256))) return invalid("invalid-source", "Spec source reference values are invalid.");
   return { ok: true, value: value as unknown as SpecSourceReference };
 }
 

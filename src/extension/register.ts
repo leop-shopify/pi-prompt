@@ -23,19 +23,11 @@ export interface RegisterPromptExtensionOptions {
 export function registerPromptExtension(pi: ExtensionAPI, options: RegisterPromptExtensionOptions = {}): PromptExtensionRuntime {
   const editorRunner = options.runEditor ?? runPromptEditor;
   const bridge = options.bridge ?? new CurrentAgentPlanBridge(pi, { nonceFactory: safeNonce });
-  let lastEditorOptions: PromptEditorInitialState = {};
   let runtime!: PromptExtensionRuntime;
 
   const open = async (ctx: ExtensionContext, initial: PromptEditorInitialState = {}): Promise<void> => {
-    const merged: PromptEditorInitialState = {
-      ...initial,
-      mode: initial.mode ?? lastEditorOptions.mode,
-    };
-    const outcome = await editorRunner(pi, ctx, merged);
+    const outcome = await editorRunner(pi, ctx, initial);
     await handleEditorOutcome(pi, ctx, outcome, runtime);
-    if (outcome.kind === "generate" || outcome.kind === "direct-send") {
-      lastEditorOptions = { mode: outcome.submission.mode };
-    }
   };
 
   runtime = options.runtime ?? createPromptExtensionRuntime({

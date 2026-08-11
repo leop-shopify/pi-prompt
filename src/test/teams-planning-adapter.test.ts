@@ -15,7 +15,7 @@ const parameters = {
   required: ["prompt", "model_slot"],
   properties: {
     name: { type: "string" }, prompt: { type: "string" }, cwd: { type: "string" },
-    metadata: { type: "object" }, model_slot: { type: "string", enum: ["writing-basic", "writing-hard"] },
+    metadata: { type: "object" }, model_slot: { type: "string", enum: ["write-feature", "write-system"] },
   },
 };
 function tool(overrides: Partial<ToolInfo> = {}): ToolInfo {
@@ -33,8 +33,8 @@ function result(isError = false): ToolResultEvent {
 
 describe("pi-extended-teams planning adapter", () => {
   it("detects only an active spawn_agent with the required schema and canonical package provenance", () => {
-    expect(detectTeamsPlanningCapability(catalog(), "writing-basic")).toBe(true);
-    expect(detectTeamsPlanningCapability(catalog(), "writing-hard")).toBe(true);
+    expect(detectTeamsPlanningCapability(catalog(), "write-feature")).toBe(true);
+    expect(detectTeamsPlanningCapability(catalog(), "write-system")).toBe(true);
     expect(detectTeamsPlanningCapability(catalog([]))).toBe(false);
     expect(detectTeamsPlanningCapability(catalog(["spawn_agent"], [tool({ parameters: { type: "object", properties: { prompt: { type: "string" } } } as never })]))).toBe(false);
     expect(detectTeamsPlanningCapability(catalog(["spawn_agent"], [tool({ sourceInfo: { ...sourceInfo, source: "evil-extension", path: "/evil/index.ts" } })]))).toBe(false);
@@ -44,13 +44,13 @@ describe("pi-extended-teams planning adapter", () => {
   it("canonicalizes the first private writer without blocking any main-agent tool", () => {
     const phases: string[] = [];
     const adapter = new TeamsPlanningAdapter({
-      primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "WRITE PLAN MISSION", modelSlot: "writing-basic",
+      primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "WRITE PLAN MISSION", modelSlot: "write-feature",
       onPhase: (phase) => phases.push(phase), onReport: vi.fn(), onProgress: vi.fn(),
     });
-    const first = call("spawn_agent", { prompt: "attacker", model_slot: "writing-hard", name: "public", cwd: "/tmp", metadata: { nonce: "leak" }, extra: true });
+    const first = call("spawn_agent", { prompt: "attacker", model_slot: "read-review", name: "public", cwd: "/tmp", metadata: { nonce: "leak" }, extra: true });
     expect(adapter.handleToolCall(first)).toBeUndefined();
     expect(first.input).toEqual({
-      prompt: "WRITE PLAN MISSION", model_slot: "writing-basic", name: "planner-private", cwd: "/repo",
+      prompt: "WRITE PLAN MISSION", model_slot: "write-feature", name: "planner-private", cwd: "/repo",
       metadata: { piPromptPlanning: { version: 1, correlation: "correlation-private" } },
     });
     expect(adapter.primaryCount).toBe(1);
@@ -67,22 +67,22 @@ describe("pi-extended-teams planning adapter", () => {
 
   it("optionally blocks swarms and every parent spawn after the one canonical writer", () => {
     const adapter = new TeamsPlanningAdapter({
-      primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "WRITE SPEC MISSION", modelSlot: "writing-hard",
+      primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "WRITE SPEC MISSION", modelSlot: "write-system",
       onPhase: vi.fn(), onReport: vi.fn(), onProgress: vi.fn(), strictSingleSpawn: true,
     });
     const earlySwarm = call("spawn_swarm_agents", { prompts: ["attacker"] });
     expect(adapter.handleToolCall(earlySwarm)).toMatchObject({ block: true });
     expect(earlySwarm.input).toEqual({ prompts: ["attacker"] });
 
-    const first = call("spawn_agent", { prompt: "attacker", model_slot: "writing-basic", extra: true });
+    const first = call("spawn_agent", { prompt: "attacker", model_slot: "read-review", extra: true });
     expect(adapter.handleToolCall(first)).toBeUndefined();
     expect(first.input).toEqual({
-      prompt: "WRITE SPEC MISSION", model_slot: "writing-hard", name: "planner-private", cwd: "/repo",
+      prompt: "WRITE SPEC MISSION", model_slot: "write-system", name: "planner-private", cwd: "/repo",
       metadata: { piPromptPlanning: { version: 1, correlation: "correlation-private" } },
     });
-    const extra = call("spawn_agent", { prompt: "second", model_slot: "writing-basic" });
+    const extra = call("spawn_agent", { prompt: "second", model_slot: "read-review" });
     expect(adapter.handleToolCall(extra)).toMatchObject({ block: true });
-    expect(extra.input).toEqual({ prompt: "second", model_slot: "writing-basic" });
+    expect(extra.input).toEqual({ prompt: "second", model_slot: "read-review" });
     expect(adapter.handleToolCall(call("spawn_swarm_agents"))).toMatchObject({ block: true });
     expect(adapter.primaryCount).toBe(1);
   });
@@ -90,19 +90,19 @@ describe("pi-extended-teams planning adapter", () => {
   it("reports only sanitized resolved model metadata for the selected slot", () => {
     const models = vi.fn();
     const adapter = new TeamsPlanningAdapter({
-      primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "mission", modelSlot: "writing-basic",
+      primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "mission", modelSlot: "write-feature",
       onPhase: vi.fn(), onReport: vi.fn(), onProgress: vi.fn(), onModel: models,
     });
     adapter.handleToolCall(call("spawn_agent"));
-    adapter.handleToolResult({ ...result(), details: { name: "planner-private", session: "private-session", modelSlot: "writing-basic", model: "openai/gpt-planner", thinking: "high", secret: "PRIVATE" } } as ToolResultEvent);
-    expect(models).toHaveBeenCalledWith({ slot: "writing-basic", model: "openai/gpt-planner", thinking: "high" });
+    adapter.handleToolResult({ ...result(), details: { name: "planner-private", session: "private-session", modelSlot: "write-feature", model: "openai/gpt-planner", thinking: "high", secret: "PRIVATE" } } as ToolResultEvent);
+    expect(models).toHaveBeenCalledWith({ slot: "write-feature", model: "openai/gpt-planner", thinking: "high" });
     expect(JSON.stringify(models.mock.calls)).not.toContain("PRIVATE");
   });
 
   it("accepts only fresh normalized progress for the exact primary and private team, then rejects stale and late events", () => {
     const progress = vi.fn();
     const adapter = new TeamsPlanningAdapter({
-      primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "mission", modelSlot: "writing-basic",
+      primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "mission", modelSlot: "write-feature",
       onPhase: vi.fn(), onReport: vi.fn(), onProgress: progress,
     });
     adapter.handleToolCall(call("spawn_agent")); adapter.handleToolResult(result());
@@ -121,7 +121,7 @@ describe("pi-extended-teams planning adapter", () => {
   it("accepts only the expected successful report and closes observation against late events", () => {
     const reports: string[] = [];
     const adapter = new TeamsPlanningAdapter({
-      primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "mission", modelSlot: "writing-hard",
+      primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "mission", modelSlot: "write-system",
       onPhase: vi.fn(), onReport: (report) => reports.push(report), onProgress: vi.fn(),
     });
     adapter.handleToolCall(call("spawn_agent")); adapter.handleToolResult(result());
@@ -136,9 +136,9 @@ describe("pi-extended-teams planning adapter", () => {
     expect(adapter.handleFollowUp({ role: "custom", customType: "pi-extended-teams-report", content: "EXPECTED REPORT", details: { name: "planner-private", teamName: "private-session" } })).toBe(true);
     expect(adapter.handleFollowUp({ role: "custom", customType: "pi-extended-teams-report", content: "EXPECTED REPORT", details: { name: "planner-private", teamName: "private-session" } })).toBe(false);
     expect(adapter.prepareRetry("CORRECTION MISSION")).toBe(true);
-    const retry = call("spawn_agent", { prompt: "wrong", model_slot: "writing-hard" });
+    const retry = call("spawn_agent", { prompt: "wrong", model_slot: "read-review" });
     expect(adapter.handleToolCall(retry)).toBeUndefined();
-    expect(retry.input).toMatchObject({ prompt: "CORRECTION MISSION", model_slot: "writing-hard", name: "planner-private" });
+    expect(retry.input).toMatchObject({ prompt: "CORRECTION MISSION", model_slot: "write-system", name: "planner-private" });
     expect(adapter.primaryCount).toBe(1);
     adapter.handleToolResult(result());
     expect(adapter.handleReport({ teamName: "private-session", name: "planner-private", ok: true, report: "SECOND REPORT", metadata: { piPromptPlanning: { version: 1, correlation: "wrong" } } })).toBe(false);
@@ -146,5 +146,16 @@ describe("pi-extended-teams planning adapter", () => {
     expect(adapter.handleFollowUp({ role: "custom", customType: "pi-extended-teams-report", content: "SECOND REPORT", details: { name: "planner-private", teamName: "private-session" } })).toBe(true);
     adapter.close();
     expect(adapter.handleReport({ teamName: "private-session", name: "planner-private", ok: true, report: "LATE" })).toBe(false);
+  });
+
+  it("preserves failed writer status across the report boundary", () => {
+    const reports: Array<[string, boolean]> = [];
+    const adapter = new TeamsPlanningAdapter({
+      primaryName: "planner-private", correlation: "correlation-private", cwd: "/repo", mission: "mission", modelSlot: "write-system",
+      onPhase: vi.fn(), onReport: (report, ok) => reports.push([report, ok]), onProgress: vi.fn(),
+    });
+    adapter.handleToolCall(call("spawn_agent")); adapter.handleToolResult(result());
+    expect(adapter.handleReport({ teamName: "private-session", name: "planner-private", ok: false, report: "WRITER FAILED" })).toBe(true);
+    expect(reports).toEqual([["WRITER FAILED", false]]);
   });
 });

@@ -5,12 +5,17 @@ import { createPromptEditorComponent } from "../prompt-editor/tui.js";
 import type { PromptEditorOutcome } from "../prompt-editor/types.js";
 import { makeTestTheme } from "./helpers.js";
 
-function setup(initial: Parameters<typeof createPromptEditorComponent>[0]["initial"] = {}) {
+function setup(
+  initial: Parameters<typeof createPromptEditorComponent>[0]["initial"] = {},
+  readClipboardPaste: () => Promise<string | null> = async () => null,
+) {
   const done = vi.fn<(outcome: PromptEditorOutcome) => void>();
   const returnToInput = vi.fn<(text: string) => void>();
   const requestRender = vi.fn();
+  const keybindings = { matches: (data: string, binding: string) => binding === "app.clipboard.pasteImage" && data === "\x16" };
   const component = createPromptEditorComponent({
-    tui: { terminal: { rows: 36 } as never, requestRender }, theme: makeTestTheme(), initial, done, returnToInput,
+    tui: { terminal: { rows: 36 } as never, requestRender }, theme: makeTestTheme(), keybindings,
+    initial, done, returnToInput, readClipboardPaste,
   });
   return { component, done, returnToInput, requestRender };
 }
@@ -47,6 +52,19 @@ describe("prompt editor TUI", () => {
       kind: "direct-send",
       submission: { text: "first\nsecond", mode: "normal", saveAsTemplate: false },
     });
+  });
+
+  it.each([
+    { label: "image path", clipboard: "/tmp/pi-clipboard-image.png", expected: "inspect /tmp/pi-clipboard-image.png" },
+    { label: "text fallback", clipboard: "copied\ntext", expected: "inspect copied\ntext" },
+  ])("pastes a clipboard $label through Pi's configured Ctrl+V binding", async ({ clipboard, expected }) => {
+    const readClipboardPaste = vi.fn(async () => clipboard);
+    const { component, done, requestRender } = setup({ text: "inspect " }, readClipboardPaste);
+    component.handleInput?.("\x16");
+    await vi.waitFor(() => expect(requestRender).toHaveBeenCalledTimes(3));
+    component.handleInput?.("\x1b[13;5u");
+    expect(readClipboardPaste).toHaveBeenCalledOnce();
+    expect(done).toHaveBeenCalledWith(expect.objectContaining({ submission: expect.objectContaining({ text: expected }) }));
   });
 
   it("makes Ctrl+Enter generate when a planning mode was explicitly selected", () => {

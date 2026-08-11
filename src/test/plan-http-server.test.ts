@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import { startPlanHttpHost, SECURITY_HEADERS } from "../plan/http-server.js";
 import type { PlanController, PlanControllerEvent } from "../plan/controller.js";
 import type { PlanSession } from "../plan/types.js";
+import type { SpecController } from "../spec/controller.js";
 
 function readyState(overrides: Partial<PlanSession> = {}): PlanSession {
   return {
@@ -45,7 +46,7 @@ function fakeController(initial = readyState(), behavior: { stageFailures?: numb
     dispatchGeneration: vi.fn(() => ({ ok: true as const, value: undefined })),
     acceptedStagingPending: vi.fn(() => state.status === "accepted" && !staged),
     accept: vi.fn(async () => {
-      if (state.status === "ready") commit({ status: "accepted" }, "accepted");
+      if (["ready", "error"].includes(state.status)) commit({ status: "accepted" }, "accepted");
       if (stageFailures > 0) { stageFailures -= 1; return { ok: false as const, error: { code: "stage-failed", message: "The accepted plan was saved but could not be staged." } }; }
       staged = true; return { ok: true as const, value: undefined };
     }),
@@ -318,6 +319,17 @@ describe("secure plan HTTP host", () => {
       expect(host.closed).toBe(false);
       const retried = await fetch(`${host.origin}/api/v1/accept`, { method: "POST", headers: auth(host, true, '"pi-plan-state-4"'), body: JSON.stringify({ requestId: "request-id-stageretry-1", stateVersion: 4, documentRevision: 1, confirmed: true }) });
       expect(retried.status).toBe(200); expect(fake.raw.accept).toHaveBeenCalledTimes(2);
+    } finally { await host.close(); }
+  });
+
+  it("rejects direct Plan submission while Spec generation is active", async () => {
+    const fake = fakeController(); const spec = {
+      snapshot: vi.fn(() => ({ status: "generating", generationJob: { jobId: "spec-job" } })), subscribe: vi.fn(() => () => undefined), configureWriterEndpoint: vi.fn(() => ({ ok: true as const, value: undefined })), acceptedStagingPending: vi.fn(() => false),
+    } as unknown as SpecController;
+    const host = await startPlanHttpHost({ controller: fake.controller, specController: spec, reopenInPi: vi.fn() });
+    try {
+      const response = await fetch(`${host.origin}/api/v1/accept`, { method: "POST", headers: auth(host, true, '"pi-plan-state-3"'), body: JSON.stringify({ requestId: "request-id-spec-active", stateVersion: 3, documentRevision: 1, confirmed: true }) });
+      expect(response.status).toBe(409); expect(await json(response)).toMatchObject({ error: { code: "spec-job-active" } }); expect(fake.raw.accept).not.toHaveBeenCalled(); expect(host.closed).toBe(false); expect((await fetch(`${host.origin}/api/v1/snapshot`, { headers: auth(host) })).status).toBe(200);
     } finally { await host.close(); }
   });
 

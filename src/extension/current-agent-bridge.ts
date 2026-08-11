@@ -15,14 +15,15 @@ import { MAX_GRILL_RESULT_BYTES, MAX_WRITER_RESULT_BYTES, annotationsFilePath, d
 import type { DispatchableSpecGenerator, SpecGeneratorInput, SpecGeneratorResult, SpecWriterSubmission } from "../spec/generator.js";
 import { specResultFromBytes, validateSpecGeneratorInput } from "../spec/generator.js";
 import { specFilePath, writerSpecResultFilePath } from "../spec/session-files.js";
+import { hasAdversarialReview } from "../spec/source.js";
 import {
   TeamsPlanningAdapter, detectTeamsPlanningCapability, observeTeamsEvents,
   type DelegatedPrimaryStatus, type PlanningModelInfo, type TeamsAdapterPhase,
 } from "./teams-planning-adapter.js";
 
 export const PLAN_SUBMIT_TOOL_NAME = "pi_prompt_submit_plan";
-// SpecSession has no generation profile; use the existing semantic hard-writing slot consistently.
-const SPEC_WRITER_MODEL_SLOT = "writing-hard";
+// SpecSession has no generation profile; use the canonical system-writing slot consistently.
+const SPEC_WRITER_MODEL_SLOT = "write-system";
 export type PlanningAdapterKind = "delegated" | "direct";
 export type PlanningActivityPhase =
   | "capability-detected" | "primary-starting" | "primary-active" | "waiting-report" | "report-received"
@@ -293,7 +294,7 @@ export class CurrentAgentPlanBridge {
     const adapter = new TeamsPlanningAdapter({
       primaryName, correlation, cwd: gate.input.source.reference.planArtifactPath, mission: "pending-controller-mission",
       modelSlot: SPEC_WRITER_MODEL_SLOT, strictSingleSpawn: true,
-      onPhase: () => undefined, onReport: () => this.#specReport(gate), onProgress: () => undefined,
+      onPhase: () => undefined, onReport: (_report, ok) => this.#specReport(gate, ok), onProgress: () => undefined,
       now: () => this.#clock().getTime(),
     });
     gate.teams = adapter;
@@ -340,6 +341,11 @@ export class CurrentAgentPlanBridge {
   }
   #specMission(gate: SpecGate): string {
     const source = gate.input.source.reference;
+    const reviewed = hasAdversarialReview(source);
+    const review = reviewed ? [
+      `Adversarial Review decision tree: ${source.grillPath}${source.grillPointer}`,
+      `Adversarial Review revision/state: ${source.grillBasedOnDocumentRevision}/${source.grillStateVersion}`,
+    ] : ["Adversarial Review: skipped by user"];
     const comments = gate.input.session.comments
       .filter((comment) => gate.input.selectedCommentIds.includes(comment.id))
       .map((comment) => ({ id: comment.id, body: comment.body, exact: comment.target.exact }));
@@ -349,15 +355,14 @@ export class CurrentAgentPlanBridge {
       "## Controller-owned Spec writer mission", `Operation: ${gate.input.operation}`, `Plan session: ${source.planSessionId}`,
       `Plan Markdown: ${source.planMarkdownPath}`, `Plan annotations: ${source.annotationsPath}`,
       `Plan revision/state: ${source.planDocumentRevision}/${source.planStateVersion}`,
-      `Adversarial Review decision tree: ${source.grillPath}${source.grillPointer}`,
-      `Adversarial Review revision/state: ${source.grillBasedOnDocumentRevision}/${source.grillStateVersion}`,
+      ...review,
       ...(gate.input.operation === "revision" ? [`Existing Spec input: ${canonical}`] : []),
       `Selected Spec comments: ${JSON.stringify(comments)}`,
       ...(gate.input.instruction ? [`Revision instruction: ${gate.input.instruction}`] : []),
-      "Read only those exact durable Plan, annotation, Adversarial Review, and existing Spec inputs. Write the shortest unambiguous implementation Spec as UTF-8 Markdown with at least one H1. Do not restate the Plan, findings, or decision-tree branches, introduce requirements, silently resolve material decisions, or add speculative improvements.",
+      `Read only the exact durable Plan and annotation${reviewed ? ", Adversarial Review" : ""} inputs${gate.input.operation === "revision" ? " and existing Spec" : ""}. Write the shortest unambiguous implementation Spec as UTF-8 Markdown with at least one H1. Do not restate the Plan${reviewed ? ", findings, or decision-tree branches" : ""}, introduce requirements, silently resolve material decisions, or add speculative improvements.`,
       "Use exactly these H2 sections in order: Artifact References, Intended Outcome, Implementation Decisions, Testing Approach, Unresolved Decisions, Out of Scope, Acceptance Criteria. Do not add User Stories or Further Notes. Keep prose compact and prefer bullets.",
-      "Artifact References must identify the Plan session/path/revision and Adversarial Review path/pointer/revision. Every Acceptance Criterion must be independently pass/fail, externally observable or contract-verifiable, trace to the approved outcome or a settled decision, and state material failure/denied/empty/retry/rollback behavior without inventing implementation detail. Reject vague criteria such as works correctly, handles appropriately, or tests pass.",
-      "Do not use the Plan storage schema, create issue-tracker artifacts, or mutate Plan, annotations, or Adversarial Review artifacts.",
+      `Artifact References must identify the Plan session/path/revision${reviewed ? " and Adversarial Review path/pointer/revision" : " and state that Adversarial Review was skipped by the user"}. Every Acceptance Criterion must be independently pass/fail, externally observable or contract-verifiable, trace to the approved outcome or a settled decision, and state material failure/denied/empty/retry/rollback behavior without inventing implementation detail. Reject vague criteria such as works correctly, handles appropriately, or tests pass.`,
+      `Do not use the Plan storage schema, create issue-tracker artifacts, or mutate Plan, annotations${reviewed ? ", or Adversarial Review artifacts" : ""}.`,
       `Write only the transient writer draft ${output}; never write the repository-owned canonical Spec ${canonical}. Then upload the exact draft bytes and do not edit them afterward:`,
       `curl --fail-with-body --silent --show-error --request POST --header 'Authorization: Bearer ${gate.attemptId}' --header 'Content-Type: text/markdown' --header 'X-Pi-Prompt-Result: spec' --data-binary '@${output}' '${gate.writerEndpoint}'`,
       "If the upload returns an error, inspect the response, fix the transient draft, and retry the same upload during this turn. The gate remains active until a submission is accepted or this turn ends.",
@@ -369,9 +374,11 @@ export class CurrentAgentPlanBridge {
     if (gate.adapterKind === "direct") return true;
     return gate.teams?.primaryCount === 1 && gate.teams.primaryStatus === "waiting";
   }
-  #specReport(gate: SpecGate): void {
+  #specReport(gate: SpecGate, ok: boolean): void {
     if (["settled", "closed"].includes(gate.state) || !gate.active) return;
-    const error = gate.latestValidationError ?? { code: "missing-spec-submission", message: "The correlated Spec writer reported without an accepted HTTP submission." };
+    const error = gate.latestValidationError ?? (ok
+      ? { code: "missing-spec-submission", message: "The correlated Spec writer reported without an accepted HTTP submission." }
+      : { code: "delegation-failed", message: `The delegated Spec writer failed before submitting an authenticated result. Inspect the writer failure for the configured ${SPEC_WRITER_MODEL_SLOT} slot, then retry.` });
     this.#failSpec(gate, error);
   }
   #sendSpecFailureFollowUp(input: SpecGeneratorInput, error: { readonly code: string; readonly message: string }): void {
@@ -434,7 +441,7 @@ export class CurrentAgentPlanBridge {
       mission: "pending-controller-mission",
       modelSlot: GENERATION_PROFILES[gate.input.session.generation.mode].modelSlot,
       onPhase: (phase) => this.#teamsPhase(gate, phase),
-      onReport: (report) => { this.#primaryReport(gate, report); },
+      onReport: (report, ok) => { this.#primaryReport(gate, report, ok); },
       onProgress: (status, updatedAt) => this.#primaryProgress(gate, status, updatedAt),
       onModel: (model) => { gate.model = model; this.#activity(gate, "primary-active", gate.teams?.primaryStatus ?? "active"); },
       now: () => this.#clock().getTime(),
@@ -616,8 +623,12 @@ export class CurrentAgentPlanBridge {
     this.#activity(gate, "waiting-report", gate.teams.primaryStatus, { summary, updatedAt: new Date(updatedAt).toISOString() });
   }
 
-  #primaryReport(gate: Gate, report: string): void {
+  #primaryReport(gate: Gate, report: string, ok: boolean): void {
     if (!this.#isOpen(gate) || gate.privateReport !== undefined) return;
+    if (!ok) {
+      this.#settle(gate, failed("delegation-failed", `The delegated planner failed before submitting an authenticated result. Inspect the writer failure for the configured ${gate.model.slot} slot, then retry.`));
+      return;
+    }
     gate.privateReport = report; // Cleanup/advisory signal only; correlated HTTP bytes are sole result authority.
     this.#activity(gate, "report-received", "report-received");
     this.#beginCorrection(gate);
