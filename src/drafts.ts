@@ -76,6 +76,13 @@ export async function deleteDraft(id: string): Promise<void> {
   await writeDraftsFile(file);
 }
 
+export async function clearDrafts(): Promise<number> {
+  const file = await readDraftsFile();
+  if (file.drafts.length === 0) return 0;
+  await writeDraftsFile({ version: 1, drafts: [] });
+  return file.drafts.length;
+}
+
 export async function savePlanDraft(sessionId: string, prompt: string): Promise<Draft> {
   const file = await readDraftsFile();
   const id = planDraftId(sessionId);

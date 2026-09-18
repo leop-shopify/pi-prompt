@@ -1,10 +1,22 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { access, readFile } from "node:fs/promises";
-import { describe, expect, it, vi } from "vitest";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { listDrafts, saveDraft, savePlanDraft } from "../drafts.js";
 import { createAcceptedPlanSubmitter } from "../extension/controller-factory.js";
 import { registerPromptExtension } from "../extension/register.js";
 import type { PromptExtensionRuntime } from "../extension/runtime.js";
 
+const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+const tempPaths: string[] = [];
+afterEach(async () => {
+  await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+});
+
+async function tempDir(prefix: string): Promise<string> { const path = await mkdtemp(join(tmpdir(), prefix)); tempPaths.push(path); return path; }
 
 function makeRuntime(): PromptExtensionRuntime {
   return {
@@ -78,7 +90,7 @@ describe("extension registration", () => {
     expect([...commands.keys()]).toEqual(["prompt", "pi-prompt"]);
     for (const name of ["prompt", "pi-prompt"]) {
       const completions = commands.get(name).getArgumentCompletions("");
-      expect(completions.map((item: any) => item.value)).toEqual(["drafts", "goal-templates", "loop-templates", "resume"]);
+      expect(completions.map((item: any) => item.value)).toEqual(["drafts", "clear-drafts", "goal-templates", "loop-templates", "resume"]);
     }
     expect(shortcuts.has("ctrl+alt+p")).toBe(true);
     expect([...lifecycle.keys()].slice(-4)).toEqual(["session_start", "session_before_tree", "session_tree", "session_shutdown"]);
@@ -89,6 +101,21 @@ describe("extension registration", () => {
     expect(runtime.resume).toHaveBeenCalledTimes(2);
   });
 
+  it("clears all saved drafts and reports populated and empty stores", async () => {
+    process.env.PI_CODING_AGENT_DIR = await tempDir("pi-prompt-command-clear-");
+    await saveDraft("unfinished plan");
+    await savePlanDraft("session-1", "Build it");
+    const { pi, commands } = makePi();
+    const commandCtx = ctx();
+    registerPromptExtension(pi);
+
+    await commands.get("prompt").handler("clear-drafts", commandCtx);
+    await expect(listDrafts()).resolves.toEqual([]);
+    expect(commandCtx.ui.notify).toHaveBeenLastCalledWith("Cleared 2 saved drafts.", "info");
+
+    await commands.get("prompt").handler("clear-drafts", commandCtx);
+    expect(commandCtx.ui.notify).toHaveBeenLastCalledWith("No saved drafts to clear.", "info");
+  });
 
   it("returns Pi's public cancellation result when durable tree close fails", async () => {
     const { pi, lifecycle } = makePi();

@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { deletePlanDraft, listDrafts, PLAN_DRAFT_TAG, saveDraft, savePlanDraft } from "../drafts.js";
+import { clearDrafts, deletePlanDraft, listDrafts, PLAN_DRAFT_TAG, saveDraft, savePlanDraft } from "../drafts.js";
 import { applyPromptTemplateVariables, extractPromptTemplateVariables } from "../prompt-templates.js";
 import { preloadPromptFile } from "../prompt-editor/sources.js";
 
@@ -38,6 +38,15 @@ describe("prompt editor sources", () => {
     await expect(listDrafts()).resolves.toEqual([updated]);
     await deletePlanDraft("session-1");
     await expect(listDrafts()).resolves.toEqual([]);
+  });
+
+  it("clears ordinary and plan drafts and reports how many were removed", async () => {
+    process.env.PI_CODING_AGENT_DIR = await tempDir("pi-prompt-agent-clear-");
+    await saveDraft("unfinished plan");
+    await savePlanDraft("session-1", "Build it");
+    await expect(clearDrafts()).resolves.toBe(2);
+    await expect(listDrafts()).resolves.toEqual([]);
+    await expect(clearDrafts()).resolves.toBe(0);
   });
 
   it("preserves template variables", () => {

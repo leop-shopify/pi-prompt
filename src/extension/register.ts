@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { saveDraft } from "../drafts.js";
+import { clearDrafts, saveDraft } from "../drafts.js";
 import { memorizePromptTemplate } from "../prompt-templates.js";
 import { dispatchDirectSend } from "../prompt-editor/direct-send.js";
 import { chooseDraft, choosePromptTemplate, preloadPromptFile } from "../prompt-editor/sources.js";
@@ -64,10 +64,11 @@ function registerPromptCommand(
   open: (ctx: ExtensionContext, initial?: PromptEditorInitialState) => Promise<void>,
 ): void {
   pi.registerCommand(name, {
-    description: "Open the fullscreen Plan prompt editor (file, drafts, goal-templates, loop-templates, or resume)",
+    description: "Open the fullscreen Plan prompt editor (file, drafts, clear-drafts, goal-templates, loop-templates, or resume)",
     getArgumentCompletions: (prefix) => {
       const routes = [
         { value: "drafts", label: "drafts", description: "Open saved drafts" },
+        { value: "clear-drafts", label: "clear-drafts", description: "Delete all saved drafts" },
         { value: "goal-templates", label: "goal-templates", description: "Open goal prompt templates" },
         { value: "loop-templates", label: "loop-templates", description: "Open loop prompt templates" },
         { value: "resume", label: "resume", description: "Resume the newest saved plan on this branch" },
@@ -89,6 +90,11 @@ async function routePromptCommand(
 ): Promise<void> {
   if (argument === "resume") { await runtime.resume(ctx); return; }
   if (argument === "drafts") { const initial = await chooseDraft(ctx); if (initial) await open(ctx, initial); return; }
+  if (argument === "clear-drafts") {
+    const count = await clearDrafts();
+    ctx.ui.notify(count === 0 ? "No saved drafts to clear." : `Cleared ${count} saved ${count === 1 ? "draft" : "drafts"}.`, "info");
+    return;
+  }
   if (argument === "goal-templates" || argument === "loop-templates") {
     const initial = await choosePromptTemplate(ctx, argument === "goal-templates" ? "goal" : "loop");
     if (initial) await open(ctx, initial);

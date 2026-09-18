@@ -24,7 +24,7 @@ The editor starts in **No plan** with focus in the prompt:
 
 There is no external-editor handoff.
 
-Prompt sources remain available through `/prompt drafts`, `/prompt goal-templates`, `/prompt loop-templates`, `/prompt resume`, and `/prompt <file>`.
+Prompt sources remain available through `/prompt drafts`, `/prompt goal-templates`, `/prompt loop-templates`, `/prompt resume`, and `/prompt <file>`. Use `/prompt clear-drafts` to delete every saved draft, including plan restart drafts.
 
 ## Planning levels
 
