@@ -55,12 +55,10 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
-  "dependencies": {
-    "@earendil-works/pi-tui": "0.78.1",
-    "typebox": "1.1.38"
-  },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "0.78.1"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "devDependencies": {
     "@types/node": "24.12.4",
