@@ -4,8 +4,8 @@
 
 ## Requirements
 
-- Pi `0.78.1`
-- Node.js 22
+- Pi `0.99.1` (tested local host; supplied by Pi as a peer dependency)
+- Node.js 22.19.0 or newer
 - pnpm `10.28.0`
 
 ## Prompt editor
