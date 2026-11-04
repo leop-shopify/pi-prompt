@@ -15,7 +15,7 @@ const endpoint = "http://127.0.0.1:43210/api/v1/writer-results";
 const taskBody = "Scope: src/a.ts\nTest first: Add a failing test.\nImplement: Make the change.\nVerify: Run the test.\nDone when: The test passes.";
 const markdown = `# Plan\r\n\r\n## Execution\r\nNormal\r\n\r\n## Implementation Tasks\r\nTasks\r\n\r\n### Build\r\n${taskBody.replaceAll("\n", "\r\n")}\r\n`;
 const sourceInfo = { path: "/packages/pi-extended-teams/extensions/index.ts", source: "npm:pi-extended-teams@2.0.0", scope: "user" as const, origin: "package" as const };
-const spawnTool = { name: "spawn_agent", description: "spawn", sourceInfo, parameters: { type: "object", required: ["prompt", "model_slot"], properties: {
+const spawnTool = { name: "spawn_agent", description: "spawn", exposure: "direct", sourceInfo, parameters: { type: "object", required: ["prompt", "model_slot"], properties: {
   prompt: { type: "string" }, model_slot: { type: "string", enum: ["write-feature", "write-system"] }, name: { type: "string" }, cwd: { type: "string" }, metadata: { type: "object" },
 } } } as ToolInfo;
 const malformedSpawnTool = { ...spawnTool, parameters: { type: "object", properties: { prompt: { type: "string" } } } } as ToolInfo;
